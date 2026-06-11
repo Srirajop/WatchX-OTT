@@ -1,0 +1,494 @@
+# main.py — SubtitleAI V2 Backend
+# FastAPI + Groq (LLaMA 3.1 8B Instant) + MySQL
+
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+import os, json, io, re
+
+from database import init_db, get_all_platforms, save_custom_platform, log_job
+from file_reader import read_file
+from extractor import pre_extract_dialogue
+from cleaner import clean_subtitle_chunk, extract_platform_rules_with_ai
+from quality_checker import check_quality
+from platform_rules import get_platform, get_platform_list
+
+load_dotenv()
+
+app = FastAPI(title="SubtitleAI V2", description="AI subtitle cleaning and quality check tool", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("FRONTEND_URL", "http://localhost:5173"), "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def startup():
+    try:
+        init_db()
+    except Exception as e:
+        print(f"WARNING DB warning: {e}")
+
+
+@app.get("/")
+def root():
+    return {"status": "running", "version": "2.0.0", "model": "llama-3.1-8b-instant"}
+
+
+@app.get("/health")
+def health():
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    return {
+        "status": "ok",
+        "groq_configured": bool(groq_key and groq_key != "your_groq_api_key_here"),
+        "model": "llama-3.1-8b-instant (Groq)"
+    }
+
+
+# ─── CLEAN ───────────────────────────────────────────────────────
+
+def chunk_text(text: str, max_chunk_size: int = 7000) -> list[str]:
+    lines = text.splitlines()
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current_size + line_len > max_chunk_size and current_chunk:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = [line]
+            current_size = line_len
+        else:
+            current_chunk.append(line)
+            current_size += line_len
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+    return chunks
+
+
+@app.post("/clean")
+async def clean_file_endpoint(
+    file: UploadFile = File(...),
+    platform: str = Form(default="discovery_max")
+):
+    import asyncio
+    
+    ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",
+               ".rtf",".srt",".vtt",".webvtt",".xlsx",".xls",
+               ".csv",".txt",".json"]
+
+    filename = file.filename or "unknown.txt"
+    ext = "." + filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+    if ext not in ALLOWED:
+        raise HTTPException(400, f"File type '{ext}' not supported.")
+
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    if not groq_key or groq_key == "your_groq_api_key_here":
+        raise HTTPException(500, "GROQ_API_KEY not configured. Get free key at https://console.groq.com")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "Uploaded file is empty")
+
+    file_data = read_file(file_bytes, filename)
+    raw_text = file_data["raw_text"]
+    structure = file_data["structure"]
+
+    if not raw_text.strip():
+        raise HTTPException(400, "Could not extract text from file")
+
+    # ── Step 1: Pure Python extraction (instant, no LLM) ─────────────────────
+    platform_dict = get_platform(platform)
+    pre_extracted = pre_extract_dialogue(raw_text, structure, file_bytes, filename, platform_dict)
+
+    if pre_extracted:
+        # Join extracted lines — LLM only needs to polish punctuation/spelling
+        # Much shorter input → much faster LLM response
+        clean_input = "\n".join(pre_extracted)
+        print(f"[EXTRACT] Pre-extracted {len(pre_extracted)} lines via Python (structure: {structure})")
+    else:
+        # Fallback: send raw text if extractor found nothing (unusual format)
+        clean_input = raw_text
+        print(f"[EXTRACT] No pre-extraction, sending raw text to LLM")
+
+    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    # With pre-extraction, input is already clean dialogue.
+    # We use smaller chunks (600) for Groq.
+    lmstudio_chunk = int(os.getenv("LM_STUDIO_CHUNK_SIZE", "1500"))
+    chunk_size = lmstudio_chunk if provider == "lmstudio" else 600
+    chunks = chunk_text(clean_input, max_chunk_size=chunk_size)
+    total_chunks = len(chunks)
+    
+    # Process 5 chunks simultaneously. This is the mathematical maximum 
+    # we can do on Groq's free tier (~750 tokens per request * 5 = 3750 tokens).
+    parallel = int(os.getenv("LM_STUDIO_PARALLEL", "1")) if provider == "lmstudio" else 5
+
+    file_ext = ext.lstrip(".")
+
+    async def process_chunk(idx: int, chunk: str):
+        loop = asyncio.get_running_loop()
+        return idx, await loop.run_in_executor(
+            None,
+            clean_subtitle_chunk,
+            chunk,
+            structure,
+            platform,
+            filename
+        )
+
+    async def event_generator():
+        all_subtitles = []
+
+        yield f"data: {json.dumps({'status': 'starting', 'progress': 0, 'message': f'Initializing — {total_chunks} parts, processing {parallel} at a time...'})}\n\n"
+        await asyncio.sleep(0.05)
+
+        # Process in parallel batches to match LM Studio's parallel slot count
+        for batch_start in range(0, total_chunks, parallel):
+            batch = list(enumerate(chunks[batch_start:batch_start + parallel], start=batch_start))
+            done = batch_start + len(batch)
+            progress_pct = int((batch_start / total_chunks) * 100)
+            part_range = f"{batch_start+1}–{done}" if len(batch) > 1 else str(batch_start+1)
+            yield f"data: {json.dumps({'status': 'processing', 'progress': progress_pct, 'message': f'AI cleaning parts {part_range} of {total_chunks}...'})}\n\n"
+            await asyncio.sleep(0.05)
+
+            try:
+                results = await asyncio.gather(*[process_chunk(i, c) for i, c in batch])
+                # Sort by original index to preserve document order
+                results.sort(key=lambda x: x[0])
+                for _, chunk_subs in results:
+                    all_subtitles.extend(chunk_subs)
+            except Exception as e:
+                yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+                return
+
+        # Re-index all subtitles contiguously
+        for s_idx, sub in enumerate(all_subtitles, start=1):
+            sub["id"] = s_idx
+
+        total_lines = len(all_subtitles)
+        flagged_lines = sum(1 for s in all_subtitles if s.get("flagged"))
+
+        # Log job
+        try:
+            log_job(filename, file_ext, platform, structure, total_lines, flagged_lines, 0)
+        except Exception as e:
+            print(f"Failed to log job: {e}")
+
+        final_result = {
+            "subtitles": all_subtitles,
+            "stats": {
+                "total_lines": total_lines,
+                "flagged_lines": flagged_lines,
+                "platform": platform,
+                "detected_structure": structure,
+                "original_format": filename
+            }
+        }
+
+        yield f"data: {json.dumps({'status': 'completed', 'progress': 100, 'result': final_result})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",    # disables Nginx/proxy buffering
+            "Connection": "keep-alive",
+        }
+    )
+
+@app.post("/extract")
+async def extract_file_endpoint(
+    file: UploadFile = File(...),
+    platform: str = Form(default="discovery_max")
+):
+    ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",
+               ".rtf",".srt",".vtt",".webvtt",".xlsx",".xls",
+               ".csv",".txt",".json"]
+
+    filename = file.filename or "unknown.txt"
+    ext = "." + filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+    if ext not in ALLOWED:
+        raise HTTPException(400, f"File type '{ext}' not supported.")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "Uploaded file is empty")
+
+    file_data = read_file(file_bytes, filename)
+    raw_text = file_data["raw_text"]
+    structure = file_data["structure"]
+
+    if not raw_text.strip():
+        raise HTTPException(400, "Could not extract text from file")
+
+    platform_dict = get_platform(platform)
+    pre_extracted = pre_extract_dialogue(raw_text, structure, file_bytes, filename, platform_dict)
+    if not pre_extracted:
+        pre_extracted = raw_text.splitlines()
+
+    subtitles = []
+    for i, line in enumerate(pre_extracted, 1):
+        clean_line = line.strip()
+        if clean_line:
+            subtitles.append({"id": i, "text": clean_line, "flagged": False})
+
+    return {
+        "subtitles": subtitles,
+        "stats": {
+            "total_lines": len(subtitles),
+            "flagged_lines": 0,
+            "platform": "none",
+            "detected_structure": structure,
+            "original_format": filename
+        }
+    }
+
+
+
+# ─── QUALITY CHECK ───────────────────────────────────────────────
+
+@app.post("/quality-check")
+async def quality_check_endpoint(data: dict):
+    """
+    Check cleaned subtitles for defects before delivery to OTT platform.
+    Accepts: { subtitles: [...], platform_key: "...", filename: "..." }
+    """
+    subtitles = data.get("subtitles", [])
+    platform_key = data.get("platform_key", "generic")
+    filename = data.get("filename", "subtitles.srt")
+
+    if not subtitles:
+        raise HTTPException(400, "No subtitles provided for quality check")
+
+    result = check_quality(subtitles, platform_key, filename)
+
+    # Log defects
+    log_job(filename, "quality_check", platform_key, "quality_check",
+            result.get("total_lines", 0), 0, result.get("total_defects", 0))
+
+    return result
+
+
+# ─── EXPORT ──────────────────────────────────────────────────────
+
+@app.post("/export/srt")
+async def export_srt(data: dict):
+    """Export dialogue-only as a plain numbered text file (no timecodes)."""
+    subtitles = data.get("subtitles", [])
+    filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
+
+    lines = []
+    for sub in subtitles:
+        text = sub.get("text", "").strip()
+        if text:
+            lines.append(text)
+
+    # One blank line between each entry for the clean spaced look
+    content = "\n\n".join(lines)
+
+    buf = io.BytesIO(content.encode("utf-8"))
+    return StreamingResponse(buf, media_type="text/plain",
+        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.txt"})
+
+
+@app.post("/export/txt")
+async def export_txt(data: dict):
+    subtitles = data.get("subtitles", [])
+    filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
+    content = "\n".join(s.get("text", "") for s in subtitles if s.get("text"))
+    buf = io.BytesIO(content.encode("utf-8"))
+    return StreamingResponse(buf, media_type="text/plain",
+        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.txt"})
+
+
+@app.post("/export/docx")
+async def export_docx(data: dict):
+    """Export dialogue-only as a DOCX with one paragraph per line and blank spacer between entries."""
+    from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    import re
+    
+    subtitles = data.get("subtitles", [])
+    filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
+
+    doc = Document()
+    # Set a readable body font
+    style = doc.styles["Normal"]
+    style.font.name = "Arial"
+    style.font.size = Pt(12)
+
+    for i, sub in enumerate(subtitles):
+        text = sub.get("text", "").strip()
+        if not text:
+            continue
+        # Remove control characters that break python-docx
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        # Add the dialogue line, centred to match the screenshot layout
+        p = doc.add_paragraph(text)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        # Add a blank spacer paragraph between entries
+        if i < len(subtitles) - 1:
+            spacer = doc.add_paragraph("")
+            spacer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return StreamingResponse(buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.docx"})
+
+
+@app.post("/export/pdf")
+async def export_pdf(data: dict):
+    """Export dialogue-only as a PDF, centred on the page with spacing between entries."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.units import inch
+    import html
+    import re
+
+    subtitles = data.get("subtitles", [])
+    filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        leftMargin=1.5 * inch, rightMargin=1.5 * inch,
+        topMargin=1 * inch, bottomMargin=1 * inch
+    )
+    styles = getSampleStyleSheet()
+    centred = ParagraphStyle(
+        "centred",
+        parent=styles["Normal"],
+        alignment=TA_CENTER,
+        fontSize=12,
+        leading=18,
+        spaceAfter=0,
+    )
+    Story = []
+
+    for sub in subtitles:
+        text = sub.get("text", "").strip()
+        if not text:
+            continue
+        # Remove control characters
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        text = html.escape(text).replace("\n", "<br/>")
+        Story.append(Paragraph(text, centred))
+        # Generous vertical space between each dialogue entry (matches screenshot)
+        Story.append(Spacer(1, 28))
+
+    doc.build(Story)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.pdf"})
+
+
+
+# ─── PLATFORMS ───────────────────────────────────────────────────
+
+@app.get("/platforms")
+def get_platforms():
+    try:
+        platforms = get_all_platforms()
+        return {"platforms": platforms}
+    except:
+        # Fallback to static list if DB not ready
+        return {"platforms": {p["key"]: p for p in get_platform_list()}}
+
+
+@app.post("/platforms/add")
+async def add_platform(
+    platform_name: str = Form(...),
+    guidelines_file: UploadFile = File(None),
+    guidelines_text: str = Form(default="")
+):
+    if not platform_name.strip():
+        raise HTTPException(400, "Platform name is required")
+
+    platform_key = "custom_" + re.sub(r'[^a-z0-9]', '_', platform_name.lower().strip())
+
+    raw_guidelines = ""
+    if guidelines_file and guidelines_file.filename:
+        file_bytes = await guidelines_file.read()
+        file_data = read_file(file_bytes, guidelines_file.filename)
+        raw_guidelines = file_data["raw_text"]
+    elif guidelines_text.strip():
+        raw_guidelines = guidelines_text.strip()
+
+    if raw_guidelines:
+        platform_data = extract_platform_rules_with_ai(raw_guidelines, platform_name.strip())
+    else:
+        platform_data = {
+            "name": platform_name.strip(),
+            "max_chars_per_line": 42,
+            "max_lines": 2,
+            "rules": ["Maximum 42 characters per line", "Maximum 2 lines", "Standard guidelines"],
+            "summary": f"Custom: {platform_name.strip()}"
+        }
+
+    platform_data["guidelines_raw"] = raw_guidelines
+    save_custom_platform(platform_key, platform_data)
+
+    return {
+        "success": True,
+        "platform_key": platform_key,
+        "platform_name": platform_name.strip(),
+        "rules_extracted": len(platform_data.get("rules", [])),
+        "message": f"Platform '{platform_name}' added with {len(platform_data.get('rules', []))} rules"
+    }
+
+
+@app.delete("/platforms/{platform_key}")
+def delete_platform(platform_key: str):
+    if not platform_key.startswith("custom_"):
+        raise HTTPException(400, "Cannot delete built-in platforms")
+    from database import get_connection
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM platforms WHERE platform_key=%s AND is_custom=TRUE", (platform_key,))
+    affected = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    conn.close()
+    if affected == 0:
+        raise HTTPException(404, "Platform not found")
+    return {"success": True}
+
+
+# ─── HELPER ──────────────────────────────────────────────────────
+
+def normalize_tc(tc: str) -> str:
+    if not tc:
+        return ""
+    tc = tc.strip()
+    if re.match(r'\d{2}:\d{2}:\d{2},\d{3}', tc):
+        return tc
+    m = re.match(r'(\d{2}):(\d{2}):(\d{2})[:;](\d{2})', tc)
+    if m:
+        h, mn, s, f = m.groups()
+        ms = int(int(f) * 1000 / 25)
+        return f"{h}:{mn}:{s},{ms:03d}"
+    m = re.match(r'(\d{2}):(\d{2}):(\d{2})\.(\d+)', tc)
+    if m:
+        h, mn, s, ms = m.groups()
+        return f"{h}:{mn}:{s},{ms[:3].ljust(3,'0')}"
+    return tc
