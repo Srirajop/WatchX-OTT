@@ -434,10 +434,20 @@ def _show_name_from_filename(filename: str) -> str:
 
 
 def _entry(start: str, end: str, text: str) -> dict:
+    start_tc = normalize_timecode(start)
+    end_tc = normalize_timecode(end)
+    
+    start_sec = _to_seconds(start_tc)
+    end_sec = _to_seconds(end_tc)
+    
+    if start_sec is not None and end_sec is not None:
+        if end_sec <= start_sec:
+            end_tc = _add_seconds(start_tc, 1.0)
+            
     return {
         "id": 0,
-        "start_time": normalize_timecode(start),
-        "end_time": normalize_timecode(end),
+        "start_time": start_tc,
+        "end_time": end_tc,
         "text": _clean_text(text),
         "flagged": False,
         "flag_reason": "",
@@ -445,7 +455,7 @@ def _entry(start: str, end: str, text: str) -> dict:
 
 
 def _clean_text(text: str) -> str:
-    cleaned = re.sub(r"<[^>]+>", "", text)
+    cleaned = clean_delivery_text(text)
     cleaned = re.sub(r"{\\.*?}", "", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     return "\n".join(line.strip() for line in cleaned.splitlines() if line.strip()).strip()
