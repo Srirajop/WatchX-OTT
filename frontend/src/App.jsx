@@ -47,6 +47,13 @@ export default function App() {
   const [addMsg, setAddMsg] = useState('')
   const [addErr, setAddErr] = useState('')
 
+  // Transcribe tab
+  const [audioFile, setAudioFile] = useState(null)
+  const [recording, setRecording] = useState(false)
+  const [mediaRecorder, setMediaRecorder] = useState(null)
+  const [transcribing, setTranscribing] = useState(false)
+  const [transcribeError, setTranscribeError] = useState('')
+
   useEffect(() => { loadPlatforms() }, [])
 
   async function loadPlatforms() {
@@ -231,6 +238,51 @@ export default function App() {
     catch (e) { alert(e.response?.data?.detail || 'Cannot delete') }
   }
 
+  // ── TRANSCRIBE ──────────────────────────────────────────────────
+
+  async function startRecording() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const recorder = new MediaRecorder(stream)
+      const chunks = []
+      recorder.ondataavailable = e => chunks.push(e.data)
+      recorder.onstop = () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' })
+        const f = new File([blob], 'recording.webm', { type: 'audio/webm' })
+        setAudioFile(f)
+      }
+      recorder.start()
+      setMediaRecorder(recorder)
+      setRecording(true)
+      setTranscribeError('')
+    } catch (e) {
+      setTranscribeError('Microphone access denied: ' + e.message)
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop()
+      mediaRecorder.stream.getTracks().forEach(t => t.stop())
+      setRecording(false)
+    }
+  }
+
+  async function handleTranscribe() {
+    if (!audioFile) { setTranscribeError('Please upload or record audio first'); return }
+    setTranscribing(true); setTranscribeError(''); setSubtitles([]); setCleanStats(null);
+    const fd = new FormData()
+    fd.append('file', audioFile)
+    try {
+      const response = await axios.post(`${API}/transcribe`, fd)
+      setSubtitles(response.data.subtitles || [])
+      setCleanStats(response.data.stats || null)
+      setTab('clean') // Auto-switch to view the extracted subtitles
+    } catch (e) {
+      setTranscribeError(e.response?.data?.detail || 'Transcription failed')
+    } finally { setTranscribing(false) }
+  }
+
   const flaggedCount = subtitles.filter(s => s.flagged).length
   const builtinPlatforms = Object.entries(platforms).filter(([k]) => !k.startsWith('custom_'))
   const customPlatforms = Object.entries(platforms).filter(([k]) => k.startsWith('custom_'))
@@ -247,7 +299,7 @@ export default function App() {
           </div>
         </div>
         <div style={S.tabs}>
-          {[['clean','🧹 Clean'],['quality','✅ Quality Check'],['platforms','⚙️ Platforms']].map(([id,label]) => (
+          {[['clean','🧹 Clean'],['transcribe','🎙️ Transcribe'],['quality','✅ Quality Check'],['platforms','⚙️ Platforms']].map(([id,label]) => (
             <button key={id} style={{...S.tab,...(tab===id?S.tabActive:{})}} onClick={()=>setTab(id)}>{label}</button>
           ))}
         </div>
@@ -400,6 +452,49 @@ export default function App() {
                   </div>
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* ══ TRANSCRIBE TAB ══ */}
+        {tab === 'transcribe' && (
+          <div style={{maxWidth:600, margin:'0 auto'}}>
+            <div style={S.card}>
+              <div style={{fontSize:18, fontWeight:700, marginBottom:20, textAlign:'center'}}>🎙️ AI Audio / Video Transcription</div>
+              <div style={{fontSize:12, color:'#a78bfa', marginBottom:20, textAlign:'center'}}>Powered by Groq Whisper-Large-v3. Automatically generates frame-accurate SRT.</div>
+              
+              <div style={{display:'flex', gap:10, marginBottom:20}}>
+                <div style={{flex:1, ...S.uploadZone}} onClick={()=>document.getElementById('audio-upload').click()}>
+                  <div style={{fontSize:24, marginBottom:6}}>📁</div>
+                  <div style={S.uploadTitle}>Upload Audio/Video</div>
+                  <div style={S.uploadSub}>MP3, MP4, M4A, WAV, WEBM</div>
+                  <input id="audio-upload" type="file" hidden accept="audio/*,video/*" onChange={e=>{if(e.target.files[0])setAudioFile(e.target.files[0])}}/>
+                </div>
+                
+                <div style={{flex:1, ...S.uploadZone, borderColor: recording ? '#ef4444' : '#2a2a3e', background: recording ? '#2a0f0f' : '#08080f'}} 
+                     onClick={recording ? stopRecording : startRecording}>
+                  <div style={{fontSize:24, marginBottom:6}}>{recording ? '🛑' : '🎤'}</div>
+                  <div style={S.uploadTitle}>{recording ? 'Stop Recording' : 'Live Record'}</div>
+                  <div style={S.uploadSub}>{recording ? 'Recording in progress...' : 'Use your microphone'}</div>
+                </div>
+              </div>
+
+              {audioFile && (
+                <div style={{...S.fileChip, marginBottom:20}}>
+                  <span style={{fontSize:18}}>🎵</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:13,color:'#c8c6d4'}}>{audioFile.name}</div>
+                    <div style={{fontSize:10,color:'#5a5870'}}>{(audioFile.size/1024/1024).toFixed(2)} MB</div>
+                  </div>
+                  <button style={S.btnX} onClick={()=>setAudioFile(null)}>✕</button>
+                </div>
+              )}
+
+              <button style={{...S.btnPrimary, ...(transcribing || !audioFile ? S.btnOff : {})}} onClick={handleTranscribe} disabled={transcribing || !audioFile}>
+                {transcribing ? '⏳ Transcribing...' : '✨ Transcribe to SRT'}
+              </button>
+
+              {transcribeError && <div style={{...S.errBox, marginTop:20}}><div style={{fontSize:12,color:'#fca5a5'}}>{transcribeError}</div></div>}
             </div>
           </div>
         )}

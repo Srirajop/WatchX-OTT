@@ -336,6 +336,58 @@ async def extract_file_endpoint(
     }
 
 
+# ─── TRANSCRIBE ──────────────────────────────────────────────
+
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    if not groq_key or groq_key == "your_groq_api_key_here":
+        raise HTTPException(500, "GROQ_API_KEY not configured. Transcription requires Groq API.")
+
+    from groq import Groq
+    client = Groq(api_key=groq_key)
+    
+    file_bytes = await file.read()
+    if len(file_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(400, "File is too large. Max size supported by Groq is 25MB.")
+        
+    filename = file.filename or "audio.webm"
+    ext = filename.split(".")[-1].lower()
+    
+    # Groq supported audio formats: mp3, mp4, mpeg, mpga, m4a, wav, webm
+    if ext not in ['mp3', 'mp4', 'mpeg', 'mpga', 'm4a', 'wav', 'webm']:
+        # If the user uploaded an unsupported video like mkv, avi, or no extension
+        # the simplest approach without ffmpeg is to rename to a supported container like webm or mp4 
+        # and see if Groq can demux it. 
+        filename = "audio.webm"
+
+    try:
+        transcription = client.audio.transcriptions.create(
+            file=(filename, file_bytes),
+            model="whisper-large-v3",
+            response_format="srt",
+            language="en"
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Transcription failed (API error): {str(e)}")
+
+    # `transcription.text` contains the raw SRT string, or if response_format="srt" makes it return a string
+    raw_srt = getattr(transcription, "text", transcription) if not isinstance(transcription, str) else transcription
+
+    from timecoded_subtitles import parse_timecoded_subtitles
+    subtitles = parse_timecoded_subtitles(raw_srt)
+    
+    return {
+        "subtitles": subtitles,
+        "stats": {
+            "total_lines": len(subtitles),
+            "flagged_lines": 0,
+            "platform": "none",
+            "detected_structure": "whisper_audio",
+            "original_format": filename
+        }
+    }
+
 
 # ─── QUALITY CHECK ───────────────────────────────────────────────
 
