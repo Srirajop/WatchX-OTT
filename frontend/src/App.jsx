@@ -52,6 +52,7 @@ export default function App() {
   const [recording, setRecording] = useState(false)
   const [mediaRecorder, setMediaRecorder] = useState(null)
   const [transcribing, setTranscribing] = useState(false)
+  const [transcribeProgress, setTranscribeProgress] = useState({ pct: 0, msg: '' })
   const [transcribeError, setTranscribeError] = useState('')
 
   useEffect(() => { loadPlatforms() }, [])
@@ -271,16 +272,50 @@ export default function App() {
   async function handleTranscribe() {
     if (!audioFile) { setTranscribeError('Please upload or record audio first'); return }
     setTranscribing(true); setTranscribeError(''); setSubtitles([]); setCleanStats(null);
+    setTranscribeProgress({ pct: 0, msg: 'Starting...' })
+    
     const fd = new FormData()
     fd.append('file', audioFile)
+    
     try {
-      const response = await axios.post(`${API}/transcribe`, fd)
-      setSubtitles(response.data.subtitles || [])
-      setCleanStats(response.data.stats || null)
-      setTab('clean') // Auto-switch to view the extracted subtitles
+      const response = await fetch(`${API}/transcribe`, { method: 'POST', body: fd })
+      if (!response.ok) throw new Error(`Server error: ${response.status}`)
+      
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data: ')) continue
+          
+          let data = null
+          try { data = JSON.parse(trimmed.substring(6)) } catch(e) { continue }
+          
+          if (data.status === 'starting' || data.status === 'processing') {
+             setTranscribeProgress({ pct: data.progress || 0, msg: data.message || 'Processing...' })
+          } else if (data.status === 'error') {
+             throw new Error(data.error || 'Transcription failed')
+          } else if (data.status === 'completed') {
+             setSubtitles(data.result?.subtitles || [])
+             setCleanStats(data.result?.stats || null)
+             setTab('clean')
+          }
+        }
+      }
     } catch (e) {
-      setTranscribeError(e.response?.data?.detail || 'Transcription failed')
-    } finally { setTranscribing(false) }
+      setTranscribeError(e.message || 'Transcription failed')
+    } finally { 
+      setTranscribing(false) 
+    }
   }
 
   const flaggedCount = subtitles.filter(s => s.flagged).length
@@ -493,6 +528,18 @@ export default function App() {
               <button style={{...S.btnPrimary, ...(transcribing || !audioFile ? S.btnOff : {})}} onClick={handleTranscribe} disabled={transcribing || !audioFile}>
                 {transcribing ? '⏳ Transcribing...' : '✨ Transcribe to SRT'}
               </button>
+
+              {transcribing && (
+                <div style={S.progressContainer}>
+                  <div style={S.progressBarOuter}>
+                    <div style={{...S.progressBarInner, width: `${transcribeProgress.pct}%`}} />
+                  </div>
+                  <div style={S.progressMeta}>
+                    <span style={S.progressMsg}>{transcribeProgress.msg}</span>
+                    <span style={S.progressPct}>{transcribeProgress.pct}%</span>
+                  </div>
+                </div>
+              )}
 
               {transcribeError && <div style={{...S.errBox, marginTop:20}}><div style={{fontSize:12,color:'#fca5a5'}}>{transcribeError}</div></div>}
             </div>

@@ -342,14 +342,11 @@ async def extract_file_endpoint(
 async def transcribe_audio(file: UploadFile = File(...)):
     import tempfile
     import os
+    import json
+    import threading
+    import queue
+    import asyncio
     from timecoded_subtitles import _from_seconds
-
-    # We use faster-whisper locally instead of an external API
-    # This removes file size limits and runs securely on your machine
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        raise HTTPException(500, "faster-whisper is not installed. Please run: pip install faster-whisper")
 
     filename = file.filename or "audio.webm"
     
@@ -359,43 +356,86 @@ async def transcribe_audio(file: UploadFile = File(...)):
         tmp.write(content)
         tmp_path = tmp.name
 
-    try:
-        # Load the base model locally. It automatically downloads on first run.
-        # "base" provides a great balance of speed and accuracy for local CPUs.
-        model = WhisperModel("base", device="cpu", compute_type="int8")
-        segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False)
+    async def transcribe_stream():
+        yield f"data: {json.dumps({'status': 'starting', 'message': 'Initializing transcription engine...', 'progress': 0})}\n\n"
+        await asyncio.sleep(0.05)
         
-        subtitles = []
-        for i, segment in enumerate(segments, start=1):
-            subtitles.append({
-                "id": i,
-                "start_time": _from_seconds(segment.start),
-                "end_time": _from_seconds(segment.end),
-                "text": segment.text.strip(),
-                "flagged": False,
-                "flag_reason": ""
-            })
-            
-    except Exception as e:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise HTTPException(500, f"Local transcription failed: {str(e)}")
+        q = queue.Queue()
         
-    finally:
+        def worker():
+            try:
+                from faster_whisper import WhisperModel
+                q.put({"type": "status", "message": "Loading AI model into memory (might download on first run)...", "progress": 5})
+                # "base" provides a great balance of speed and accuracy for local CPUs.
+                model = WhisperModel("base", device="cpu", compute_type="int8")
+                
+                q.put({"type": "status", "message": "Analyzing audio stream...", "progress": 10})
+                segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False)
+                
+                duration = info.duration
+                if duration <= 0: duration = 1.0
+                
+                q.put({"type": "status", "message": "Transcribing audio...", "progress": 15})
+                
+                subs = []
+                for i, segment in enumerate(segments, start=1):
+                    subs.append({
+                        "id": i,
+                        "start_time": _from_seconds(segment.start),
+                        "end_time": _from_seconds(segment.end),
+                        "text": segment.text.strip(),
+                        "flagged": False,
+                        "flag_reason": ""
+                    })
+                    pct = min(95, int(15 + (segment.end / duration) * 80))
+                    q.put({"type": "status", "message": f"Transcribing... ({int(segment.end)}s / {int(duration)}s)", "progress": pct})
+                    
+                q.put({"type": "done", "subtitles": subs})
+            except Exception as e:
+                q.put({"type": "error", "error": str(e)})
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.1)
+                continue
+                
+            if msg["type"] == "status":
+                yield f"data: {json.dumps({'status': 'processing', 'message': msg['message'], 'progress': msg['progress']})}\n\n"
+            elif msg["type"] == "error":
+                yield f"data: {json.dumps({'status': 'error', 'error': msg['error']})}\n\n"
+                break
+            elif msg["type"] == "done":
+                result = {
+                    "subtitles": msg["subtitles"],
+                    "stats": {
+                        "total_lines": len(msg["subtitles"]),
+                        "flagged_lines": 0,
+                        "platform": "none",
+                        "detected_structure": "local_whisper_audio",
+                        "original_format": filename
+                    }
+                }
+                yield f"data: {json.dumps({'status': 'completed', 'progress': 100, 'result': result})}\n\n"
+                break
+                
         # Clean up temporary file
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-            
-    return {
-        "subtitles": subtitles,
-        "stats": {
-            "total_lines": len(subtitles),
-            "flagged_lines": 0,
-            "platform": "none",
-            "detected_structure": "local_whisper_audio",
-            "original_format": filename
+
+    return StreamingResponse(
+        transcribe_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         }
-    }
+    )
 
 
 # ─── QUALITY CHECK ───────────────────────────────────────────────
