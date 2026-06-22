@@ -461,7 +461,7 @@ export default function App() {
           <div style={{maxWidth:600, margin:'0 auto'}}>
             <div style={S.card}>
               <div style={{fontSize:18, fontWeight:700, marginBottom:20, textAlign:'center'}}>🎙️ AI Audio / Video Transcription</div>
-              <div style={{fontSize:12, color:'#a78bfa', marginBottom:20, textAlign:'center'}}>Powered by Groq Whisper-Large-v3. Automatically generates frame-accurate SRT.</div>
+              <div style={{fontSize:12, color:'#a78bfa', marginBottom:20, textAlign:'center'}}>Powered by local Faster-Whisper. No file size limits, runs entirely on your machine. Automatically generates frame-accurate SRT.</div>
               
               <div style={{display:'flex', gap:10, marginBottom:20}}>
                 <div style={{flex:1, ...S.uploadZone}} onClick={()=>document.getElementById('audio-upload').click()}>

@@ -340,50 +340,59 @@ async def extract_file_endpoint(
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
-    groq_key = os.getenv("GROQ_API_KEY", "")
-    if not groq_key or groq_key == "your_groq_api_key_here":
-        raise HTTPException(500, "GROQ_API_KEY not configured. Transcription requires Groq API.")
+    import tempfile
+    import os
+    from timecoded_subtitles import _from_seconds
 
-    from groq import Groq
-    client = Groq(api_key=groq_key)
-    
-    file_bytes = await file.read()
-    if len(file_bytes) > 25 * 1024 * 1024:
-        raise HTTPException(400, "File is too large. Max size supported by Groq is 25MB.")
-        
+    # We use faster-whisper locally instead of an external API
+    # This removes file size limits and runs securely on your machine
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        raise HTTPException(500, "faster-whisper is not installed. Please run: pip install faster-whisper")
+
     filename = file.filename or "audio.webm"
-    ext = filename.split(".")[-1].lower()
     
-    # Groq supported audio formats: mp3, mp4, mpeg, mpga, m4a, wav, webm
-    if ext not in ['mp3', 'mp4', 'mpeg', 'mpga', 'm4a', 'wav', 'webm']:
-        # If the user uploaded an unsupported video like mkv, avi, or no extension
-        # the simplest approach without ffmpeg is to rename to a supported container like webm or mp4 
-        # and see if Groq can demux it. 
-        filename = "audio.webm"
+    # Save the uploaded file to a temporary location for faster-whisper
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
 
     try:
-        transcription = client.audio.transcriptions.create(
-            file=(filename, file_bytes),
-            model="whisper-large-v3",
-            response_format="srt",
-            language="en"
-        )
+        # Load the base model locally. It automatically downloads on first run.
+        # "base" provides a great balance of speed and accuracy for local CPUs.
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+        segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False)
+        
+        subtitles = []
+        for i, segment in enumerate(segments, start=1):
+            subtitles.append({
+                "id": i,
+                "start_time": _from_seconds(segment.start),
+                "end_time": _from_seconds(segment.end),
+                "text": segment.text.strip(),
+                "flagged": False,
+                "flag_reason": ""
+            })
+            
     except Exception as e:
-        raise HTTPException(500, f"Transcription failed (API error): {str(e)}")
-
-    # `transcription.text` contains the raw SRT string, or if response_format="srt" makes it return a string
-    raw_srt = getattr(transcription, "text", transcription) if not isinstance(transcription, str) else transcription
-
-    from timecoded_subtitles import parse_timecoded_subtitles
-    subtitles = parse_timecoded_subtitles(raw_srt)
-    
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise HTTPException(500, f"Local transcription failed: {str(e)}")
+        
+    finally:
+        # Clean up temporary file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            
     return {
         "subtitles": subtitles,
         "stats": {
             "total_lines": len(subtitles),
             "flagged_lines": 0,
             "platform": "none",
-            "detected_structure": "whisper_audio",
+            "detected_structure": "local_whisper_audio",
             "original_format": filename
         }
     }
