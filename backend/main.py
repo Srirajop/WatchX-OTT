@@ -19,6 +19,7 @@ from extractor import pre_extract_dialogue
 from cleaner import clean_subtitle_chunk, extract_platform_rules_with_ai
 from quality_checker import check_quality
 from platform_rules import get_platform, get_platform_list
+from timecoded_subtitles import ensure_srt_timings, parse_timecoded_subtitles, prepare_for_platform, subtitles_to_srt
 
 load_dotenv()
 
@@ -90,13 +91,10 @@ async def clean_file_endpoint(
 
     filename = file.filename or "unknown.txt"
     ext = "." + filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    file_ext = ext.lstrip(".")
 
     if ext not in ALLOWED:
         raise HTTPException(400, f"File type '{ext}' not supported.")
-
-    groq_key = os.getenv("GROQ_API_KEY", "")
-    if not groq_key or groq_key == "your_groq_api_key_here":
-        raise HTTPException(500, "GROQ_API_KEY not configured. Get free key at https://console.groq.com")
 
     file_bytes = await file.read()
     if not file_bytes:
@@ -111,6 +109,57 @@ async def clean_file_endpoint(
 
     # ── Step 1: Pure Python extraction (instant, no LLM) ─────────────────────
     platform_dict = get_platform(platform)
+    timecoded_subtitles = parse_timecoded_subtitles(raw_text)
+
+    if timecoded_subtitles:
+        async def timecoded_event_generator():
+            yield f"data: {json.dumps({'status': 'starting', 'progress': 0, 'message': 'Converting to SRT with original timecodes...'})}\n\n"
+            await asyncio.sleep(0.05)
+
+            from quality_checker import auto_fix_subtitles
+            fixed_subtitles = auto_fix_subtitles(timecoded_subtitles, platform)
+            fixed_subtitles = ensure_srt_timings(fixed_subtitles)
+            fixed_subtitles = prepare_for_platform(fixed_subtitles, platform, filename)
+            for s_idx, sub in enumerate(fixed_subtitles, start=1):
+                sub["id"] = s_idx
+                sub["start_time"] = normalize_tc(sub.get("start_time", ""))
+                sub["end_time"] = normalize_tc(sub.get("end_time", ""))
+
+            total_lines = len(fixed_subtitles)
+            flagged_lines = sum(1 for s in fixed_subtitles if s.get("flagged"))
+
+            try:
+                log_job(filename, file_ext, platform, structure, total_lines, flagged_lines, 0)
+            except Exception as e:
+                print(f"Failed to log job: {e}")
+
+            final_result = {
+                "subtitles": fixed_subtitles,
+                "stats": {
+                    "total_lines": total_lines,
+                    "flagged_lines": flagged_lines,
+                    "platform": platform,
+                    "detected_structure": "srt_timecoded",
+                    "original_format": filename
+                }
+            }
+
+            yield f"data: {json.dumps({'status': 'completed', 'progress': 100, 'result': final_result})}\n\n"
+
+        return StreamingResponse(
+            timecoded_event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            }
+        )
+
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    if not groq_key or groq_key == "your_groq_api_key_here":
+        raise HTTPException(500, "GROQ_API_KEY not configured. Get free key at https://console.groq.com")
+
     pre_extracted = pre_extract_dialogue(raw_text, structure, file_bytes, filename, platform_dict)
 
     if pre_extracted:
@@ -125,17 +174,14 @@ async def clean_file_endpoint(
 
     provider = os.getenv("LLM_PROVIDER", "groq").lower()
     # With pre-extraction, input is already clean dialogue.
-    # We use smaller chunks (600) for Groq.
+    # We use optimized chunking to balance TPM limits and throughput.
     lmstudio_chunk = int(os.getenv("LM_STUDIO_CHUNK_SIZE", "1500"))
-    chunk_size = lmstudio_chunk if provider == "lmstudio" else 600
+    chunk_size = lmstudio_chunk if provider == "lmstudio" else 3000
     chunks = chunk_text(clean_input, max_chunk_size=chunk_size)
     total_chunks = len(chunks)
     
-    # Process 5 chunks simultaneously. This is the mathematical maximum 
-    # we can do on Groq's free tier (~750 tokens per request * 5 = 3750 tokens).
-    parallel = int(os.getenv("LM_STUDIO_PARALLEL", "1")) if provider == "lmstudio" else 5
-
-    file_ext = ext.lstrip(".")
+    # Process fewer chunks in parallel with larger sizes to prevent exceeding Groq TPM.
+    parallel = int(os.getenv("LM_STUDIO_PARALLEL", "1")) if provider == "lmstudio" else 2
 
     async def process_chunk(idx: int, chunk: str):
         loop = asyncio.get_running_loop()
@@ -173,9 +219,28 @@ async def clean_file_endpoint(
                 yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
                 return
 
-        # Re-index all subtitles contiguously
+        # Re-index all subtitles contiguously and assign sequential placeholder timecodes if missing
+        from timecoded_subtitles import _from_seconds, _to_seconds
+        tc = 0.0
         for s_idx, sub in enumerate(all_subtitles, start=1):
             sub["id"] = s_idx
+            
+            # If timecodes are missing, generate sequential ones (3s apart) so SRT export works
+            if not sub.get("start_time"):
+                sub["start_time"] = _from_seconds(tc)
+                sub["end_time"] = _from_seconds(tc + 2.0)
+                tc += 3.0
+            else:
+                # Keep existing timecodes, but update 'tc' so any subsequent missing ones continue from here
+                parsed = _to_seconds(sub["start_time"])
+                if parsed is not None:
+                    tc = parsed + 3.0
+                if not sub.get("end_time"):
+                    sub["end_time"] = _from_seconds(tc - 1.0)
+
+        # ── Auto-fix pass: apply platform rules in Python (100% reliable) ──
+        from quality_checker import auto_fix_subtitles
+        all_subtitles = auto_fix_subtitles(all_subtitles, platform)
 
         total_lines = len(all_subtitles)
         flagged_lines = sum(1 for s in all_subtitles if s.get("flagged"))
@@ -236,6 +301,19 @@ async def extract_file_endpoint(
         raise HTTPException(400, "Could not extract text from file")
 
     platform_dict = get_platform(platform)
+    timecoded_subtitles = parse_timecoded_subtitles(raw_text)
+    if timecoded_subtitles:
+        return {
+            "subtitles": timecoded_subtitles,
+            "stats": {
+                "total_lines": len(timecoded_subtitles),
+                "flagged_lines": 0,
+                "platform": "none",
+                "detected_structure": "srt_timecoded",
+                "original_format": filename
+            }
+        }
+
     pre_extracted = pre_extract_dialogue(raw_text, structure, file_bytes, filename, platform_dict)
     if not pre_extracted:
         pre_extracted = raw_text.splitlines()
@@ -274,11 +352,16 @@ async def quality_check_endpoint(data: dict):
     if not subtitles:
         raise HTTPException(400, "No subtitles provided for quality check")
 
+    subtitles = prepare_for_platform(subtitles, platform_key, filename)
     result = check_quality(subtitles, platform_key, filename)
+    result["subtitles"] = subtitles
 
     # Log defects
-    log_job(filename, "quality_check", platform_key, "quality_check",
-            result.get("total_lines", 0), 0, result.get("total_defects", 0))
+    try:
+        log_job(filename, "quality_check", platform_key, "quality_check",
+                result.get("total_lines", 0), 0, result.get("total_defects", 0))
+    except Exception:
+        pass
 
     return result
 
@@ -287,22 +370,19 @@ async def quality_check_endpoint(data: dict):
 
 @app.post("/export/srt")
 async def export_srt(data: dict):
-    """Export dialogue-only as a plain numbered text file (no timecodes)."""
+    """Export real SRT with preserved timecodes."""
     subtitles = data.get("subtitles", [])
+    platform_key = data.get("platform_key", "generic")
     filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
 
-    lines = []
-    for sub in subtitles:
-        text = sub.get("text", "").strip()
-        if text:
-            lines.append(text)
-
-    # One blank line between each entry for the clean spaced look
-    content = "\n\n".join(lines)
+    subtitles = prepare_for_platform(subtitles, platform_key, data.get("filename", "cleaned"))
+    content = subtitles_to_srt(subtitles)
+    if not content.strip():
+        raise HTTPException(400, "No timecoded subtitles available for SRT export.")
 
     buf = io.BytesIO(content.encode("utf-8"))
-    return StreamingResponse(buf, media_type="text/plain",
-        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.txt"})
+    return StreamingResponse(buf, media_type="application/x-subrip",
+        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.srt"})
 
 
 @app.post("/export/txt")

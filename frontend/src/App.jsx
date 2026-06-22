@@ -7,6 +7,7 @@ const SEVERITY_COLOR = { critical: '#ef4444', error: '#f59e0b', warning: '#a78bf
 const SEVERITY_BG = { critical: '#2a0f0f', error: '#2a1f0f', warning: '#1a1535' }
 
 const STRUCTURE_LABELS = {
+  srt_timecoded: 'SRT Timecoded',
   srt_format: 'SRT File', vtt_format: 'VTT File',
   table_with_timecodes: 'Table with Timecodes', paragraph_with_speaker: 'Paragraph Script',
   paragraph_without_table: 'Script with Timecodes', ccsl_double_dialogue: 'CCSL Spotting List',
@@ -141,10 +142,11 @@ export default function App() {
   }
 
   async function exportSRT() {
-    const r = await axios.post(`${API}/export/srt`, { subtitles, filename: file?.name }, { responseType: 'blob' })
+    const r = await axios.post(`${API}/export/srt`, { subtitles, filename: file?.name, platform_key: platform }, { responseType: 'blob' })
     const url = URL.createObjectURL(r.data)
     const a = document.createElement('a'); a.href = url
-    a.download = `${file?.name || 'subtitles'}_cleaned.srt`; a.click(); URL.revokeObjectURL(url)
+    const base = (file?.name || 'subtitles').replace(/\.[^/.]+$/, '')
+    a.download = `${base}_cleaned.srt`; a.click(); URL.revokeObjectURL(url)
   }
 
   async function exportTXT() {
@@ -178,13 +180,18 @@ export default function App() {
     try {
       let subs = subtitles
 
-      // If a separate file uploaded for QC
+      // If a separate file uploaded for QC — use /extract (returns JSON, not SSE)
       if (qcFile) {
         const fd = new FormData()
         fd.append('file', qcFile)
         fd.append('platform', platform)
-        const cleanR = await axios.post(`${API}/clean`, fd)
-        subs = cleanR.data.subtitles || []
+        const extractR = await axios.post(`${API}/extract`, fd)
+        subs = extractR.data.subtitles || []
+      }
+
+      if (!subs.length) {
+        setQcError('No dialogue lines found in file')
+        return
       }
 
       const r = await axios.post(`${API}/quality-check`, {
@@ -192,9 +199,10 @@ export default function App() {
         platform_key: platform,
         filename: qcFile?.name || file?.name || 'subtitles.srt'
       })
+      if (r.data.subtitles?.length && !qcFile) setSubtitles(r.data.subtitles)
       setQcResult(r.data)
     } catch (e) {
-      setQcError(e.response?.data?.detail || 'Quality check failed')
+      setQcError(e.response?.data?.detail || 'Quality check failed — is backend running?')
     } finally { setChecking(false) }
   }
 
@@ -367,6 +375,9 @@ export default function App() {
                   <div style={S.subList}>
                     {subtitles.map((sub,i) => (
                       <div key={i} style={{...S.subRow,...(sub.flagged?S.subFlagged:{})}}>
+                        {(sub.start_time || sub.end_time) && (
+                          <div style={S.timecode}>{`${sub.start_time} --> ${sub.end_time}`}</div>
+                        )}
                         <div style={{...S.subText,...(sub.flagged?{color:'#fca5a5'}:{})}}
                           contentEditable suppressContentEditableWarning
                           onBlur={e=>{const u=[...subtitles];u[i]={...u[i],text:e.target.textContent};setSubtitles(u)}}>
@@ -619,6 +630,7 @@ const S = {
   subList: { maxHeight:560, overflowY:'auto', border:'1px solid #1e1e2e', borderRadius:8 },
   subRow: { padding:'18px 24px', borderBottom:'1px solid #131320', textAlign:'center' },
   subFlagged: { background:'#1a0f0f', borderLeft:'3px solid #ef4444' },
+  timecode: { fontSize:11, color:'#a78bfa', fontFamily:'Consolas, monospace', marginBottom:6 },
   subText: { fontSize:13, color:'#e8e6df', lineHeight:1.8, outline:'none' },
   empty: { display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:300, textAlign:'center', padding:30, background:'#0d0d1a', border:'1px solid #1e1e2e', borderRadius:12 },
   input: { width:'100%', padding:'10px 12px', background:'#08080f', border:'1.5px solid #2a2a3e', borderRadius:8, color:'#e8e6df', fontSize:13, marginBottom:10, outline:'none' },

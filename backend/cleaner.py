@@ -175,12 +175,10 @@ def clean_subtitle_chunk(
     client, model_name, is_local = _get_client_and_model()
     system_prompt, user_prompt = build_prompt(raw_text, structure, platform, max_chars)
 
-    # Ultra-fast parallel trick:
-    # 600-char chunk is ~150 input tokens.
-    # We only need ~150 output tokens. We cap at 300 to be safe.
-    # Total request size = ~450 tokens. 
-    # With Groq's 6000 TPM limit, 450 tokens per request means we can do 10+ chunks in parallel!
-    max_output_tokens = 800 if is_local else 300
+    # Groq free tier optimization:
+    # 3000-char chunk is ~750 input tokens.
+    # We need ~750 output tokens. We cap at 1200 to be safe.
+    max_output_tokens = 800 if is_local else 1200
     retry_delay = 0.5 if is_local else 2
 
     last_error = None

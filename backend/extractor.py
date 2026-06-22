@@ -26,27 +26,41 @@ _ALLCAPS_NOISE = re.compile(
     re.IGNORECASE
 )
 
-# Stage directions in ANY bracket type
+# Stage directions in ANY bracket type — catches ALL parenthetical content
 _BRACKETS = re.compile(
-    r'\(speaking\s+\w+\)\s*'       # (speaking Spanish)
-    r'|\(through\s+\w+\)\s*'       # (through telephone)
-    r'|\(whispering[^)]*\)\s*'     # (whispering in Spanish)
-    r'|\(overlaps?\)\s*'           # (overlaps)
-    r'|\(Archive\)\s*'             # (Archive)
-    r'|\(continues?[^)]*\)\s*'     # (continues...)
-    r'|\(indistinct[^)]*\)\s*'     # (indistinct chatter)
-    r'|\(.*?music.*?\)\s*'         # (music)
-    r'|\[.*?\]'                    # [gasps] [MUSIC]
-    r'|<[^>]+>'                    # <gasps> <laughs>
+    r'\(speaking\s+\w+\)\s*'           # (speaking Spanish)
+    r'|\(through\s+\w+\)\s*'           # (through telephone)
+    r'|\(into\s+\w+\)\s*'              # (into phone) (into radio)
+    r'|\(to\s+[^)]+\)\s*'              # (to himself) (to Maria)
+    r'|\(whispering[^)]*\)\s*'         # (whispering in Spanish)
+    r'|\(overlaps?\)\s*'               # (overlaps)
+    r'|\(Archive\)\s*'                 # (Archive)
+    r'|\(continues?[^)]*\)\s*'         # (continues...)
+    r'|\(indistinct[^)]*\)\s*'         # (indistinct chatter)
+    r'|\(.*?music.*?\)\s*'             # (music)
+    r'|\(sarcastically\)\s*'           # (sarcastically)
+    r'|\(quietly\)\s*'                 # (quietly)
+    r'|\(loudly\)\s*'                  # (loudly)
+    r'|\(angrily\)\s*'                 # (angrily)
+    r'|\(softly\)\s*'                  # (softly)
+    r'|\(nervously\)\s*'               # (nervously)
+    r'|\(in\s+\w+\)\s*'               # (in English) (in Spanish)
+    r'|\[.*?\]'                        # [gasps] [MUSIC] [indistinct]
+    r'|<[^>]+>'                        # <gasps> <laughs>
     r'|\(LAUGHS?\)|\(CHUCKLES?\)|\(GASPS?\)|\(SIGHS?\)|\(SCREAMS?\)'
     r'|\(CRIES?\)|\(SOBBING\)|\(MOANS?\)|\(GROANS?\)'
-    r'|\([^)]+:\s*[^)]+\)',         # Slang notes like (Come on: interjection...)
+    r'|\([^)]+:\s*[^)]+\)',            # Slang notes like (Come on: interjection...)
     re.IGNORECASE
 )
 
 # Character name patterns — speaker labels (ends with : or -)
 _SPEAKER_LABEL = re.compile(
     r'^(?:\(OPTIONAL\)\s*)?[A-Z][A-Z\s\.\-\'\/\(\)0-9\#\&\,]{1,60}[:\-]\s*'
+)
+
+# Inline speaker without colon/hyphen (ALL CAPS followed by space)
+_INLINE_SPEAKER = re.compile(
+    r"^([A-Z]{2,30}(?:\s+[A-Z0-9]{1,30}){0,3}|[A-Z]\s+[A-Z0-9]{1,30})\s+(?=[A-Z][a-z]|I\s|['\"\(]|\d)"
 )
 
 # Lines to skip entirely if they contain these metadata phrases (used with search)
@@ -158,6 +172,8 @@ def extract_docx_table(file_bytes: bytes) -> list[str]:
                 # Clean and strip speaker labels / slang notes
                 cleaned_dialogue = _clean_line(dialogue)
                 cleaned_dialogue = _SPEAKER_LABEL.sub('', cleaned_dialogue).strip()
+                m = _INLINE_SPEAKER.match(cleaned_dialogue)
+                if m: cleaned_dialogue = cleaned_dialogue[m.end():].strip()
                 cleaned_dialogue = re.sub(r'\([^)]+\)$', '', cleaned_dialogue).strip()
                 
                 if not cleaned_dialogue:
@@ -176,6 +192,8 @@ def extract_docx_table(file_bytes: bytes) -> list[str]:
                     continue
                 cleaned = _clean_line(dialogue)
                 cleaned = _SPEAKER_LABEL.sub('', cleaned).strip()
+                m = _INLINE_SPEAKER.match(cleaned)
+                if m: cleaned = cleaned[m.end():].strip()
                 cleaned = re.sub(r'\([^)]+\)$', '', cleaned).strip()
                 if _is_valid(cleaned):
                     lines.append(cleaned)
@@ -190,6 +208,8 @@ def extract_docx_table(file_bytes: bytes) -> list[str]:
         if _SCENE_HEADINGS.match(text) or _SKIP_PATTERNS.match(text):
             continue
         text = _SPEAKER_LABEL.sub('', text)
+        m = _INLINE_SPEAKER.match(text)
+        if m: text = text[m.end():].strip()
         cleaned = _clean_line(text)
         cleaned = re.sub(r'\([^)]+\)$', '', cleaned).strip()
         if _is_valid(cleaned, min_words=2):
@@ -264,6 +284,8 @@ def extract_table(text: str) -> list[str]:
         if dialogue and not _SKIP_PATTERNS.search(dialogue):
             # Remove speaker label if present in the dialogue cell
             dialogue = _SPEAKER_LABEL.sub('', dialogue).strip()
+            m = _INLINE_SPEAKER.match(dialogue)
+            if m: dialogue = dialogue[m.end():].strip()
             # Remove trailing slang definitions
             dialogue = re.sub(r'\([^)]+\)$', '', dialogue).strip()
             if _is_valid(dialogue):
@@ -312,6 +334,8 @@ def extract_script_with_speaker(text: str) -> list[str]:
             
         # Remove speaker label
         line = _SPEAKER_LABEL.sub('', line).strip()
+        m = _INLINE_SPEAKER.match(line)
+        if m: line = line[m.end():].strip()
         # Also remove any remaining slang definitions like (Slang)
         line = re.sub(r'\([^)]+\)$', '', line).strip() # Removes trailing brackets like (Be quiet)
         cleaned = _clean_line(line)
@@ -332,6 +356,8 @@ def extract_script_with_timecodes(text: str) -> list[str]:
         if _SCENE_HEADINGS.match(line) or _SKIP_PATTERNS.search(line):
             continue
         line = _SPEAKER_LABEL.sub('', line).strip()
+        m = _INLINE_SPEAKER.match(line)
+        if m: line = line[m.end():].strip()
         cleaned = _clean_line(line)
         cleaned = re.sub(r'\([^)]+\)$', '', cleaned).strip()
         if _is_valid(cleaned, min_words=1):

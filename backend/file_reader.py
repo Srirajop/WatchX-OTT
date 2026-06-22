@@ -208,48 +208,11 @@ def read_pdf(file_bytes: bytes) -> str:
 
 
 def read_srt(file_bytes: bytes) -> str:
-    text = decode_bytes(file_bytes)
-    blocks = re.split(r'\n\s*\n', text.strip())
-    lines = []
-    for block in blocks:
-        blines = [l.strip() for l in block.splitlines() if l.strip()]
-        if not blines:
-            continue
-        idx = blines[0] if blines[0].isdigit() else ""
-        tc = ""
-        txt = []
-        for line in (blines[1:] if idx else blines):
-            if "-->" in line:
-                tc = line
-            else:
-                txt.append(line)
-        if tc and txt:
-            lines.append(f"{tc} | {' '.join(txt)}")
-        elif txt:
-            lines.append(' '.join(txt))
-    return "\n".join(lines)
+    return decode_bytes(file_bytes)
 
 
 def read_vtt(file_bytes: bytes) -> str:
-    text = decode_bytes(file_bytes)
-    text = re.sub(r'^WEBVTT.*\n', '', text, flags=re.MULTILINE)
-    text = re.sub(r'NOTE.*?\n\n', '', text, flags=re.DOTALL)
-    blocks = re.split(r'\n\s*\n', text.strip())
-    lines = []
-    for block in blocks:
-        blines = [l.strip() for l in block.splitlines() if l.strip()]
-        tc = ""
-        txt = []
-        for line in blines:
-            if "-->" in line:
-                tc = line
-            elif not line.isdigit():
-                clean = re.sub(r'<[^>]+>', '', line).strip()
-                if clean:
-                    txt.append(clean)
-        if txt:
-            lines.append(f"{tc} | {' '.join(txt)}" if tc else ' '.join(txt))
-    return "\n".join(lines)
+    return decode_bytes(file_bytes)
 
 
 def read_xml(file_bytes: bytes) -> str:
