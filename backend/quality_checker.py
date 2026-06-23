@@ -1,12 +1,89 @@
-# quality_checker.py — Checks AND auto-fixes cleaned subtitle files
+# quality_checker.py - Checks AND auto-fixes cleaned subtitle files
 # Based on REAL rules from OTT Clients Protocol Excel images
 # Two modes: check_quality (report defects) and auto_fix (fix what can be fixed)
 
 import re
 from platform_rules import get_platform, UNIVERSAL_GUIDELINES, get_profanity_table
+from italic_formatter import apply_italics_rules, has_italics_errors
 
 
-# ─── AUTO-FIX PASS ───────────────────────────────────────────────────────────
+# --- HELPERS ---
+
+_NUMS_1_10 = {
+    '0': 'zero', '1': 'one', '2': 'two', '3': 'three', '4': 'four',
+    '5': 'five', '6': 'six', '7': 'seven', '8': 'eight', '9': 'nine', '10': 'ten'
+}
+_NUMS_1_9 = {k: v for k, v in _NUMS_1_10.items() if k not in ('10',)}
+_NUMS_0_9 = _NUMS_1_10.copy()
+
+# UK -> US spelling corrections (most common broadcast subtitle issues)
+_UK_US = {
+    r'\bcolour\b': 'color', r'\bcolours\b': 'colors',
+    r'\bfavourite\b': 'favorite', r'\bfavourites\b': 'favorites',
+    r'\bneighbour\b': 'neighbor', r'\bneighbours\b': 'neighbors',
+    r'\bhonour\b': 'honor', r'\bhonours\b': 'honors',
+    r'\bbehaviour\b': 'behavior', r'\bbehaviours\b': 'behaviors',
+    r'\bflavour\b': 'flavor', r'\bflavours\b': 'flavors',
+    r'\blabour\b': 'labor', r'\blabours\b': 'labors',
+    r'\bhumour\b': 'humor', r'\btumour\b': 'tumor',
+    r'\brealise\b': 'realize', r'\brealises\b': 'realizes', r'\brealised\b': 'realized',
+    r'\borganise\b': 'organize', r'\borganised\b': 'organized',
+    r'\brecognise\b': 'recognize', r'\brecognised\b': 'recognized',
+    r'\bcentre\b': 'center', r'\btheatre\b': 'theater',
+    r'\blicence\b': 'license', r'\bdefence\b': 'defense',
+    r'\bprogramme\b': 'program', r'\bprogrammes\b': 'programs',
+    r'\btravelling\b': 'traveling', r'\bcancelled\b': 'canceled',
+    r'\bfulfil\b': 'fulfill', r'\benrol\b': 'enroll',
+    r'\bjoalise\b': 'realize',
+}
+
+
+def _fix_numbers_in_text(text: str, num_map: dict) -> str:
+    """Replace standalone digit strings with their word equivalents."""
+    def _replacer(m):
+        n = m.group(0)
+        # Skip years, times, addresses, measurements (context heuristics)
+        pre = text[:m.start()]
+        post = text[m.end():]
+        # Skip if preceded by $ / % or followed by % / ft / mph / km etc.
+        if re.search(r'[$%]$', pre) or re.search(r'^[%s]', post):
+            return n
+        if re.search(r'(st|nd|rd|th|ft|in|cm|mm|km|kg|lb|mph|kph|am|pm)$', post[:3], re.IGNORECASE):
+            return n
+        # Skip 4-digit numbers (years like 2024)
+        if len(n) == 4 and n.startswith(('19', '20')):
+            return n
+        return num_map.get(n, n)
+    # Match standalone numbers (not part of larger numbers)
+    pattern = r'\b(' + '|'.join(re.escape(k) for k in sorted(num_map, key=len, reverse=True)) + r')\b'
+    return re.sub(pattern, _replacer, text)
+
+
+def _fix_us_spelling(text: str) -> str:
+    """Fix British -> US English spelling."""
+    for pattern, replacement in _UK_US.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
+
+def _strip_remaining_char_names(text: str) -> str:
+    """Last-resort removal of ALL-CAPS character name labels at line start.
+    Preserves <i>/<b> italic/bold tags — stashes them, strips speaker label, restores."""
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        # Stash italic/bold tags so they survive speaker-label stripping
+        line = line.replace('<i>', '__IO__').replace('</i>', '__IC__')
+        line = line.replace('<b>', '__BO__').replace('</b>', '__BC__')
+        # Pattern: ALL-CAPS word(s) followed by : or - at start of line
+        stripped = re.sub(r'^[A-Z][A-Z0-9 .\'/()]{1,40}[:\-]\s*', '', line)
+        if stripped.strip():  # don't blank the whole line
+            line = stripped
+        # Restore tags
+        line = line.replace('__IO__', '<i>').replace('__IC__', '</i>')
+        line = line.replace('__BO__', '<b>').replace('__BC__', '</b>')
+        cleaned.append(line)
+    return '\n'.join(cleaned)
 
 def _capitalize_line(line: str) -> str:
     # If it starts with ellipsis, keep lowercase as it indicates mid-sentence continuation
@@ -70,16 +147,29 @@ def _split_line(line: str, max_chars: int) -> str:
 
 def auto_fix_subtitles(subtitles: list, platform_key: str) -> list:
     """
-    Apply platform rules automatically in Python — 100% reliable.
-    Fixes: profanity replacement, double spaces, punctuation, sentence case,
-           line splitting at char limit, HOH/EMT removal, filler removal.
-    Called AFTER LLM polish.
+    Apply platform rules automatically in Python - 100% reliable catch-all.
+    Called AFTER the LLM clean pass to fix anything the LLM missed.
+    Fixes: profanity, punctuation, sentence case, HOH removal, filler removal,
+           two-speaker hyphen format, number words, character name stripping,
+           italics formatting, US spelling, line splitting.
     """
     platform = get_platform(platform_key)
     max_chars = platform.get("max_chars_per_line", 42)
     max_chars_italics = platform.get("max_chars_italics", max_chars)
     profanity_table = get_profanity_table(platform_key)
     remove_elements = platform.get("remove_elements", [])
+    rules_text = " ".join(platform.get("rules", []))
+    speaker_fmt = platform.get("two_speaker_format", "")
+
+    # Determine number rule from platform rules
+    if "1-10 in words" in rules_text or "Numbers 1-10" in rules_text:
+        num_map = _NUMS_1_10
+    elif "0-9 written out" in rules_text:
+        num_map = _NUMS_0_9
+    elif "1-9" in rules_text or "spell out numbers 1-9" in rules_text.lower():
+        num_map = _NUMS_1_9
+    else:
+        num_map = None
 
     fixed = []
     for sub in subtitles:
@@ -88,46 +178,141 @@ def auto_fix_subtitles(subtitles: list, platform_key: str) -> list:
             fixed.append(sub)
             continue
 
-        # 1. Remove HOH/EMT elements (Discovery/DMAX requirement)
+        # 1. Remove HOH/EMT elements
         if "HOH" in remove_elements or "EMT" in remove_elements:
             text = re.sub(r'\[MUSIC[^\]]*\]', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'\[APPLAUSE\]', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'\[LAUGHTER\]', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'\[CHEERING\]', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'\[[^\]]*sound[^\]]*\]', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'\[[^\]]*music[^\]]*\]', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'\[APPLAUSE[^\]]*\]', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'\[LAUGHTER[^\]]*\]', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'\[CHEERING[^\]]*\]', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'\[SINGING[^\]]*\]', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'\[[^\]]*(?:sound|music|applause|laughter|singing|cheering|gunshot|explosion)[^\]]*\]', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'\(.*?(?:music|singing|narrator|narrating|chuckles|laughs|sighs|gasps|crying|sobbing|whimpering).*?\)', '', text, flags=re.IGNORECASE)
+            # Remove any remaining [...] blocks that look like HOH
+            text = re.sub(r'\[[A-Z ]+\]', '', text)
 
-        # 2. Remove fillers (Guide Discovery requirement)
+        # 2. Remove stage directions
+        if "stage_directions" in remove_elements:
+            text = re.sub(r'\([^)]{1,100}\)', '', text)
+            text = re.sub(r'\[[^\]]{1,100}\]', '', text)
+
+        # 3. Remove character name labels
+        if "character_names" in remove_elements:
+            text = _strip_remaining_char_names(text)
+
+        # 4. Remove fillers
         if "fillers" in remove_elements:
-            text = re.sub(r'\b(ugh|hmm|erm|ah|oh)\b[\.,]?\s*', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'\b(u+gh+|h+mm+|erm+|a+h+|o+h+|u+m+|u+h+)\b[\.,]?\s*', '', text, flags=re.IGNORECASE)
 
-        # 3. Replace profanity per platform table
+        # 5. Replace profanity per platform table
         for word, replacement in profanity_table.items():
             text = re.sub(r'\b' + re.escape(word) + r'\b', replacement, text, flags=re.IGNORECASE)
 
-        # 4. Fix double spaces
+        if "asterisks (****)" in rules_text:
+            text = re.sub(r'\*bleep\*|\[bleep\]|\(bleep\)', '****', text, flags=re.IGNORECASE)
+
+        # 6. Fix double spaces
         text = re.sub(r'  +', ' ', text)
 
-        # 5. Fix space before punctuation
+        # 7. Fix space before punctuation
         text = re.sub(r' ([.,!?;:])', r'\1', text)
 
-        # 6. Fix sentence case — first word capitalised (respects hyphens and ellipses)
+        # 8. Fix double/mixed punctuation
+        text = re.sub(r'!!+', '!', text)
+        text = re.sub(r'\?\?+', '?', text)
+        text = re.sub(r'[!?][?!]+', '!', text)  # !? ?! etc
+
+        # 9. Ellipsis must be exactly 3 dots
+        text = re.sub(r'\.{4,}', '...', text)
+        # Convert exactly 2 dots to 3 dots, using lookbehinds to prevent touching existing 3 dots
+        text = re.sub(r'(?<!\.)\.{2}(?!\.)', '...', text)
+
+        # 10. Two-speaker hyphen format
+        if speaker_fmt == "hyphen_no_space":
+            text = re.sub(r'^- ', '-', text, flags=re.MULTILINE)
+        elif speaker_fmt == "hyphen_with_space":
+            text = re.sub(r'^-([^\-\s])', r'- \1', text, flags=re.MULTILINE)
+
+        # --- PLATFORM-SPECIFIC TEXTUAL RULE ENFORCEMENT ---
+
+        # 10a. "Always use quotation marks instead of apostrophes for quotes"
+        if "quotation marks instead of apostrophes" in rules_text:
+            text = re.sub(r"(^|\s)'([^']*)'(\s|$|[.,?!])", r'\1"\2"\3', text)
+            
+        # 10b. "Do not use &, <, >, degree or copyright symbols"
+        # For platforms like discovery_scripps that forbid ALL text styles,
+        # first strip SRT/HTML markup tags cleanly (e.g. <i>text</i> -> text)
+        # THEN remove any remaining bare < > characters.
+        if "&, <, >, degree or copyright symbols" in rules_text:
+            text = re.sub(r'<[^>]+>', '', text)   # strip all HTML/SRT tags cleanly
+            text = text.replace('&', 'and')
+            text = text.replace('<', '')
+            text = text.replace('>', '')
+            text = text.replace('©', '')
+            text = text.replace('°', ' degrees')
+
+            
+        # 10c. "No periods for acronyms: FBI, NASA, NATO"
+        if "no periods for acronyms" in rules_text:
+            def remove_periods(m): return m.group(0).replace('.', '')
+            text = re.sub(r'\b([A-Z])\.([A-Z])\.([A-Z])?\.?', remove_periods, text)
+            
+        # 10d. "Use ellipsis without space at start if subtitle starts mid-sentence"
+        if "ellipsis without space at start" in rules_text:
+            text = re.sub(r'^\.\.\.\s+', '...', text, flags=re.MULTILINE)
+
+        # 10e. "Song lyrics italicised, upper case at beginning of line"
+        if "upper case at beginning of line" in rules_text and "song" in rules_text:
+            def upper_lyric(m): return m.group(1) + m.group(2).upper()
+            text = re.sub(r'(♪\s*)([a-z])', upper_lyric, text)
+            
+        # 10f. "No punctuation at end of song line except ? and !"
+        if "no punctuation at end of song line" in rules_text:
+            lines = text.split('\n')
+            for i, line in enumerate(lines):
+                if '♪' in line or '♫' in line:
+                    lines[i] = re.sub(r'[,.]+(\s*(?:</i>)?\s*)$', r'\1', line)
+            text = '\n'.join(lines)
+            
+        # 10g. "STORY and LANG must be capitalised with colon followed by space"
+        if "story and lang must be capitalised" in rules_text:
+            text = re.sub(r'(?i)\bstory\s*:', 'STORY:', text)
+            text = re.sub(r'(?i)\blang\s*:', 'LANG:', text)
+
+        # 10h. "Double hyphens (--) for abrupt interruptions"
+        if "double hyphens (--)" in rules_text:
+            text = re.sub(r'—', '--', text)  # convert em-dash to double hyphen
+
+        # 11. Fix sentence case per line (respects ellipsis continuations)
         text = '\n'.join(_capitalize_line(line.strip()) for line in text.split('\n'))
 
-        # 7. Split lines exceeding char limit at word boundaries (respects italics limit)
+        # 12. Number-to-word conversion
+        if num_map:
+            lines_num = []
+            for line in text.split('\n'):
+                # Don't modify content inside <i>...</i> for numbers (italics already set)
+                lines_num.append(_fix_numbers_in_text(line, num_map))
+            text = '\n'.join(lines_num)
+
+        # 13. US English spelling fix
+        text = _fix_us_spelling(text)
+
+        # 14. Split lines exceeding char limit
         split_lines = []
         for line in text.split('\n'):
-            limit = max_chars_italics if ("<i>" in line or "</i>" in line) and "max_chars_italics" in platform else max_chars
+            limit = max_chars_italics if ('<i>' in line or '</i>' in line) and 'max_chars_italics' in platform else max_chars
             split_lines.append(_split_line(line, limit))
         text = '\n'.join(split_lines)
 
-        # 8. Strip trailing/leading whitespace per line
-        text = '\n'.join(l.strip() for l in text.split('\n'))
-        text = text.strip()
+        # 15. Strip whitespace per line and remove blank lines
+        lines_final = [l.strip() for l in text.split('\n') if l.strip()]
+        text = '\n'.join(lines_final).strip()
 
         sub = dict(sub)
         sub["text"] = text
         fixed.append(sub)
+
+    # Final pass: apply platform italics rules (song lyrics, VO, foreign words etc.)
+    fixed = apply_italics_rules(fixed, platform_key)
 
     return fixed
 
@@ -137,31 +322,48 @@ def auto_fix_subtitles(subtitles: list, platform_key: str) -> list:
 def check_quality(subtitles: list, platform_key: str, filename: str) -> dict:
     """
     Run all quality checks on a subtitle list.
-    Returns defects with line number, severity, description, suggestion.
+    AUTO-FIXES everything fixable first, then reports only what remains.
+    Returns fixed subtitles + remaining defects.
     """
     platform = get_platform(platform_key)
+
+    # Step 1: Auto-fix everything fixable in Python
+    fixed_subtitles = auto_fix_subtitles(subtitles, platform_key)
+
+    # Step 2: Check the FIXED subtitles — only real remaining problems reported
     defects = []
-
     defects += check_file_naming(filename, platform)
-    defects += check_zero_subtitle(subtitles, platform)
-    defects += check_each_line(subtitles, platform)
-    defects += check_profanity(subtitles, platform_key)
-    defects += check_spacing_punctuation(subtitles)
-    defects += check_hoh_emt(subtitles, platform)
-    defects += check_universal_guidelines(subtitles)
+    defects += check_zero_subtitle(fixed_subtitles, platform)
+    defects += check_each_line(fixed_subtitles, platform)
+    defects += check_profanity(fixed_subtitles, platform_key)
+    defects += check_spacing_punctuation(fixed_subtitles)
+    defects += check_hoh_emt(fixed_subtitles, platform)
+    defects += check_universal_guidelines(fixed_subtitles)
+    defects += has_italics_errors(fixed_subtitles, platform_key)
+    defects += check_platform_specific_rules(fixed_subtitles, platform)
 
-    total = len(subtitles)
+    # Separate hard errors from warnings/info
+    errors = [d for d in defects if d.get('severity') in ('critical', 'error')]
+    warnings = [d for d in defects if d.get('severity') == 'warning']
+    info = [d for d in defects if d.get('severity') == 'info']
+
+    total = len(fixed_subtitles)
     defect_lines = len(set(d["line_id"] for d in defects if d.get("line_id")))
 
     return {
         "defects": defects,
         "total_defects": len(defects),
+        "error_count": len(errors),
+        "warning_count": len(warnings),
+        "info_count": len(info),
         "defect_lines": defect_lines,
         "total_lines": total,
         "clean_lines": total - defect_lines,
-        "is_ready_for_delivery": len(defects) == 0,
+        # Ready for delivery = zero critical/error defects (warnings are acceptable)
+        "is_ready_for_delivery": len(errors) == 0,
         "platform": platform["name"],
         "filename": filename,
+        "subtitles": fixed_subtitles,  # return the auto-fixed version
     }
 
 
@@ -188,44 +390,33 @@ def check_zero_subtitle(subtitles: list, platform: dict) -> list:
     if not platform.get("zero_subtitle_required", False):
         return defects
     if not subtitles:
-        defects.append({
-            "type": "ZERO_SUBTITLE_MISSING",
-            "severity": "critical",
-            "line_id": None,
-            "description": "No subtitles found. Zero subtitle is required for this platform.",
-            "suggestion": "Add zero subtitle: timecode 00:00:00:00 to 00:00:00:08 with show name, STORY: [ID], LANG: ENG"
-        })
-        return defects
+        return defects  # No subtitles at all — a different check will catch this
+
     first = subtitles[0]
     text = first.get("text", "")
     text_upper = text.upper()
 
-    # Check required fields: STORY: and LANG:
-    missing_fields = []
-    if "STORY:" not in text_upper:
-        missing_fields.append("STORY: [programme ID]")
-    if "LANG:" not in text_upper:
-        missing_fields.append("LANG: ENG")
-
-    if missing_fields:
-        defects.append({
-            "type": "ZERO_SUBTITLE_INVALID",
-            "severity": "critical",
-            "line_id": first.get("id"),
-            "description": f"First subtitle is not a valid zero subtitle. Missing: {', '.join(missing_fields)}. Any mistake = file fails to transmit.",
-            "suggestion": "Zero subtitle must have: Show name, Episode, Language, STORY: [programme ID], LANG: ENG"
-        })
-
-    # Verify zero subtitle starts at 00:00:00,000
+    # Only check zero subtitle format if the first subtitle starts at 00:00 (i.e. it looks like a zero subtitle)
     start = first.get("start_time", "")
-    if start and not start.startswith("00:00:00"):
-        defects.append({
-            "type": "ZERO_SUBTITLE_TIMECODE",
-            "severity": "critical",
-            "line_id": first.get("id"),
-            "description": f"Zero subtitle must start at 00:00:00:00 but starts at {start}. GTS Pro will reject the file.",
-            "suggestion": "Set zero subtitle in-time to 00:00:00:00 and out-time to 00:00:00:08 (or at least 1.08s)."
-        })
+    looks_like_zero_position = (not start) or start.startswith("00:00:00")
+
+    if looks_like_zero_position:
+        # It's in position 0 — check if it has the required fields
+        missing_fields = []
+        if "STORY:" not in text_upper:
+            missing_fields.append("STORY: [programme ID]")
+        if "LANG:" not in text_upper:
+            missing_fields.append("LANG: ENG")
+
+        if missing_fields:
+            defects.append({
+                "type": "ZERO_SUBTITLE_INVALID",
+                "severity": "warning",
+                "line_id": first.get("id"),
+                "description": f"First subtitle may be missing zero subtitle fields: {', '.join(missing_fields)}. Required for {platform['name']}.",
+                "suggestion": "Zero subtitle must have: Show name, Episode, Language, STORY: [programme ID], LANG: ENG at 00:00:00:00"
+            })
+
     return defects
 
 
@@ -316,10 +507,10 @@ def check_each_line(subtitles: list, platform: dict) -> list:
                     elif cps > target_cps:
                         defects.append({
                             "type": "READING_SPEED_HIGH",
-                            "severity": "warning",
+                            "severity": "info",  # warning only — does NOT block delivery
                             "line_id": sub_id,
-                            "description": f"Reading speed {cps:.1f} CPS is above target {target_cps} CPS for {platform['name']}. Yellow subtitle — acceptable but review.",
-                            "suggestion": "Consider shortening or extending duration if possible.",
+                            "description": f"Reading speed {cps:.1f} CPS is above target {target_cps} CPS (max allowed: {max_cps} CPS). Acceptable for delivery but review if possible.",
+                            "suggestion": "Shorten text or extend duration slightly if the timing allows.",
                             "text": text
                         })
 
@@ -367,12 +558,26 @@ def check_spacing_punctuation(subtitles: list) -> list:
             issues.append("more than 3 dots — use exactly 3 for ellipsis")
         if text != text.strip():
             issues.append("leading or trailing whitespace")
-        stripped = text.strip()
-        if stripped and stripped[0].islower() and not stripped.startswith('...'):
-            issues.append("starts with lowercase letter")
+
+        # Lowercase check — info only (many legit mid-sentence continuations)
+        lowercase_issues = []
+        for line in text.split('\n'):
+            ln = line.strip()
+            if not ln or _is_zero_subtitle(ln):
+                continue
+            check_line = ln
+            if check_line.startswith('-'):
+                check_line = check_line[1:].lstrip()
+            if not check_line or check_line.startswith('...'):
+                continue
+            check_line_no_tag = re.sub(r'^(<i>|</i>|<b>|</b>)+', '', check_line).strip()
+            if check_line_no_tag and check_line_no_tag[0].islower():
+                lowercase_issues.append(f"'{ln[:30]}...'" if len(ln) > 30 else f"'{ln}'")
+                break
+
         # Check for orphaned hyphen at start (two speaker format)
         for line in text.split('\n'):
-            if line.startswith('- ') and len(line) < 3:
+            if line.strip() in ('-', '- ', '\u2013'):
                 issues.append("empty speaker line (just hyphen)")
 
         if issues:
@@ -382,6 +587,15 @@ def check_spacing_punctuation(subtitles: list) -> list:
                 "line_id": sub_id,
                 "description": f"Formatting issues: {'; '.join(issues)}",
                 "suggestion": "Fix the listed formatting issues before delivery.",
+                "text": text
+            })
+        if lowercase_issues:
+            defects.append({
+                "type": "CAPITALIZATION_NOTE",
+                "severity": "info",
+                "line_id": sub_id,
+                "description": f"Line(s) start lowercase — verify these are intentional mid-sentence continuations: {'; '.join(lowercase_issues)}",
+                "suggestion": "If not a mid-sentence continuation, capitalize the first word.",
                 "text": text
             })
     return defects
@@ -485,3 +699,99 @@ def _tc_to_seconds(tc: str):
         return None
     except:
         return None
+
+
+def check_platform_specific_rules(subtitles: list, platform: dict) -> list:
+    defects = []
+    rules = platform.get("rules", [])
+    rules_text = " ".join(rules).lower()
+
+    if not subtitles: return defects
+
+    # 1. End credit Iyuno check — INFO only (subtitler adds this in GTS Pro, not in script)
+    if "subtitling by iyuno" in rules_text:
+        found = any("subtitling by iyuno" in (s.get("text", "") or "").lower() for s in subtitles)
+        if not found:
+            defects.append({
+                "type": "END_CREDIT_REMINDER",
+                "severity": "info",
+                "line_id": subtitles[-1].get("id"),
+                "description": "Reminder: Platform requires 'Subtitling by Iyuno' end credit at start of credits roll (2-4 secs). Add this in GTS Pro when spotting the end credits.",
+                "suggestion": "In GTS Pro: add a subtitle 'Subtitling by Iyuno' timed 2-4 seconds at the start of the credits roll."
+            })
+
+    # 2. Beeped profanity asterisks — warn only if bleep placeholder found
+    if "asterisks (****)" in rules_text:
+        for sub in subtitles:
+            text = sub.get("text", "")
+            if re.search(r'\*bleep\*|\[bleep\]|\(bleep\)', text, re.IGNORECASE):
+                defects.append({
+                    "type": "PROFANITY_FORMAT",
+                    "severity": "warning",
+                    "line_id": sub.get("id"),
+                    "description": "Bleep placeholder found. Platform requires asterisks (****) for beeped profanity.",
+                    "suggestion": "Replace *bleep* or [bleep] with **** (count asterisks to match letter count)",
+                    "text": text
+                })
+
+    # 3. Translator credit check — info only (subtitler task)
+    if "translator credit:" in rules_text:
+        found = any("translated by" in (s.get("text", "") or "").lower() for s in subtitles)
+        if not found:
+            defects.append({
+                "type": "TRANSLATOR_CREDIT_REMINDER",
+                "severity": "info",
+                "line_id": subtitles[-1].get("id") if subtitles else None,
+                "description": "Reminder: Platform requires 'Translated by [Name]' credit (2 seconds duration).",
+                "suggestion": "Add 'Translated by [Name]' subtitle near end of file in GTS Pro."
+            })
+
+    # 4. First subtitle cue time — only check when timecodes are actually present
+    if "first 1 second" in rules_text:
+        # Find first non-zero subtitle with a timecode
+        for sub in subtitles:
+            if _is_zero_subtitle(sub.get("text", "")):
+                continue
+            start = sub.get("start_time", "")
+            if not start:
+                break  # no timecodes — skip this check
+            sec = _tc_to_seconds(start)
+            if sec is not None and sec < 1.0:
+                defects.append({
+                    "type": "CUED_TOO_EARLY",
+                    "severity": "warning",
+                    "line_id": sub.get("id"),
+                    "description": f"First subtitle starts at {start} which is within the first 1 second of the programme. Platform disallows this.",
+                    "suggestion": "Delay the start time of the first subtitle to after 1 second.",
+                    "text": sub.get("text", "")
+                })
+            break  # only check the first non-zero sub
+
+    # 5. Subtitler-only rules — things that can only be done in GTS Pro, not in the script
+    #    These are reminders shown as INFO notes, never blocking errors.
+    subtitler_reminders = []
+    if "raise subtitle" in rules_text or "raise to top" in rules_text:
+        subtitler_reminders.append("Raising subtitles: position subtitles above on-screen text/graphics or to top when covering speaker's mouth (done in GTS Pro).")
+    if "centre-justified" in rules_text or "center-justified" in rules_text:
+        subtitler_reminders.append("Positioning: subtitles must be centre-justified at bottom (set in GTS Pro profile — not a script change).")
+    if "file_naming_format" not in platform and "file naming" in rules_text:
+        subtitler_reminders.append("File naming: ensure the exported PAC file follows the required naming convention before delivery.")
+    if "zero subtitle" in rules_text or "zero_subtitle_required" in str(platform):
+        subtitler_reminders.append("Zero subtitle: ensure subtitle #0 (00:00:00:00) contains Show name, STORY: [ID], LANG: ENG.")
+    if "repo file" in rules_text or "repositioning" in rules_text:
+        subtitler_reminders.append("Create a repo file for repositioning (done in GTS Pro after timing is complete).")
+    if "end credit file" in rules_text:
+        subtitler_reminders.append("Create a separate end credit file for repositioned credits (GTS Pro task).")
+    if "spellcheck" in rules_text:
+        subtitler_reminders.append("Always run spellcheck before delivery (GTS Pro > Tools > Spellcheck).")
+
+    if subtitler_reminders:
+        defects.append({
+            "type": "SUBTITLER_REMINDERS",
+            "severity": "info",
+            "line_id": None,
+            "description": "Subtitler-only tasks (cannot be checked automatically): " + " | ".join(subtitler_reminders),
+            "suggestion": "Complete these tasks in GTS Pro before final delivery."
+        })
+
+    return defects

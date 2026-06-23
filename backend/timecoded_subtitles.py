@@ -6,11 +6,13 @@ from platform_rules import get_platform
 _ARROW = re.compile(r"\s*-->\s*")
 _SRT_TC = re.compile(r"^\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}$")
 _FRAME_TC = re.compile(r"^\d{1,2}:\d{2}:\d{2}[:;]\d{1,2}$")
+# Permissive frame TC: allows single-digit MM/SS (e.g. 1:1:48:5)
+_FRAME_TC_LOOSE = re.compile(r"^(\d{1,2}):(\d{1,2}):(\d{1,2})[:;](\d{1,2})$")
 _INLINE_RANGE = re.compile(
-    r"(?P<start>\d{1,2}:\d{2}:\d{2}[,.:;]\d{1,3})\s*-->\s*"
-    r"(?P<end>\d{1,2}:\d{2}:\d{2}[,.:;]\d{1,3})"
+    r"(?P<start>\d{1,2}[:.]\d{2}[:.]\d{2}[,.:;]?\d{0,3})\s*-->\s*"
+    r"(?P<end>\d{1,2}[:.]\d{2}[:.]\d{2}[,.:;]?\d{0,3})"
 )
-_LEADING_TIMECODE = re.compile(r"^(?P<start>\d{1,2}:\d{2}:\d{2}[,.:;]\d{1,3})(?P<rest>.*)$")
+_LEADING_TIMECODE = re.compile(r"^(?P<start>\d{1,2}[:.]\d{2}[:.]\d{2}[,.:;]?\d{0,3})(?P<rest>.*)$")
 _FPS = 25
 
 
@@ -25,17 +27,38 @@ def normalize_timecode(value: str) -> str:
     if _SRT_TC.match(tc):
         h, m, rest = tc.replace(".", ",").split(":")
         s, ms = rest.split(",")
-        return f"{int(h):02d}:{m}:{s},{ms[:3].ljust(3, '0')}"
+        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{ms[:3].ljust(3, '0')}"
 
     if _FRAME_TC.match(tc):
         h, m, s, frames = re.split(r"[:;]", tc)
         ms = round(int(frames) * 1000 / 25)
-        return f"{int(h):02d}:{m}:{s},{ms:03d}"
+        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{ms:03d}"
 
-    basic = re.match(r"^(\d{1,2}):(\d{2}):(\d{2})$", tc)
+    # Permissive frame TC: handles single-digit MM/SS (e.g. 1:1:48:5)
+    lm = _FRAME_TC_LOOSE.match(tc)
+    if lm:
+        h, m, s, frames = lm.groups()
+        ms = round(int(frames) * 1000 / 25)
+        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{ms:03d}"
+
+    # Handle HH.MM.SS.FF or HH.MM.SS format (dot-separated)
+    if re.match(r"^\d{1,2}\.\d{1,2}\.\d{1,2}$", tc):
+        parts = tc.split(".")
+        h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+        return f"{h:02d}:{m:02d}:{s:02d},000"
+    elif re.match(r"^\d{1,2}\.\d{1,2}\.\d{1,2}[,.:;]\d{1,3}$", tc):
+        parts = re.split(r"[,.:;]", tc)
+        h, m, s, frames_or_ms = int(parts[0]), int(parts[1]), int(parts[2]), parts[3]
+        if len(frames_or_ms) <= 2:  # likely frames
+            ms = round(int(frames_or_ms) * 1000 / 25)
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        else:
+            return f"{h:02d}:{m:02d}:{s:02d},{frames_or_ms[:3].ljust(3, '0')}"
+
+    basic = re.match(r"^(\d{1,2}):(\d{1,2}):(\d{1,2})$", tc)
     if basic:
         h, m, s = basic.groups()
-        return f"{int(h):02d}:{m}:{s},000"
+        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},000"
 
     return tc
 
@@ -45,6 +68,9 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
     Extract real timecoded subtitle entries from SRT/VTT/TTML-style text.
     This never invents timings; entries without a detectable range are skipped.
     """
+    # Fix broken PyPDF2 timecodes with spurious spaces: "01:01:23:1 1" -> "01:01:23:11"
+    text = re.sub(r'(\d{1,2}[:.]\d{2}[:.]\d{2}[:.,;]\d)\s+(\d)\b', r'\1\2', text)
+    
     entries = []
 
     # Block parser for native SRT/VTT content.
@@ -90,13 +116,123 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
     if entries:
         return _renumber(entries)
 
+    # ── CCSL Spotting List / Column-based table parser ────────────────────
+    # Handles output from _read_pdf_spatial() which produces rows like:
+    #   Sh# | ShTimeIn | SceneDescription | Title | TimeIn | TimeOut | Dur | Titles
+    #   19  | 01:01:47:20 | FS - THE STREET | 6 | 01:01:48:05 | 01:01:50:01 | 01:20 | REPORTER (OS): The energy crisis is real.
+    # Also handles other pipe-delimited table formats from DOCX/XLSX spotting lists.
+    _ANY_TC = re.compile(r"^\d{1,2}[:.]\d{2}[:.]\d{2}(?:[,.:;]\d{1,3})?$")
+
+    # Try to detect CCSL header row and build column index map
+    ccsl_col_map = {}
+    ccsl_entries_found = []
+    _HAS_PIPE = any('|' in l for l in text.splitlines() if not l.startswith('==='))
+
+    if _HAS_PIPE:
+        header_idx = -1
+        all_lines_list = [l.strip() for l in text.splitlines()]
+        for li, line in enumerate(all_lines_list):
+            if re.search(r'(TimeIn|Time\s*In|TimeOut|Time\s*Out|Titles?)\b', line, re.IGNORECASE) and '|' in line:
+                cells_h = [c.strip() for c in line.split('|')]
+                for ci, ch in enumerate(cells_h):
+                    ch_lower = ch.lower().replace(' ', '')
+                    if ch_lower in ('timein', 'timein(hh:mm:ss:ff)'):
+                        ccsl_col_map['start'] = ci
+                    elif ch_lower in ('timeout', 'timeout(hh:mm:ss:ff)'):
+                        ccsl_col_map['end'] = ci
+                    elif ch_lower in ('titles', 'title', 'subtitle', 'subtitles', 'dialogue'):
+                        ccsl_col_map['dialogue'] = ci
+                    elif ch_lower in ('dur', 'duration'):
+                        ccsl_col_map['dur'] = ci
+                header_idx = li
+                break
+
+        # If we found a valid CCSL header, parse data rows
+        if 'start' in ccsl_col_map and 'end' in ccsl_col_map and 'dialogue' in ccsl_col_map:
+            for line in all_lines_list[header_idx + 1:]:
+                if not line or line.startswith('===') or '|' not in line:
+                    continue
+                cells = [c.strip() for c in line.split('|')]
+                if len(cells) <= max(ccsl_col_map['start'], ccsl_col_map['end'], ccsl_col_map['dialogue']):
+                    continue
+                start_raw = cells[ccsl_col_map['start']]
+                end_raw = cells[ccsl_col_map['end']]
+                dialogue_raw = cells[ccsl_col_map['dialogue']]
+
+                # Skip empty or non-timecode rows
+                if not _ANY_TC.match(start_raw.strip()) or not _ANY_TC.match(end_raw.strip()):
+                    continue
+                if not dialogue_raw.strip():
+                    continue
+
+                # Convert **text** bold markers to <b>text</b>
+                dialogue_raw = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', dialogue_raw)
+                # Convert *text* italic markers to <i>text</i>
+                dialogue_raw = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', dialogue_raw)
+
+                start_tc = normalize_timecode(start_raw.strip())
+                end_tc = normalize_timecode(end_raw.strip())
+                dialogue_text = _strip_speaker_label(dialogue_raw.strip())
+                dialogue_text = _clean_text(dialogue_text)
+                if dialogue_text:
+                    ccsl_entries_found.append(_entry(start_tc, end_tc, dialogue_text))
+
+        if ccsl_entries_found:
+            return _renumber(ccsl_entries_found)
+
     # Table/script parser for rows like:
     # 01:00:34:15 | OLIVIA (VO) | Help! Somebody, please.
+    # Or Spotting Lists: 00.08.00 INT./EXT. | 4-1 | WES (TO SYDNEY)- Be careful. | 00.08.02 | 00.08.18 | 0.16
     timed_rows = []
+    _ANY_TC = re.compile(r"^\d{1,2}[:.]\d{2}[:.]\d{2}(?:[,.:;]\d{1,3})?$")
+    
+    _STRICT_TC = re.compile(r'\b\d{1,2}[:.]\d{2}[:.]\d{2}(?:[,.:;]\d{1,3})?\b')
+    
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.upper().startswith("TIMECODE"):
+        if not line or line.upper().startswith("TIMECODE") or line.startswith("==="):
             continue
+
+        # If line doesn't have | but has multiple timecodes, convert space-delimited timecodes to |
+        if "|" not in line and len(_STRICT_TC.findall(line)) >= 2:
+            line = _STRICT_TC.sub(r' | \g<0> | ', line)
+            line = re.sub(r'\|\s*\|', '|', line)
+            line = re.sub(r'\s+', ' ', line).strip(' |')
+
+        cells = [c.strip() for c in line.split("|")]
+        
+        # Check if the row contains valid timecodes, especially at the end
+        dialogue = ""
+        tc_matches = []
+        for i in range(len(cells)-1, -1, -1):
+            if _ANY_TC.match(cells[i]):
+                tc_matches.append(cells[i])
+            else:
+                if not dialogue and cells[i] and not re.match(r'^[\d\.]+$', cells[i]):
+                    dialogue = cells[i]
+                    
+        if len(tc_matches) >= 2:
+            start = normalize_timecode(tc_matches[1])
+            end = normalize_timecode(tc_matches[0])
+            
+            # Remove any leading duration like "02:12 " before extracting dialogue
+            dialogue = re.sub(r'^\d{1,2}[:.;]\d{2}\s+', '', dialogue)
+            
+            dialogue = _strip_speaker_label(dialogue)
+            dialogue = _clean_text(dialogue)
+            if dialogue:
+                entries.append(_entry(start, end, dialogue))
+            continue
+            
+        # Continuation line check: if no timecodes but we have cells, append to previous entry
+        if not tc_matches and entries and len(cells) > 0:
+            potential_text = cells[-1]
+            if potential_text and not re.match(r'^[\d\.]+$', potential_text) and not _is_metadata_label(potential_text):
+                cleaned_extra = _strip_speaker_label(potential_text)
+                cleaned_extra = _clean_text(cleaned_extra)
+                if cleaned_extra:
+                    entries[-1]["text"] += "\n" + cleaned_extra
+                continue
 
         match = _LEADING_TIMECODE.match(line)
         if not match:
@@ -122,7 +258,13 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
         if dialogue:
             timed_rows.append({"start_time": start, "text": dialogue})
 
-    return _entries_from_start_times(timed_rows)
+    if timed_rows:
+        entries.extend(_entries_from_start_times(timed_rows))
+
+    if entries:
+        return _renumber(entries)
+    
+    return []
 
 
 def subtitles_to_srt(subtitles: list[dict]) -> str:
@@ -187,9 +329,6 @@ _METADATA_LINE = re.compile(
     r'|FADE\s+IN|FADE\s+OUT|CUT\s+TO'          # edit directions
     r'|SMASH\s+CUT|MATCH\s+CUT'               # edit directions
     r'|END\s+(OF\s+)?EPISODE'                  # END OF EPISODE / END EPISODE
-    r'|MAIN\s+TITLE'                           # MAIN TITLE EVIL etc
-    r'|END\s+CREDITS|OPENING\s+CREDITS'       # credit labels
-    r'|TITLE\s+SEQUENCE'                       # title sequence
     r'|INT\.|EXT\.|INT/EXT\.|EXT/INT\.'       # scene headings
     r'|(\d+(ST|ND|RD|TH)\s+QC:)'             # QC notes like "1st QC: Jared M."
     r')',
@@ -198,13 +337,45 @@ _METADATA_LINE = re.compile(
 
 
 def clean_delivery_text(text: str) -> str:
-    # Remove all parenthesized and bracketed content first (handles multiline)
-    text = re.sub(r"\([^)]+\)", "", text, flags=re.DOTALL)
-    text = re.sub(r"\[[^\]]+\]", "", text, flags=re.DOTALL)
-    # Remove HTML/markup tags
-    text = re.sub(r"<[^>]+>", "", text)
+    """
+    Clean dialogue text for OTT delivery.
+    IMPORTANT: Preserves <i> and <b> italic/bold tags — these carry platform
+    formatting (songs, narration, VO) that MUST be kept intact.
+    Only strips stage-direction parenthetical content, not all brackets.
+    """
+    # ── 1. Stash any <i>/<b> tags so we can restore them after cleaning ──
+    # We replace them with unique placeholders, clean, then put them back.
+    text = re.sub(r'<i>', '__ITALIC_OPEN__', text)
+    text = re.sub(r'</i>', '__ITALIC_CLOSE__', text)
+    text = re.sub(r'<b>', '__BOLD_OPEN__', text)
+    text = re.sub(r'</b>', '__BOLD_CLOSE__', text)
 
-    # Split text into lines
+    # ── 2. Remove ONLY stage-direction parentheticals (not all brackets) ──
+    # Keep: (VO), (OS), (CONT'D), (singing), (screaming) when they are alone
+    # Remove: (speaking Spanish), (to himself), (through phone), etc.
+    _STAGE_PARENS = re.compile(
+        r'\((speaking\s+\w+|through\s+\w+|into\s+\w+|to\s+[^)]+|whispering[^)]*'
+        r'|overlaps?|Archive|continues?[^)]*|indistinct[^)]*|.*?music.*?'
+        r'|sarcastically|quietly|loudly|angrily|softly|nervously|in\s+\w+'
+        r'|LAUGHS?|CHUCKLES?|GASPS?|SIGHS?|SCREAMS?|CRIES?|SOBBING|MOANS?|GROANS?'
+        r'|from\s+[^)]+|off\s*camera|off\s*screen)\)',
+        re.IGNORECASE
+    )
+    text = _STAGE_PARENS.sub('', text)
+
+    # Remove sound-effect brackets [MUSIC], [APPLAUSE] but NOT [words in song]
+    text = re.sub(r'\[(?:MUSIC|APPLAUSE|LAUGHTER|CHEERING|GUNSHOT|EXPLOSION|SINGING)[^\]]*\]', '', text, flags=re.IGNORECASE)
+
+    # ── 3. Remove truly spurious HTML tags but NOT i/b placeholders ──
+    text = re.sub(r'<(?!/?i>|/?b>)[^>]+>', '', text)
+
+    # ── 4. Restore italic/bold tags ──
+    text = text.replace('__ITALIC_OPEN__', '<i>')
+    text = text.replace('__ITALIC_CLOSE__', '</i>')
+    text = text.replace('__BOLD_OPEN__', '<b>')
+    text = text.replace('__BOLD_CLOSE__', '</b>')
+
+    # Split text into lines for per-line processing
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     cleaned_lines = []
 
@@ -221,9 +392,10 @@ def clean_delivery_text(text: str) -> str:
         if re.search(r'\b(INT\.|EXT\.|INT/EXT\.|EXT/INT\.)', line, re.IGNORECASE):
             continue
 
-        # Skip on-screen text / burn-in labels
+        # Keep on-screen text / burn-in labels but strip purely administrative ones if needed.
+        # Removed dropping ON-SCREEN/ON SIGN so they can act as forced narratives.
         if re.match(
-            r"^(ON-SCREEN|ON\s+SCREEN|ON\s+SIGN|TEXT\s+ON|TRAUMA\s+CENTER|EMERGENCY|Admitting|Outpatient|Registration)",
+            r"^(TRAUMA\s+CENTER|EMERGENCY|Admitting|Outpatient|Registration)$",
             line, re.IGNORECASE
         ):
             continue
@@ -233,18 +405,23 @@ def clean_delivery_text(text: str) -> str:
             continue
 
         # Skip pure speaker-name lines (all uppercase, no sentence punctuation)
-        stripped_for_check = re.sub(r"[\s.'\-/&#,/()+]+", "", line)
-        if stripped_for_check.isupper() and len(stripped_for_check) > 0 and len(stripped_for_check) <= 40:
+        # BUT never skip lines that contain music notes (♪ ♫) — those are song lyrics
+        stripped_for_check = re.sub(r"[\s.'\-/&#,/()+<>]+", "", re.sub(r'<[^>]+>', '', line))
+        has_music = bool(re.search(r'[♪♫🎵🎶]', line))
+        if not has_music and stripped_for_check.isupper() and 0 < len(stripped_for_check) <= 40:
             if not re.search(r"[!?]", line) and not re.search(r'[a-z]', line):
                 continue  # pure speaker label — drop it
 
         # Strip speaker prefix WITH colon or dash separator (e.g. "DAVID: Hello" / "DAVID - Hello")
-        line = re.sub(r"^[A-Z][A-Z0-9 .'\-/()#&,]{0,60}[:\-]\s*", "", line)
+        # Only strip if the RESULT is not empty
+        stripped_speaker = re.sub(r"^[A-Z][A-Z0-9 .'\-/()#&,]{0,60}[:\-]\s*", "", line)
+        if stripped_speaker.strip():   # don't blank out the whole line
+            line = stripped_speaker
 
         # Strip speaker prefix WITHOUT colon/dash — ALL-CAPS word(s) followed by mixed-case dialogue
         # e.g. "LILA I thought he seemed sad." → "I thought he seemed sad."
         m = _INLINE_SPEAKER.match(line)
-        if m:
+        if m and line[m.end():].strip():
             line = line[m.end():].strip()
 
         line = re.sub(r"\s+", " ", line).strip()
@@ -455,8 +632,10 @@ def _entry(start: str, end: str, text: str) -> dict:
 
 
 def _clean_text(text: str) -> str:
+    """Clean entry text — preserves <i>/<b> tags for OTT italic/bold formatting."""
     cleaned = clean_delivery_text(text)
-    cleaned = re.sub(r"{\\.*?}", "", cleaned)
+    # Remove RTF control sequences but NOT HTML italic/bold tags
+    cleaned = re.sub(r"\{\\[^}]+\}", "", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     return "\n".join(line.strip() for line in cleaned.splitlines() if line.strip()).strip()
 
@@ -467,7 +646,7 @@ def _strip_speaker_label(text: str) -> str:
 
 def _is_metadata_label(text: str) -> bool:
     return bool(re.search(
-        r"^(NARRATIVE TITLE|GRAPHICS ON SCREEN|MUSIC|WALLA|LOGO|TITLE CARD|ON SCREEN|CAPTION|INSERT)$",
+        r"^(MUSIC|WALLA)$",
         text.strip(),
         re.IGNORECASE,
     ))
@@ -482,7 +661,7 @@ def _is_dialogue_text(text: str) -> bool:
     # Filter out all production metadata lines
     if _METADATA_LINE.match(cleaned):
         return False
-    if re.match(r"^(FADE IN|FADE OUT|CUT TO|SMASH CUT|END CREDITS|OPENING CREDITS|TITLE SEQUENCE)$", cleaned, re.IGNORECASE):
+    if re.match(r"^(FADE IN|FADE OUT|CUT TO|SMASH CUT)$", cleaned, re.IGNORECASE):
         return False
     if _is_metadata_label(cleaned):
         return False

@@ -79,6 +79,17 @@ def init_db():
         )
     """)
 
+    # Movies table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS movies (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            title VARCHAR(500) NOT NULL,
+            url VARCHAR(1000) NOT NULL,
+            added_by VARCHAR(200) DEFAULT 'Anonymous',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Insert all built-in platforms
     for key, p in PLATFORMS.items():
         cursor.execute("""
@@ -179,7 +190,28 @@ def log_job(filename, fmt, platform, structure, total, flagged, defects):
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """, (filename, fmt, platform, structure, total, flagged, defects, "completed"))
         conn.commit()
+    except Exception as e:
+        print("Log error:", e)
+    finally:
         cursor.close()
         conn.close()
-    except:
-        pass
+
+def get_all_movies():
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM movies ORDER BY created_at DESC")
+    movies = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return movies
+
+def add_movie(title, url, added_by="Anonymous"):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO movies (title, url, added_by) VALUES (%s, %s, %s)",
+        (title, url, added_by)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()

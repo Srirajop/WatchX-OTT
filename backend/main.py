@@ -673,3 +673,38 @@ def normalize_tc(tc: str) -> str:
         h, mn, s, ms = m.groups()
         return f"{h}:{mn}:{s},{ms[:3].ljust(3,'0')}"
     return tc
+
+
+# ─── MOVIES ──────────────────────────────────────────────────────
+
+from pydantic import BaseModel
+
+class MovieAddRequest(BaseModel):
+    title: str
+    url: str
+    added_by: str = "Anonymous"
+
+@app.get("/movies")
+def get_movies():
+    try:
+        from database import get_all_movies
+        return {"movies": get_all_movies()}
+    except Exception as e:
+        print(f"Error fetching movies: {e}")
+        return {"movies": []}
+
+@app.post("/movies")
+def add_new_movie(req: MovieAddRequest):
+    if not req.title.strip() or not req.url.strip():
+        raise HTTPException(400, "Title and URL are required")
+    try:
+        from database import add_movie
+        add_movie(req.title.strip(), req.url.strip(), req.added_by.strip() or "Anonymous")
+        return {"message": "Movie added successfully"}
+    except Exception as e:
+        print(f"Error adding movie: {e}")
+        raise HTTPException(500, "Failed to add movie")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -13,18 +13,34 @@ _TIMECODE = re.compile(
 
 _SCENE_HEADINGS = re.compile(
     r'^(INT\.|EXT\.|INT/EXT\.|EXT/INT\.|TEASER|TAG\b|ACT\s+(ONE|TWO|THREE|\d+)'
-    r'|SCENE\s+\d+|COLD\s+OPEN|FADE\s+IN|FADE\s+OUT|CUT\s+TO|SMASH\s+CUT'
-    r'|TITLE\s+SEQUENCE|END\s+CREDITS|OPENING\s+CREDITS)',
+    r'|SCENE\s+\d+|COLD\s+OPEN|FADE\s+IN|FADE\s+OUT|CUT\s+TO|SMASH\s+CUT)',
     re.IGNORECASE
 )
 
 # ALL-CAPS words that are production notes, not dialogue
 _ALLCAPS_NOISE = re.compile(
-    r'^(GRAPHICS\s+ON\s+SCREEN|NARRATIVE\s+TITLE|WALLA|MUSIC|CHATTER'
-    r'|INTERCUT|FLASHBACK|MONTAGE|SUPER|SUBTITLE|LOGO|TITLE\s+CARD'
-    r'|ON\s+SCREEN|CAPTION|INSERT|LOWER\s+THIRD)[:\s]',
+    r'^(WALLA|MUSIC|CHATTER'
+    r'|INTERCUT|FLASHBACK|MONTAGE|SUPER)[:\s]',
     re.IGNORECASE
 )
+
+# Lines that MUST be preserved — they're needed by platform rules
+# e.g. "END CREDITS", "TITLE SEQUENCE", on-screen text, opening/closing titles
+_MUST_PRESERVE = re.compile(
+    r'(END\s+CREDIT|OPENING\s+CREDIT|CLOSING\s+CREDIT|TITLE\s+CARD|TITLE\s+SEQUENCE'
+    r'|ON\s+SCREEN|ON-SCREEN|ONSCREEN|LOWER\s+THIRD'
+    r'|GRAPHIC|SUPER(?:IMPOSE)?\b|CAPTION\b|SUBTITLE\b'
+    r'|ROLL\s+CREDIT|CREDIT\s+ROLL|CREDITS\s+ROLL'
+    r'|WRITTEN\s+BY|DIRECTED\s+BY|PRODUCED\s+BY'
+    r'|EXECUTIVE\s+PRODUCER|STARRING|FEATURING'
+    r'|TRANSLATION|SUBTITLING\s+BY|TRANSLATED\s+BY)',
+    re.IGNORECASE
+)
+
+
+def _is_credits_or_preserved(line: str) -> bool:
+    """Return True if this line is credit/title/on-screen content that must not be filtered."""
+    return bool(_MUST_PRESERVE.search(line))
 
 # Stage directions in ANY bracket type — catches ALL parenthetical content
 _BRACKETS = re.compile(
@@ -65,9 +81,8 @@ _INLINE_SPEAKER = re.compile(
 
 # Lines to skip entirely if they contain these metadata phrases (used with search)
 _SKIP_PATTERNS = re.compile(
-    r'(GRAPHICS\s+ON\s+SCREEN|NARRATIVE\s+TITLE|WALLA\b|MUSIC\b'
-    r'|TITLE\s+SEQUENCE|END\s+CREDITS|OPENING\s+CREDITS'
-    r'|INTERCUT|FLASHBACK|MONTAGE|LOGO\b|INSERT\b'
+    r'(WALLA\b|MUSIC\b'
+    r'|INTERCUT|FLASHBACK|MONTAGE'
     r'|DIALOGUE\s+LIST|SPOTTING\s+LIST|TIMECODE\/ DIALOGUE|START\s+MEASURING'
     r'|LOCATION\s+START:|TITLE\#:|FINISH:|TOTAL:)',
     re.IGNORECASE
@@ -78,38 +93,55 @@ _COMMA_CONNECTORS = re.compile(r',\s+(and|but|that|or|because)\b', re.IGNORECASE
 
 
 def _clean_line(line: str) -> str:
-    """Strip all noise from a single line — matches manual process from PDF"""
-    # Remove all bracket types
+    """Strip stage-direction noise from a single line — preserves <i>/<b> italic/bold tags."""
+    # Preserve italic/bold tags
+    line = re.sub(r'<i>', '__ITALIC_OPEN__', line)
+    line = re.sub(r'</i>', '__ITALIC_CLOSE__', line)
+    line = re.sub(r'<b>', '__BOLD_OPEN__', line)
+    line = re.sub(r'</b>', '__BOLD_CLOSE__', line)
+    # Remove bracket-based stage directions
     line = _BRACKETS.sub('', line)
-    # Remove markup tags
+    # Remove other markup tags (but not our placeholders)
     line = re.sub(r'<[^>]+>', '', line)
     # Fix multiple spaces
     line = re.sub(r'\s+', ' ', line).strip()
     # Remove comma before connectors
     line = _COMMA_CONNECTORS.sub(r' \1', line)
     # Strip leading/trailing punctuation artefacts
-    line = line.strip(' -–—|')
+    line = line.strip(' -\u2013\u2014|')
+    # Restore italic/bold tags
+    line = line.replace('__ITALIC_OPEN__', '<i>')
+    line = line.replace('__ITALIC_CLOSE__', '</i>')
+    line = line.replace('__BOLD_OPEN__', '<b>')
+    line = line.replace('__BOLD_CLOSE__', '</b>')
     return line
 
 
 def _is_valid(line: str, min_words: int = 1) -> bool:
-    """Check if line is real dialogue worth keeping"""
+    """Check if line is real dialogue worth keeping.
+    Credit/title/on-screen lines bypass all filters — they are needed for platform rules.
+    """
     line = line.strip()
     if not line or len(line) < 2:
         return False
+    # Credits and platform-rule-required content must ALWAYS pass through
+    if _is_credits_or_preserved(line):
+        return True
     if _SCENE_HEADINGS.match(line):
         return False
     if _SKIP_PATTERNS.search(line):
         return False
-    if _TIMECODE.match(line) and len(line.replace(' ', '')) < 20:
+    # Check plain-text length (strip tags for this check)
+    plain = re.sub(r'<[^>]+>', '', line)
+    if _TIMECODE.match(plain) and len(plain.replace(' ', '')) < 20:
         return False
-    if re.match(r'^[\d\s\.\,\-\:\;\/]+$', line):
+    if re.match(r'^[\d\s\.\,\-\:\;\/]+$', plain):
         return False
-    if line.startswith('(') and line.endswith(')'):
+    if plain.startswith('(') and plain.endswith(')'):
         return False
-    if line.startswith('[') and line.endswith(']'):
+    if plain.startswith('[') and plain.endswith(']'):
         return False
-    words = [w for w in line.split() if re.search(r'[a-zA-Z\u00C0-\u024F]', w)]
+    words = [w for w in plain.split() if re.search(r'[a-zA-Z\u00C0-\u024F]', w)]
     return len(words) >= min_words
 
 
@@ -164,10 +196,13 @@ def extract_docx_table(file_bytes: bytes) -> list[str]:
                     continue
 
                 # Skip GRAPHICS ON SCREEN, NARRATIVE TITLE, WALLA etc
-                if _SKIP_PATTERNS.match(dialogue.strip()):
-                    continue
-                if _ALLCAPS_NOISE.match(dialogue.strip()):
-                    continue
+                # BUT: preserve credit/title/on-screen lines needed for platform rules
+                dlg_stripped = dialogue.strip()
+                if not _is_credits_or_preserved(dlg_stripped):
+                    if _SKIP_PATTERNS.match(dlg_stripped):
+                        continue
+                    if _ALLCAPS_NOISE.match(dlg_stripped):
+                        continue
 
                 # Clean and strip speaker labels / slang notes
                 cleaned_dialogue = _clean_line(dialogue)
@@ -318,10 +353,15 @@ def extract_script_with_speaker(text: str) -> list[str]:
         line = _TIMECODE.sub('', line).strip()
         if not line:
             continue
-        # Skip scene headings and noise
+        # Skip scene headings and noise — but always preserve credits/on-screen text
+        if _is_credits_or_preserved(line):
+            # Let credits through without any further filtering
+            lines.append(_clean_line(line))
+            continue
         if _SCENE_HEADINGS.match(line) or _SKIP_PATTERNS.search(line):
             continue
-        # Remove ALL CAPS words (like TITLE SEQUENCE, GRAPHICS ON SCREEN, SYDNEY (TO MALES))
+        # Remove ALL CAPS lines that are scene/production notes
+        # EXCEPTION: do NOT filter if it looks like credits, titles, or on-screen text
         if re.match(r'^[A-Z0-9\s\.\-\'\/\(\)\&\,]{3,}$', line):
             continue
             
@@ -448,9 +488,11 @@ def pre_extract_dialogue(raw_text: str, structure: str, file_bytes: bytes = None
             line = re.sub(r'\s+', ' ', line).strip()
             
         # Optional: remove purely uppercase lines if they are not dialogue but scene descriptions
+        # CRITICAL: never remove lines that contain credit/platform-rule-required content
         if "scene_descriptions" in remove_elements and line.isupper() and len(line) > 5:
-            # Only if it looks like a scene descriptor and not a shout
-            if re.match(r'^[A-Z0-9\s\.\-\'\/\(\)\&\,]{3,60}$', line) and not any(p in line for p in ['?', '!', '"']):
+            if _is_credits_or_preserved(line):
+                pass  # Always keep credits regardless of scene_descriptions filter
+            elif re.match(r'^[A-Z0-9\s\.\-\'\/\(\)\.\&\,]{3,60}$', line) and not any(p in line for p in ['?', '!', '"']):
                 continue
                 
         if not line or len(line) < 2:
