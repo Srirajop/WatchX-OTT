@@ -443,6 +443,7 @@ def clean_subtitle_chunk(
                     "id": i + 1,
                     "start_time": "",
                     "end_time": "",
+                    "original_text": lines[i] if i < len(lines) else line,
                     "text": line,
                     "flagged": flagged,
                     "flag_reason": flag_reason

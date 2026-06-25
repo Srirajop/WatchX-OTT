@@ -117,6 +117,9 @@ async def clean_file_endpoint(
             await asyncio.sleep(0.05)
 
             from quality_checker import auto_fix_subtitles
+            for sub in timecoded_subtitles:
+                if "original_text" not in sub:
+                    sub["original_text"] = sub.get("text", "")
             fixed_subtitles = auto_fix_subtitles(timecoded_subtitles, platform)
             fixed_subtitles = ensure_srt_timings(fixed_subtitles)
             fixed_subtitles = prepare_for_platform(fixed_subtitles, platform, filename)
@@ -322,7 +325,7 @@ async def extract_file_endpoint(
     for i, line in enumerate(pre_extracted, 1):
         clean_line = line.strip()
         if clean_line:
-            subtitles.append({"id": i, "text": clean_line, "flagged": False})
+            subtitles.append({"id": i, "original_text": clean_line, "text": clean_line, "flagged": False})
 
     return {
         "subtitles": subtitles,
@@ -581,6 +584,170 @@ async def export_pdf(data: dict):
     buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.pdf"})
+
+@app.post("/export/track-changes-pdf")
+async def export_track_changes_pdf(data: dict):
+    """Export track changes as a PDF, showing original and new text side by side or top to bottom."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from platform_rules import get_platform
+    import html
+    import re
+
+    subtitles = data.get("subtitles", [])
+    filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
+    platform_key = data.get("platform_key", "generic")
+    
+    platform_dict = get_platform(platform_key)
+    plat_rules = platform_dict.get("rules", [])
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        leftMargin=1 * inch, rightMargin=1 * inch,
+        topMargin=1 * inch, bottomMargin=1 * inch
+    )
+    styles = getSampleStyleSheet()
+    
+    # Custom styles
+    original_style = ParagraphStyle(
+        "OriginalText",
+        parent=styles["Normal"],
+        alignment=TA_LEFT,
+        fontSize=10,
+        textColor=colors.HexColor("#d97706"),  # orange-ish
+        spaceAfter=4,
+    )
+    new_style = ParagraphStyle(
+        "NewText",
+        parent=styles["Normal"],
+        alignment=TA_LEFT,
+        fontSize=11,
+        textColor=colors.HexColor("#059669"),  # green-ish
+        spaceAfter=4,
+    )
+    rule_style = ParagraphStyle(
+        "RuleText",
+        parent=styles["Normal"],
+        alignment=TA_LEFT,
+        fontSize=9,
+        textColor=colors.HexColor("#64748b"),  # slate gray
+        spaceAfter=12,
+        leftIndent=10,
+    )
+
+    Story = []
+    
+    # Title
+    title_style = ParagraphStyle("TitleStyle", parent=styles["Heading1"], alignment=TA_LEFT, spaceAfter=16)
+    Story.append(Paragraph(f"Track Changes: {filename}", title_style))
+    Story.append(Spacer(1, 12))
+    
+    def deduce_rules(orig: str, new: str) -> list[str]:
+        if orig == new:
+            return []
+            
+        rules = []
+        orig_lower = orig.lower()
+        new_lower = new.lower()
+        
+        def add_rule(keywords: list, default: str):
+            for r in plat_rules:
+                if any(k in r.lower() for k in keywords):
+                    rules.append(f"Rule: {r}")
+                    return
+            rules.append(default)
+        
+        # 1. Italics
+        if ("<i>" in new or "</i>" in new) and not ("<i>" in orig or "</i>" in orig):
+            add_rule(["italic", "song", "voice"], "Applied italics formatting (generic)")
+            
+        # 2. HOH / Stage Directions
+        if re.search(r'\[.*?\]|\(.*?\)', orig) and not re.search(r'\[.*?\]|\(.*?\)', new):
+            add_rule(["hoh", "emt", "stage", "direction"], "Removed non-dialogue elements (HOH / stage directions)")
+            
+        # 3. Line splitting
+        if "\n" in new and "\n" not in orig:
+            add_rule(["maximum", "character", "lines per"], "Split line to enforce platform character/line limits")
+            
+        # 4. Two-speaker hyphen
+        if (new.startswith("-") and not orig.startswith("-")) or ("\n-" in new and "\n-" not in orig):
+            add_rule(["hyphen", "two speaker", "interrupted"], "Applied two-speaker formatting")
+            
+        # 5. Profanity / Bleep
+        if "****" in new and "****" not in orig:
+            add_rule(["asterisk", "bleep"], "Replaced profanity/bleep with asterisks")
+        elif "xxx" in new_lower and "xxx" not in orig_lower:
+            add_rule(["profanity", "xxx", "fxxx"], "Applied profanity censoring")
+            
+        # 6. US English
+        uk_words = ['colour', 'favourite', 'neighbour', 'realise', 'centre', 'theatre', 'programme', 'travelling']
+        if any(w in orig_lower for w in uk_words) and not any(w in new_lower for w in uk_words):
+            add_rule(["spelling"], "Converted to standard US English spelling")
+            
+        # 7. Numbers
+        if re.search(r'\b\d\b|\b10\b', orig) and not re.search(r'\b\d\b|\b10\b', new):
+            add_rule(["number", "1-10", "1-9", "spell out"], "Spelled out numbers as words")
+            
+        # 8. Punctuation / Spacing
+        if "  " in orig and "  " not in new:
+            add_rule(["space"], "Removed double spaces")
+        if re.search(r'[!?]{2,}', orig) and not re.search(r'[!?]{2,}', new):
+            add_rule(["double punctuation", "punctuation"], "Removed double punctuation marks")
+        if re.search(r' [.,!?;:]', orig) and not re.search(r' [.,!?;:]', new):
+            add_rule(["space before", "punctuation"], "Removed space before punctuation")
+            
+        # 9. Capitalisation
+        if orig.strip() and new.strip() and orig.strip()[0].islower() and new.strip()[0].isupper():
+            add_rule(["capital", "sentence case"], "Corrected sentence capitalisation")
+
+        if not rules:
+            add_rule(["punctuation", "grammar", "style"], "Applied standard punctuation and readability fixes")
+            
+        # Deduplicate
+        seen = set()
+        unique = []
+        for r in rules:
+            if r not in seen:
+                seen.add(r)
+                unique.append(r)
+                
+        return unique
+
+    for sub in subtitles:
+        text = sub.get("text", "").strip()
+        orig_text = sub.get("original_text", "").strip()
+        
+        if not text and not orig_text:
+            continue
+            
+        # Deduce rules before modifying string for HTML
+        applied_rules = deduce_rules(orig_text, text)
+            
+        # Remove control characters
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        orig_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', orig_text)
+        
+        text_safe = html.escape(text).replace("\n", "<br/>")
+        orig_safe = html.escape(orig_text).replace("\n", "<br/>")
+
+        Story.append(Paragraph(f"<b>Previously:</b> {orig_safe}", original_style))
+        Story.append(Paragraph(f"<b>Cleaned:</b> {text_safe}", new_style))
+        
+        if applied_rules:
+            rules_html = "<b>Rules Applied:</b><br/>" + "<br/>".join(f"• {r}" for r in applied_rules)
+            Story.append(Paragraph(rules_html, rule_style))
+        else:
+            Story.append(Spacer(1, 8))
+
+    doc.build(Story)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}_track_changes.pdf"})
 
 
 

@@ -4,7 +4,21 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>SubtitleAI — Cleaning & Quality Check</title>
-  <style>* { box-sizing: border-box; margin: 0; padding: 0; } body { background: #08080f; color: #e8e6df; font-family: 'Segoe UI', system-ui, sans-serif; } i { font-style: italic; color: #a78bfa; font-weight: bold; } b { font-weight: bold; color: #a78bfa; }</style>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    * { box-sizing: border-box; margin: 0; padding: 0; } 
+    body { background: #f8fafc; color: #0f172a; font-family: 'Inter', system-ui, sans-serif; -webkit-font-smoothing: antialiased; } 
+    i { font-style: italic; color: #4f46e5; font-weight: bold; } 
+    b { font-weight: bold; color: #4f46e5; }
+    button, .card, .uploadZone { transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); }
+    button:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.2), 0 4px 6px -4px rgba(79, 70, 229, 0.1); }
+    button:active:not(:disabled) { transform: translateY(0); }
+    .card:hover { box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.01); }
+    input:focus, select:focus, textarea:focus { border-color: #4f46e5 !important; box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.2); outline: none; }
+    /* Micro animations for icons */
+    .icon-spin:hover { transform: rotate(180deg); transition: transform 0.3s ease; }
+    .btn-x-hover:hover { background: #fee2e2; color: #dc2626 !important; }
+  </style>
 </head>
 <body>
   <div id="root"></div>
