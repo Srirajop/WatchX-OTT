@@ -454,7 +454,8 @@ async def transcribe_and_align_endpoint(
     import asyncio
     from timecoded_subtitles import _from_seconds
     from platform_rules import get_platform
-    from extractor import read_file, pre_extract_dialogue
+    from file_reader import read_file
+    from extractor import pre_extract_dialogue
     from transcript_aligner import align_transcription_to_script
 
     filename = audio.filename or "audio.webm"
