@@ -525,7 +525,10 @@ async def transcribe_and_align_endpoint(
                     
                 q.put({"type": "done", "subtitles": final_subs})
             except Exception as e:
-                q.put({"type": "error", "error": str(e)})
+                err_msg = str(e)
+                if "tuple index out of range" in err_msg:
+                    err_msg = "Could not extract audio from the uploaded file. It might be a video with no audio track, or an unsupported codec."
+                q.put({"type": "error", "error": err_msg})
 
         thread = threading.Thread(target=worker)
         thread.start()
