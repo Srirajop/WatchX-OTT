@@ -379,25 +379,7 @@ UNIVERSAL_GUIDELINES = {
 
 
 def get_platform(platform_key: str) -> dict:
-    """
-    Look up a platform's rules.
-    Checks built-in static PLATFORMS first (fast, no DB hit needed for the 8 known platforms).
-    Falls back to the database for custom platforms added via /platforms/add,
-    since those only ever get saved to MySQL, never to this static dict.
-    """
-    if platform_key in PLATFORMS:
-        return PLATFORMS[platform_key]
-
-    if platform_key.startswith("custom_"):
-        try:
-            from database import get_all_platforms
-            db_platforms = get_all_platforms()
-            if platform_key in db_platforms:
-                return db_platforms[platform_key]
-        except Exception as e:
-            print(f"[platform_rules] Could not load custom platform '{platform_key}' from DB: {e}")
-
-    return PLATFORMS["generic"]
+    return PLATFORMS.get(platform_key, PLATFORMS["generic"])
 
 
 def get_platform_list() -> list:

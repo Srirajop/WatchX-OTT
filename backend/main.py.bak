@@ -717,55 +717,6 @@ async def export_pdf(data: dict):
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.pdf"})
 
-@app.post("/track-changes")
-async def get_track_changes(data: dict):
-    """
-    Returns track-changes data as JSON for on-screen rendering —
-    same comparison logic the PDF export uses, but for display in the UI first.
-    The user can review this on screen, then download the PDF report separately.
-    """
-    from quality_checker import deduce_change_rules
-
-    subtitles = data.get("subtitles", [])
-    platform_key = data.get("platform_key", "generic")
-    platform_dict = get_platform(platform_key)
-    plat_rules = platform_dict.get("rules", [])
-
-    changes = []
-    unchanged_count = 0
-
-    for sub in subtitles:
-        text = sub.get("text", "").strip()
-        orig_text = sub.get("original_text", "").strip()
-
-        if not text and not orig_text:
-            continue
-
-        applied_rules = deduce_change_rules(orig_text, text, plat_rules)
-
-        if not applied_rules:
-            unchanged_count += 1
-            continue
-
-        changes.append({
-            "id": sub.get("id"),
-            "original_text": orig_text,
-            "new_text": text,
-            "rules_applied": applied_rules,
-            "flagged": sub.get("flagged", False),
-            "flag_reason": sub.get("flag_reason", "")
-        })
-
-    return {
-        "changes": changes,
-        "total_lines": len(subtitles),
-        "changed_lines": len(changes),
-        "unchanged_lines": unchanged_count,
-        "platform": platform_dict.get("name", platform_key)
-    }
-
-
-
 @app.post("/export/track-changes-pdf")
 async def export_track_changes_pdf(data: dict):
     """Export track changes as a PDF, showing original and new text side by side or top to bottom."""

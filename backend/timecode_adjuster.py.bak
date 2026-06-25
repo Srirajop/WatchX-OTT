@@ -252,11 +252,9 @@ def parse_offset_input(value: str) -> float | None:
         sign = -1.0
         raw = value[1:]
 
-    # Try plain float — strip a trailing unit suffix like 's' or 'sec' first
-    # (docstring examples like "+1.5s" should work, not just "+1.5")
-    numeric_part = re.sub(r'(s|sec|secs|seconds)\s*$', '', raw, flags=re.IGNORECASE).strip()
+    # Try plain float
     try:
-        return sign * float(numeric_part)
+        return sign * float(raw)
     except ValueError:
         pass
 

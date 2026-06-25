@@ -795,3 +795,73 @@ def check_platform_specific_rules(subtitles: list, platform: dict) -> list:
         })
 
     return defects
+
+    return defects
+
+
+def deduce_change_rules(orig: str, new: str, platform_rules: list) -> list:
+    """
+    Compare original vs cleaned text and explain WHY each change was made,
+    matched against the platform's actual rule descriptions where possible.
+    Used by both the on-screen Track Changes view and the PDF export,
+    so the explanation is identical in both places.
+    """
+    import re as _re
+    if orig == new:
+        return []
+
+    rules = []
+    orig_lower = orig.lower()
+    new_lower = new.lower()
+
+    def add_rule(keywords: list, default: str):
+        for r in platform_rules:
+            if any(k in r.lower() for k in keywords):
+                rules.append(f"Rule: {r}")
+                return
+        rules.append(default)
+
+    if ("<i>" in new or "</i>" in new) and not ("<i>" in orig or "</i>" in orig):
+        add_rule(["italic", "song", "voice"], "Applied italics formatting (generic)")
+
+    if _re.search(r'\[.*?\]|\(.*?\)', orig) and not _re.search(r'\[.*?\]|\(.*?\)', new):
+        add_rule(["hoh", "emt", "stage", "direction"], "Removed non-dialogue elements (HOH / stage directions)")
+
+    if "\n" in new and "\n" not in orig:
+        add_rule(["maximum", "character", "lines per"], "Split line to enforce platform character/line limits")
+
+    if (new.startswith("-") and not orig.startswith("-")) or ("\n-" in new and "\n-" not in orig):
+        add_rule(["hyphen", "two speaker", "interrupted"], "Applied two-speaker formatting")
+
+    if "****" in new and "****" not in orig:
+        add_rule(["asterisk", "bleep"], "Replaced profanity/bleep with asterisks")
+    elif "xxx" in new_lower and "xxx" not in orig_lower:
+        add_rule(["profanity", "xxx", "fxxx"], "Applied profanity censoring")
+
+    uk_words = ['colour', 'favourite', 'neighbour', 'realise', 'centre', 'theatre', 'programme', 'travelling']
+    if any(w in orig_lower for w in uk_words) and not any(w in new_lower for w in uk_words):
+        add_rule(["spelling"], "Converted to standard US English spelling")
+
+    if _re.search(r'\b\d\b|\b10\b', orig) and not _re.search(r'\b\d\b|\b10\b', new):
+        add_rule(["number", "1-10", "1-9", "spell out"], "Spelled out numbers as words")
+
+    if "  " in orig and "  " not in new:
+        add_rule(["space"], "Removed double spaces")
+    if _re.search(r'[!?]{2,}', orig) and not _re.search(r'[!?]{2,}', new):
+        add_rule(["double punctuation", "punctuation"], "Removed double punctuation marks")
+    if _re.search(r' [.,!?;:]', orig) and not _re.search(r' [.,!?;:]', new):
+        add_rule(["space before", "punctuation"], "Removed space before punctuation")
+
+    if orig.strip() and new.strip() and orig.strip()[0].islower() and new.strip()[0].isupper():
+        add_rule(["capital", "sentence case"], "Corrected sentence capitalisation")
+
+    if not rules:
+        add_rule(["punctuation", "grammar", "style"], "Applied standard punctuation and readability fixes")
+
+    seen = set()
+    unique = []
+    for r in rules:
+        if r not in seen:
+            seen.add(r)
+            unique.append(r)
+    return unique
