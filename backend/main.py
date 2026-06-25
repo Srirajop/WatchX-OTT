@@ -440,6 +440,134 @@ async def transcribe_audio(file: UploadFile = File(...)):
         }
     )
 
+@app.post("/transcribe-and-align")
+async def transcribe_and_align_endpoint(
+    audio: UploadFile = File(...),
+    script: UploadFile = File(None),
+    platform: str = Form(default="generic")
+):
+    import tempfile
+    import os
+    import json
+    import threading
+    import queue
+    import asyncio
+    from timecoded_subtitles import _from_seconds
+    from platform_rules import get_platform
+    from extractor import read_file, pre_extract_dialogue
+    from transcript_aligner import align_transcription_to_script
+
+    filename = audio.filename or "audio.webm"
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+        content = await audio.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    # Pre-process script if provided
+    script_subs = []
+    if script:
+        script_bytes = await script.read()
+        script_name = script.filename or "script.txt"
+        file_data = read_file(script_bytes, script_name)
+        raw_text = file_data["raw_text"]
+        structure = file_data["structure"]
+        
+        platform_dict = get_platform(platform)
+        pre_extracted = pre_extract_dialogue(raw_text, structure, script_bytes, script_name, platform_dict)
+        if not pre_extracted:
+            pre_extracted = raw_text.splitlines()
+
+        for i, line in enumerate(pre_extracted, 1):
+            clean_line = line.strip()
+            if clean_line:
+                script_subs.append({"id": i, "text": clean_line, "flagged": False})
+
+    async def transcribe_align_stream():
+        yield f"data: {json.dumps({'status': 'starting', 'message': 'Initializing transcription engine...', 'progress': 0})}\n\n"
+        await asyncio.sleep(0.05)
+        
+        q = queue.Queue()
+        
+        def worker():
+            try:
+                from faster_whisper import WhisperModel
+                q.put({"type": "status", "message": "Loading AI model into memory...", "progress": 5})
+                model = WhisperModel("base", device="cpu", compute_type="int8")
+                
+                q.put({"type": "status", "message": "Analyzing audio stream...", "progress": 10})
+                segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False)
+                
+                duration = info.duration
+                if duration <= 0: duration = 1.0
+                
+                q.put({"type": "status", "message": "Transcribing audio...", "progress": 15})
+                
+                whisper_subs = []
+                for i, segment in enumerate(segments, start=1):
+                    whisper_subs.append({
+                        "id": i,
+                        "start_time": _from_seconds(segment.start),
+                        "end_time": _from_seconds(segment.end),
+                        "text": segment.text.strip(),
+                        "flagged": False,
+                        "flag_reason": ""
+                    })
+                    pct = min(90, int(15 + (segment.end / duration) * 75))
+                    q.put({"type": "status", "message": f"Transcribing... ({int(segment.end)}s / {int(duration)}s)", "progress": pct})
+                    
+                if script_subs:
+                    q.put({"type": "status", "message": "Aligning timecodes to script...", "progress": 95})
+                    final_subs = align_transcription_to_script(whisper_subs, script_subs)
+                else:
+                    final_subs = whisper_subs
+                    
+                q.put({"type": "done", "subtitles": final_subs})
+            except Exception as e:
+                q.put({"type": "error", "error": str(e)})
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.1)
+                continue
+                
+            if msg["type"] == "status":
+                yield f"data: {json.dumps({'status': 'processing', 'message': msg['message'], 'progress': msg['progress']})}\n\n"
+            elif msg["type"] == "error":
+                yield f"data: {json.dumps({'status': 'error', 'error': msg['error']})}\n\n"
+                break
+            elif msg["type"] == "done":
+                result = {
+                    "subtitles": msg["subtitles"],
+                    "stats": {
+                        "total_lines": len(msg["subtitles"]),
+                        "flagged_lines": sum(1 for s in msg["subtitles"] if s.get("flagged")),
+                        "platform": platform,
+                        "detected_structure": "aligned_script" if script_subs else "whisper_audio",
+                        "original_format": filename
+                    }
+                }
+                yield f"data: {json.dumps({'status': 'completed', 'progress': 100, 'result': result})}\n\n"
+                break
+                
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    return StreamingResponse(
+        transcribe_align_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+    )
+
 
 # ─── QUALITY CHECK ───────────────────────────────────────────────
 
