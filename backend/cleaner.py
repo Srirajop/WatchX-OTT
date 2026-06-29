@@ -509,9 +509,10 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
     """Extract rules from a custom platform guidelines document."""
     client, model_name, _ = _get_client_and_model()
 
-    prompt = f"""Read this subtitle guidelines document for "{platform_name}" and extract key rules.
+    prompt = f"""Read this subtitle guidelines document for "{platform_name}" and extract EVERY key formatting, grammar, punctuation, profanity, and timing rule into an exhaustive list. 
+Do NOT just extract 2 or 3 rules. You MUST extract EVERY distinct instruction you can find in the document.
 
-Return ONLY valid JSON:
+Return ONLY valid JSON. NEVER include any // comments in the JSON.
 {{
   "name": "{platform_name}",
   "max_chars_per_line": 42,
@@ -524,7 +525,7 @@ Return ONLY valid JSON:
   "file_format": "PAC",
   "two_speaker_format": "hyphen_no_space",
   "zero_subtitle_required": true,
-  "rules": ["Rule 1", "Rule 2"],
+  "rules": ["Rule 1: ...", "Rule 2: ...", "Rule 3: ...", "Rule 4: ...", "Rule 5: ...", "(... include ALL rules found in the document ...)"],
   "summary": "One sentence summary"
 }}
 

@@ -127,7 +127,7 @@ def init_db():
 def get_all_platforms():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM platforms ORDER BY is_custom ASC, name ASC")
+    cursor.execute("SELECT * FROM platforms ORDER BY is_custom ASC, name ASC, created_at DESC")
     rows = cursor.fetchall()
     cursor.close()
     conn.close()

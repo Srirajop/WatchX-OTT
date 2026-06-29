@@ -796,10 +796,8 @@ def check_platform_specific_rules(subtitles: list, platform: dict) -> list:
 
     return defects
 
-    return defects
 
-
-def deduce_change_rules(orig: str, new: str, platform_rules: list) -> list:
+def deduce_change_rules(orig: str, new: str, platform_rules: list, rule_hints: list | None = None) -> list:
     """
     Compare original vs cleaned text and explain WHY each change was made,
     matched against the platform's actual rule descriptions where possible.
@@ -814,12 +812,31 @@ def deduce_change_rules(orig: str, new: str, platform_rules: list) -> list:
     orig_lower = orig.lower()
     new_lower = new.lower()
 
-    def add_rule(keywords: list, default: str):
-        for r in platform_rules:
-            if any(k in r.lower() for k in keywords):
-                rules.append(f"Rule: {r}")
-                return
-        rules.append(default)
+    def add_rule(keywords: list, verified_edit: str):
+        matches = [
+            (max(len(k) for k in keywords if k in r.lower()), r)
+            for r in platform_rules
+            if any(k in r.lower() for k in keywords)
+        ]
+        if matches:
+            # Prefer the most specific phrase (for example "double
+            # punctuation" over the generic word "punctuation").
+            rules.append(f"Rule: {max(matches, key=lambda match: match[0])[1]}")
+            return
+        if verified_edit:
+            # The before/after text proves this exact deterministic edit, but
+            # the selected platform has no explicit matching rule. Describe
+            # the edit honestly without mislabelling it as a platform rule.
+            rules.append(f"Verified edit: {verified_edit}")
+
+    # Hints are emitted by deterministic transformations at the exact moment
+    # they occur. They are stronger evidence than trying to reverse-engineer a
+    # split cue from only one fragment of its original paragraph.
+    for hint in rule_hints or []:
+        if hint == "line_limit":
+            add_rule(["maximum", "characters per line", "maximum 2 lines", "max 2 lines"], "")
+        elif hint == "zero_subtitle":
+            add_rule(["zero subtitle required", "zero subtitle"], "")
 
     if ("<i>" in new or "</i>" in new) and not ("<i>" in orig or "</i>" in orig):
         add_rule(["italic", "song", "voice"], "Applied italics formatting (generic)")
@@ -855,8 +872,11 @@ def deduce_change_rules(orig: str, new: str, platform_rules: list) -> list:
     if orig.strip() and new.strip() and orig.strip()[0].islower() and new.strip()[0].isupper():
         add_rule(["capital", "sentence case"], "Corrected sentence capitalisation")
 
+    # Do not guess. A change can come from an AI rewrite or another cause this
+    # deterministic comparison cannot prove. The audit trail must not present
+    # a generic punctuation/style claim as an applied rule.
     if not rules:
-        add_rule(["punctuation", "grammar", "style"], "Applied standard punctuation and readability fixes")
+        rules.append("No rule applied")
 
     seen = set()
     unique = []

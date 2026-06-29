@@ -116,54 +116,133 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
     if entries:
         return _renumber(entries)
 
-    # ── CCSL Spotting List / Column-based table parser ────────────────────
+    # ── General Column-Based Table Parser ──────────────────────────────────
     # Handles output from _read_pdf_spatial() which produces rows like:
     #   Sh# | ShTimeIn | SceneDescription | Title | TimeIn | TimeOut | Dur | Titles
     #   19  | 01:01:47:20 | FS - THE STREET | 6 | 01:01:48:05 | 01:01:50:01 | 01:20 | REPORTER (OS): The energy crisis is real.
-    # Also handles other pipe-delimited table formats from DOCX/XLSX spotting lists.
+    # Also handles other pipe-delimited table formats from DOCX/XLSX spotting
+    # lists, INCLUDING formats never seen before — this is a SEMANTIC column
+    # classifier, not a fixed list of known header names. It classifies each
+    # column by what kind of content it holds (a timecode column? a
+    # narration/dialogue column? a visual/scene-description column that must
+    # NEVER be mistaken for dialogue?) using a broad synonym set PLUS the
+    # actual shape of the data in that column, so a new OTT client's table
+    # with header names we've never seen — e.g. "TIME CODE | VISUALS | AUDIO"
+    # — gets classified correctly without writing a new special case for it.
     _ANY_TC = re.compile(r"^\d{1,2}[:.]\d{2}[:.]\d{2}(?:[,.:;]\d{1,3})?$")
 
-    # Try to detect CCSL header row and build column index map
-    ccsl_col_map = {}
-    ccsl_entries_found = []
+    # Synonym sets for each semantic column role. Adding support for a new
+    # client's wording (e.g. "NARRATION" instead of "AUDIO") means adding one
+    # word to a set below, not writing a new parser branch.
+    _COL_SYNONYMS = {
+        "time_single": {
+            "timecode", "time", "tc", "timein", "time(hh:mm:ss:ff)",
+        },
+        "time_start": {
+            "timein", "time in", "in", "shtimein", "startcode", "start",
+        },
+        "time_end": {
+            "timeout", "time out", "out", "endcode", "end",
+        },
+        "duration": {
+            "dur", "duration", "len", "length",
+        },
+        # Columns whose text IS spoken dialogue — safe to use as subtitle text.
+        "dialogue": {
+            "titles", "title", "subtitle", "subtitles", "dialogue", "dialog",
+            "audio", "narration", "narrator", "voiceover", "vo", "speech",
+            "text",
+        },
+        # Columns whose text is NEVER spoken dialogue, even when the
+        # dialogue/audio column is empty for that row. This is the exact
+        # fix for the CAR SOS / Food Factory bug: a VISUALS or SCENE
+        # DESCRIPTION column must never be picked as a fallback "dialogue"
+        # just because it's the only non-empty, non-timecode cell in the row.
+        "non_dialogue": {
+            "visuals", "visual", "video", "scenedescription", "scene",
+            "shotdescription", "shot", "graphics", "screenshot", "image",
+            "notes", "comment", "comments", "sh#", "sh", "shot#",
+        },
+    }
+
+    def _classify_header_cell(cell_text: str) -> str | None:
+        norm = re.sub(r'[^a-z0-9 ]', '', cell_text.lower()).strip()
+        norm_nospace = norm.replace(' ', '')
+        for role, synonyms in _COL_SYNONYMS.items():
+            for syn in synonyms:
+                syn_nospace = syn.replace(' ', '')
+                if norm_nospace == syn_nospace or norm == syn:
+                    return role
+        return None
+
+    # Try to detect a header row and build a semantic column index map
+    col_map = {}  # role -> column index, roles: start, end, dialogue, non_dialogue(set), dur
+    non_dialogue_cols = set()
+    table_entries_found = []
     _HAS_PIPE = any('|' in l for l in text.splitlines() if not l.startswith('==='))
 
     if _HAS_PIPE:
         header_idx = -1
         all_lines_list = [l.strip() for l in text.splitlines()]
         for li, line in enumerate(all_lines_list):
-            if re.search(r'(TimeIn|Time\s*In|TimeOut|Time\s*Out|Titles?)\b', line, re.IGNORECASE) and '|' in line:
-                cells_h = [c.strip() for c in line.split('|')]
-                for ci, ch in enumerate(cells_h):
-                    ch_lower = ch.lower().replace(' ', '')
-                    if ch_lower in ('timein', 'timein(hh:mm:ss:ff)'):
-                        ccsl_col_map['start'] = ci
-                    elif ch_lower in ('timeout', 'timeout(hh:mm:ss:ff)'):
-                        ccsl_col_map['end'] = ci
-                    elif ch_lower in ('titles', 'title', 'subtitle', 'subtitles', 'dialogue'):
-                        ccsl_col_map['dialogue'] = ci
-                    elif ch_lower in ('dur', 'duration'):
-                        ccsl_col_map['dur'] = ci
+            if '|' not in line:
+                continue
+            cells_h = [c.strip() for c in line.split('|')]
+            roles_found = {}
+            nd_cols_this_line = set()
+            for ci, ch in enumerate(cells_h):
+                role = _classify_header_cell(ch)
+                if role in ("time_start", "time_single"):
+                    roles_found.setdefault("start", ci)
+                elif role == "time_end":
+                    roles_found["end"] = ci
+                elif role == "dialogue":
+                    roles_found["dialogue"] = ci
+                elif role == "duration":
+                    roles_found["dur"] = ci
+                elif role == "non_dialogue":
+                    nd_cols_this_line.add(ci)
+
+            # A usable header needs at minimum: a time column AND a dialogue
+            # column. (start+end+dialogue is the richest case / CCSL-style;
+            # start-only+dialogue is the simpler single-timecode case, e.g.
+            # "TIME CODE | VISUALS | AUDIO" — handled by the same code path
+            # now, not a separate branch.)
+            if "start" in roles_found and "dialogue" in roles_found:
+                col_map = roles_found
+                non_dialogue_cols = nd_cols_this_line
                 header_idx = li
                 break
 
-        # If we found a valid CCSL header, parse data rows
-        if 'start' in ccsl_col_map and 'end' in ccsl_col_map and 'dialogue' in ccsl_col_map:
+        if "start" in col_map and "dialogue" in col_map:
+            has_end_col = "end" in col_map
             for line in all_lines_list[header_idx + 1:]:
                 if not line or line.startswith('===') or '|' not in line:
                     continue
                 cells = [c.strip() for c in line.split('|')]
-                if len(cells) <= max(ccsl_col_map['start'], ccsl_col_map['end'], ccsl_col_map['dialogue']):
+                needed_idx = [col_map['start'], col_map['dialogue']] + ([col_map['end']] if has_end_col else [])
+                if len(cells) <= max(needed_idx):
                     continue
-                start_raw = cells[ccsl_col_map['start']]
-                end_raw = cells[ccsl_col_map['end']]
-                dialogue_raw = cells[ccsl_col_map['dialogue']]
 
-                # Skip empty or non-timecode rows
-                if not _ANY_TC.match(start_raw.strip()) or not _ANY_TC.match(end_raw.strip()):
+                start_raw = cells[col_map['start']]
+                if not _ANY_TC.match(start_raw.strip()):
+                    continue  # row has no timecode of its own — skip rather than guess
+
+                # Dialogue comes ONLY from the classified dialogue column —
+                # this is the actual bug fix: never fall back to a
+                # non_dialogue (VISUALS/SCENE) column just because dialogue
+                # is empty on this particular row. An empty dialogue cell
+                # correctly means "no subtitle for this row", not "borrow
+                # the visual description instead".
+                dialogue_raw = cells[col_map['dialogue']].strip()
+                if not dialogue_raw:
                     continue
-                if not dialogue_raw.strip():
-                    continue
+
+                end_raw = cells[col_map['end']].strip() if has_end_col else ""
+                if has_end_col and not _ANY_TC.match(end_raw):
+                    has_end_col_this_row = False
+                else:
+                    has_end_col_this_row = has_end_col
 
                 # Convert **text** bold markers to <b>text</b>
                 dialogue_raw = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', dialogue_raw)
@@ -171,14 +250,24 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
                 dialogue_raw = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', dialogue_raw)
 
                 start_tc = normalize_timecode(start_raw.strip())
-                end_tc = normalize_timecode(end_raw.strip())
+                end_tc = normalize_timecode(end_raw) if has_end_col_this_row else None
                 dialogue_text = _strip_speaker_label(dialogue_raw.strip())
                 dialogue_text = _clean_text(dialogue_text)
                 if dialogue_text:
-                    ccsl_entries_found.append(_entry(start_tc, end_tc, dialogue_text))
+                    # No end column in this format (single-timecode-per-row
+                    # tables like TIME CODE | VISUALS | AUDIO) — end gets
+                    # filled in by ensure_srt_timings()/prepare_for_platform()
+                    # from the next row's start time, same pattern already
+                    # used for the no-table single-timecode case below.
+                    if has_end_col:
+                        table_entries_found.append(_entry(start_tc, end_tc or start_tc, dialogue_text))
+                    else:
+                        table_entries_found.append({"start_time": start_tc, "text": dialogue_text})
 
-        if ccsl_entries_found:
-            return _renumber(ccsl_entries_found)
+        if table_entries_found:
+            if "end" not in col_map:
+                return _entries_from_start_times(table_entries_found)
+            return _renumber(table_entries_found)
 
     # Table/script parser for rows like:
     # 01:00:34:15 | OLIVIA (VO) | Help! Somebody, please.
@@ -512,12 +601,20 @@ def _repair_timing_windows(subtitles: list[dict], min_duration: float, max_durat
 
 
 def _split_long_subtitles(subtitles: list[dict], max_chars: int, max_lines: int) -> list[dict]:
+    def mark_line_limit(item: dict):
+        hints = list(item.get("rule_hints", []))
+        if "line_limit" not in hints:
+            hints.append("line_limit")
+        item["rule_hints"] = hints
+
     split = []
     for sub in subtitles:
         text = sub.get("text", "")
         if _text_fits(text, max_chars, max_lines):
             item = dict(sub)
             item["text"] = _wrap_chunk(text, max_chars)
+            if item["text"] != text:
+                mark_line_limit(item)
             split.append(item)
             continue
 
@@ -525,6 +622,8 @@ def _split_long_subtitles(subtitles: list[dict], max_chars: int, max_lines: int)
         if len(chunks) <= 1:
             item = dict(sub)
             item["text"] = _wrap_chunk(text, max_chars)
+            if item["text"] != text:
+                mark_line_limit(item)
             split.append(item)
             continue
 
@@ -534,6 +633,7 @@ def _split_long_subtitles(subtitles: list[dict], max_chars: int, max_lines: int)
             for chunk in chunks:
                 item = dict(sub)
                 item["text"] = _wrap_chunk(chunk, max_chars)
+                mark_line_limit(item)
                 split.append(item)
             continue
 
@@ -550,6 +650,7 @@ def _split_long_subtitles(subtitles: list[dict], max_chars: int, max_lines: int)
             item["start_time"] = _from_seconds(cursor)
             item["end_time"] = _from_seconds(chunk_end)
             item["text"] = chunk
+            mark_line_limit(item)
             split.append(item)
             cursor = chunk_end
 
@@ -592,6 +693,8 @@ def _ensure_zero_subtitle(subtitles: list[dict], min_duration: float, filename: 
         "start_time": "00:00:00,000",
         "end_time": _from_seconds(max(min_duration, 1.08)),
         "text": f"{show_name}\nSTORY: UNKNOWN\nLANG: ENG",
+        "original_text": "",
+        "rule_hints": ["zero_subtitle"],
         "flagged": False,
         "flag_reason": "",
     }

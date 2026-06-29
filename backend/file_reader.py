@@ -62,6 +62,21 @@ def read_file(file_bytes: bytes, filename: str) -> dict:
     if not raw_text or not raw_text.strip():
         raw_text = decode_bytes(file_bytes)
 
+    # OCR fallback for PDFs — this runs after every other PDF extraction
+    # strategy above (pdfplumber tables, spatial word-position parsing,
+    # PyPDF2 fallback) has already had its chance. PDF has several distinct
+    # return paths inside read_pdf() itself, so rather than touch each one,
+    # this single check after the dispatcher covers all of them at once —
+    # same end result, less risk of missing a branch.
+    if ext == "pdf":
+        try:
+            from ocr_reader import ocr_fallback_for_pdf
+            ocr_text = ocr_fallback_for_pdf(file_bytes, len(raw_text.strip()))
+            if ocr_text:
+                raw_text = raw_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
+        except Exception as e:
+            print(f"[file_reader] OCR fallback skipped for PDF: {e}")
+
     structure = detect_structure(raw_text, ext)
 
     return {
@@ -86,8 +101,20 @@ def detect_structure(text: str, ext: str) -> str:
         return "ccsl_double_dialogue"
     if "COMBINED CONTINUITY" in text or "CCSL" in text.upper() or "SPOTTING LIST" in text.upper():
         return "ccsl_double_dialogue"
-    # Table with HH:MM:SS:FF timecodes — includes spatial parser output
-    if re.search(r'\d{2}:\d{2}:\d{2}[:;]\d{2}', text) and '|' in text:
+    # Table with timecodes — includes spatial parser output. Matches BOTH
+    # frame-accurate HH:MM:SS:FF (e.g. CCSL spotting lists) AND second-only
+    # HH:MM:SS (e.g. documentary-style "TIME CODE | VISUALS | AUDIO" tables
+    # like the CAR SOS/Food Factory format, which has no frame component at
+    # all) — a new client's table using either timecode precision should be
+    # recognized without adding a new regex branch for it.
+    # IMPORTANT: the timecode and the pipe must appear on the SAME LINE —
+    # checking them independently anywhere in the whole document produces
+    # false positives (e.g. a paragraph mentioning a clock time, with an
+    # unrelated pipe character somewhere else in the file).
+    if any(
+        '|' in line and re.search(r'\d{2}:\d{2}:\d{2}([:;]\d{2})?', line)
+        for line in text.splitlines()
+    ):
         return "table_with_timecodes"
     if "=== TABLE" in text and re.search(r'\d{2}:\d{2}:\d{2}', text):
         return "table_with_timecodes"
@@ -115,6 +142,7 @@ def decode_bytes(b: bytes) -> str:
 
 def read_docx(file_bytes: bytes) -> str:
     sections = []
+    extracted_text = ""
     try:
         from docx import Document
         doc = Document(io.BytesIO(file_bytes))
@@ -123,9 +151,101 @@ def read_docx(file_bytes: bytes) -> str:
             sections.append("=== PARAGRAPHS ===")
             sections.extend(paras)
 
+        # Some production scripts use one large cell per column and align
+        # timecodes/audio with blank paragraphs (instead of using one Word row
+        # per cue). ``cell.text`` flattens those columns independently, which
+        # destroys their alignment. Keep the last recognised column layout so
+        # continuation tables without a repeated header also work.
+        stacked_layout = None
+        tc_re = re.compile(r"^\d{1,2}[:.]\d{2}[:.]\d{2}(?:[,.:;]\d{1,3})?$")
+
+        def header_role(value: str):
+            key = re.sub(r"[^a-z]", "", value.lower())
+            if key in {"timecode", "time", "tc", "timein"}:
+                return "time"
+            if key in {"audio", "dialogue", "dialog", "narration", "speech", "subtitle", "subtitles", "text"}:
+                return "dialogue"
+            return None
+
         for i, table in enumerate(doc.tables):
             sections.append(f"\n=== TABLE {i+1} ({len(table.rows)} rows x {len(table.columns)} cols) ===")
-            for row in table.rows:
+            first_values = [c.text.strip() for c in table.rows[0].cells] if table.rows else []
+            roles = {header_role(value): idx for idx, value in enumerate(first_values) if header_role(value)}
+            first_is_header = "time" in roles and "dialogue" in roles
+            if first_is_header:
+                stacked_layout = (roles["time"], roles["dialogue"], len(first_values))
+
+            for row_idx, row in enumerate(table.rows):
+                if first_is_header and row_idx == 0:
+                    sections.append(" | ".join(first_values))
+                    continue
+
+                # Rebuild vertically stacked TIME CODE / AUDIO cells into
+                # actual cue rows. Each audio paragraph is assigned to the
+                # nearest timecode paragraph; deliberate blank-paragraph
+                # positioning is therefore retained.
+                if stacked_layout and len(row.cells) == stacked_layout[2]:
+                    tc_idx, dialogue_idx, column_count = stacked_layout
+                    tc_points = [
+                        (pi, p.text.strip())
+                        for pi, p in enumerate(row.cells[tc_idx].paragraphs)
+                        if tc_re.match(p.text.strip())
+                    ]
+                    dialogue_points = [
+                        (pi, p.text.strip())
+                        for pi, p in enumerate(row.cells[dialogue_idx].paragraphs)
+                        if p.text.strip()
+                    ]
+                    if tc_points and dialogue_points:
+                        grouped = {tc: [] for _, tc in tc_points}
+                        if len(tc_points) >= len(dialogue_points):
+                            # Usually there is one cue per dialogue, with an
+                            # occasional silent/title timecode. Choose the
+                            # minimum-distance monotonic one-to-one mapping so
+                            # paragraph-count drift cannot merge adjacent cues.
+                            n, m = len(tc_points), len(dialogue_points)
+                            costs = [[float("inf")] * (m + 1) for _ in range(n + 1)]
+                            took = [[False] * (m + 1) for _ in range(n + 1)]
+                            for i in range(n + 1):
+                                costs[i][0] = 0
+                            for i in range(1, n + 1):
+                                for j in range(1, min(i, m) + 1):
+                                    skip_cost = costs[i - 1][j]
+                                    take_cost = costs[i - 1][j - 1] + abs(
+                                        tc_points[i - 1][0] - dialogue_points[j - 1][0]
+                                    )
+                                    if take_cost < skip_cost:
+                                        costs[i][j] = take_cost
+                                        took[i][j] = True
+                                    else:
+                                        costs[i][j] = skip_cost
+                            choices = []
+                            i, j = n, m
+                            while j:
+                                if took[i][j]:
+                                    choices.append(tc_points[i - 1])
+                                    i -= 1
+                                    j -= 1
+                                else:
+                                    i -= 1
+                            choices.reverse()
+                            for (_, tc), (_, dialogue) in zip(choices, dialogue_points):
+                                grouped[tc].append(dialogue)
+                        else:
+                            # More dialogue paragraphs than timecodes means a
+                            # cue intentionally contains multiple fragments.
+                            for para_idx, dialogue in dialogue_points:
+                                _, nearest_tc = min(tc_points, key=lambda point: (abs(point[0] - para_idx), point[0]))
+                                grouped[nearest_tc].append(dialogue)
+                        for _, tc in tc_points:
+                            if not grouped[tc]:
+                                continue
+                            cells = [""] * column_count
+                            cells[tc_idx] = tc
+                            cells[dialogue_idx] = " ".join(grouped[tc])
+                            sections.append(" | ".join(cells))
+                        continue
+
                 cells = []
                 seen = set()
                 for cell in row.cells:
@@ -135,7 +255,7 @@ def read_docx(file_bytes: bytes) -> str:
                         seen.add(t)
                 if cells:
                     sections.append(" | ".join(cells))
-        return "\n".join(sections)
+        extracted_text = "\n".join(sections)
     except Exception as e:
         # Fallback for poorly formed DOCX files (like missing app.xml)
         import zipfile
@@ -177,9 +297,23 @@ def read_docx(file_bytes: bytes) -> str:
                                         cells.append("".join(tc_text).strip())
                                 if any(cells):
                                     lines.append(" | ".join(cells))
-                return "\n".join(lines)
+                extracted_text = "\n".join(lines)
         except:
             raise e
+
+    # OCR fallback — if this DOCX has embedded images (a pasted screenshot
+    # of a table instead of a real table, for example) and the normal text
+    # extraction above came back thin, OCR the images and append the result
+    # rather than silently returning near-nothing for that content.
+    try:
+        from ocr_reader import ocr_fallback_for_docx
+        ocr_text = ocr_fallback_for_docx(file_bytes, len(extracted_text))
+        if ocr_text:
+            extracted_text = extracted_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
+    except Exception as e:
+        print(f"[file_reader] OCR fallback skipped for DOCX: {e}")
+
+    return extracted_text
 
 
 def read_legacy_doc(file_bytes: bytes) -> str:
@@ -458,12 +592,26 @@ def read_xml(file_bytes: bytes) -> str:
 def read_rtf(file_bytes: bytes) -> str:
     try:
         from striprtf.striprtf import rtf_to_text
-        return rtf_to_text(decode_bytes(file_bytes))
+        extracted_text = rtf_to_text(decode_bytes(file_bytes))
     except:
         text = decode_bytes(file_bytes)
         text = re.sub(r'\\[a-zA-Z]+\-?\d*\s?', ' ', text)
         text = re.sub(r'[{}\\]', '', text)
-        return re.sub(r'\s+', ' ', text).strip()
+        extracted_text = re.sub(r'\s+', ' ', text).strip()
+
+    # OCR fallback — RTF can embed images via \pict blocks (a pasted
+    # screenshot of a table, same category of issue as DOCX/XLSX above,
+    # just a structurally different embedding mechanism since RTF isn't a
+    # zip archive).
+    try:
+        from ocr_reader import ocr_fallback_for_rtf
+        ocr_text = ocr_fallback_for_rtf(file_bytes, len(extracted_text))
+        if ocr_text:
+            extracted_text = extracted_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
+    except Exception as e:
+        print(f"[file_reader] OCR fallback skipped for RTF: {e}")
+
+    return extracted_text
 
 
 def read_excel(file_bytes: bytes) -> str:
@@ -477,8 +625,25 @@ def read_excel(file_bytes: bytes) -> str:
                 cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
                 if cells:
                     sections.append(" | ".join(cells))
-        return "\n".join(sections)
+        extracted_text = "\n".join(sections)
+
+        # OCR fallback — XLSX is a zip archive just like DOCX, so a pasted
+        # table-as-screenshot (rather than real cell values) is just as
+        # possible here and would otherwise come back as an empty sheet
+        # with no error to flag it.
+        try:
+            from ocr_reader import ocr_fallback_for_xlsx
+            ocr_text = ocr_fallback_for_xlsx(file_bytes, len(extracted_text))
+            if ocr_text:
+                extracted_text = extracted_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
+        except Exception as e:
+            print(f"[file_reader] OCR fallback skipped for XLSX: {e}")
+
+        return extracted_text
     except:
+        # Legacy .xls binary format — NOT a zip archive, so the OCR path
+        # above (which relies on zipfile) does not apply here. Falls back
+        # to plain text extraction only.
         import xlrd
         wb = xlrd.open_workbook(file_contents=file_bytes)
         sections = []
@@ -490,7 +655,18 @@ def read_excel(file_bytes: bytes) -> str:
                          if str(sheet.cell_value(r, c)).strip()]
                 if cells:
                     sections.append(" | ".join(cells))
-        return "\n".join(sections)
+        extracted_text = "\n".join(sections)
+
+        # OCR fallback using raw byte scanning for .xls embedded images
+        try:
+            from ocr_reader import ocr_fallback_for_xls
+            ocr_text = ocr_fallback_for_xls(file_bytes, len(extracted_text))
+            if ocr_text:
+                extracted_text = extracted_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
+        except Exception as e:
+            print(f"[file_reader] OCR fallback skipped for XLS: {e}")
+
+        return extracted_text
 
 
 def read_csv(file_bytes: bytes) -> str:

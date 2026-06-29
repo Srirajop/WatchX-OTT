@@ -138,6 +138,89 @@ def fix_from_index(subtitles: list[dict], target_id: int, new_tc: str) -> list[d
     return result
 
 
+def fix_range_from_index(
+    subtitles: list[dict],
+    target_id: int,
+    new_tc: str,
+    range_end_id: int,
+) -> dict:
+    """
+    Same idea as fix_from_index, but the ripple only applies to a BOUNDED
+    range of subtitle IDs — from target_id up to (and including)
+    range_end_id — rather than rippling all the way to the end of the file.
+
+    Real scenario this is for: the script drifts out of sync starting at
+    line 50, but gets independently re-synced again at line 80 (e.g. the
+    OTT spotting list had an ad-break insert, or that later section was
+    re-logged separately and is already correct). Rippling a single fix
+    at line 50 all the way to the end of the file would incorrectly shift
+    lines 80+ that didn't need correcting at all. Bounding the ripple to
+    [target_id, range_end_id] fixes exactly the drifted section and leaves
+    everything outside that range untouched.
+
+    Returns a dict (not a bare list) so the caller can see exactly which
+    IDs were actually touched, and surface a clear warning if range_end_id
+    comes before target_id (a likely UI input mistake) rather than silently
+    doing nothing or doing something unexpected.
+    """
+    if not subtitles:
+        return {"subtitles": subtitles, "touched_ids": [], "warning": "No subtitles provided."}
+
+    if range_end_id < target_id:
+        return {
+            "subtitles": subtitles,
+            "touched_ids": [],
+            "warning": f"Range end (#{range_end_id}) is before range start (#{target_id}) — nothing changed. Check the order of the two IDs.",
+        }
+
+    new_start = _tc_to_seconds(new_tc)
+    if new_start is None:
+        return {"subtitles": subtitles, "touched_ids": [], "warning": f"Could not understand timecode '{new_tc}'."}
+
+    result = []
+    delta = None
+    touched_ids = []
+
+    for sub in subtitles:
+        item = dict(sub)
+        sub_id = sub.get("id", 0)
+
+        if sub_id == target_id:
+            old_start = _tc_to_seconds(sub.get("start_time", ""))
+            if old_start is not None:
+                delta = new_start - old_start
+            item["start_time"] = _seconds_to_srt(max(0.0, new_start))
+            if delta is not None:
+                old_end = _tc_to_seconds(sub.get("end_time", ""))
+                if old_end is not None:
+                    item["end_time"] = _seconds_to_srt(max(0.0, old_end + delta))
+            touched_ids.append(sub_id)
+
+        elif (
+            sub_id is not None and isinstance(sub_id, int)
+            and target_id < sub_id <= range_end_id
+            and delta is not None
+        ):
+            # Only ripple within the bounded range — anything past
+            # range_end_id is intentionally left alone, unlike
+            # fix_from_index which ripples to the end of the file.
+            start = _tc_to_seconds(sub.get("start_time", ""))
+            end = _tc_to_seconds(sub.get("end_time", ""))
+            if start is not None:
+                item["start_time"] = _seconds_to_srt(max(0.0, start + delta))
+            if end is not None:
+                item["end_time"] = _seconds_to_srt(max(0.0, end + delta))
+            touched_ids.append(sub_id)
+
+        result.append(item)
+
+    warning = ""
+    if delta is None:
+        warning = f"Subtitle #{target_id} not found, or it has no existing start timecode to compute a delta from — nothing changed."
+
+    return {"subtitles": result, "touched_ids": touched_ids, "warning": warning}
+
+
 def shift_only_this(
     subtitles: list[dict],
     target_id: int,

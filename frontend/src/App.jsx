@@ -17,11 +17,20 @@ const STRUCTURE_LABELS = {
 export default function App() {
   const [tab, setTab] = useState('clean')
   const [platforms, setPlatforms] = useState({})
+
+  // Platform Search
+  const [searchKeyword, setSearchKeyword] = useState('')
+  const [searchPlatformFilter, setSearchPlatformFilter] = useState('')
+
+  // Add/Generate Platform
+  const [uniPlatform, setUniPlatform] = useState('')
+  const [uniFile, setUniFile] = useState(null)
+  const [uniText, setUniText] = useState('')
+  const [uniProcessing, setUniProcessing] = useState(false)
+  const [uniMsg, setUniMsg] = useState('')
+  const [uniErr, setUniErr] = useState('')
   const [platform, setPlatform] = useState('discovery_max')
-  const [trackChangesOpen, setTrackChangesOpen] = useState(false)
-  const [trackChangesData, setTrackChangesData] = useState(null)
-  const [trackChangesLoading, setTrackChangesLoading] = useState(false)
-  const [trackChangesErr, setTrackChangesErr] = useState('')
+  const [managementView, setManagementView] = useState('platforms')
 
   // Clean tab
   const [file, setFile] = useState(null)
@@ -41,15 +50,11 @@ export default function App() {
   const [checking, setChecking] = useState(false)
   const [qcResult, setQcResult] = useState(null)
   const [qcError, setQcError] = useState('')
+  const [qcPlatform, setQcPlatform] = useState('discovery_max')
+  const [qcSubtitles, setQcSubtitles] = useState([])
   const qcFileRef = useRef()
 
   // Platforms tab
-  const [newName, setNewName] = useState('')
-  const [glFile, setGlFile] = useState(null)
-  const [glText, setGlText] = useState('')
-  const [adding, setAdding] = useState(false)
-  const [addMsg, setAddMsg] = useState('')
-  const [addErr, setAddErr] = useState('')
   const [editingPlatform, setEditingPlatform] = useState(null)
   const [editRulesText, setEditRulesText] = useState('')
   const [editPlatformMsg, setEditPlatformMsg] = useState('')
@@ -74,16 +79,27 @@ export default function App() {
   const [movieErr, setMovieErr] = useState('')
   const [movieMsg, setMovieMsg] = useState('')
 
+  // Track Changes (on-screen view, before PDF download)
+  const [trackChangesOpen, setTrackChangesOpen] = useState(false)
+  const [trackChangesData, setTrackChangesData] = useState(null)
+  const [trackChangesLoading, setTrackChangesLoading] = useState(false)
+  const [trackChangesErr, setTrackChangesErr] = useState('')
+
   // Timecode Adjuster
   const [tcMode, setTcMode] = useState('offset')   // 'offset' | 'edit_single'
   const [tcValue, setTcValue] = useState('')         // offset OR new start TC
   const [tcEndValue, setTcEndValue] = useState('')   // new end TC (edit_single only)
   const [tcTargetId, setTcTargetId] = useState('')   // subtitle ID (edit_single only)
-  const [tcShiftMode, setTcShiftMode] = useState('ripple') // 'ripple' | 'only_this'
+  const [tcRangeEndId, setTcRangeEndId] = useState('') // last subtitle ID the fix applies up to (range mode only)
+  const [tcShiftMode, setTcShiftMode] = useState('ripple') // 'ripple' | 'only_this' | 'range'
   const [tcAdjusting, setTcAdjusting] = useState(false)
   const [tcError, setTcError] = useState('')
   const [tcSuccess, setTcSuccess] = useState('')
   const [tcCollision, setTcCollision] = useState(null) // null | collision detail string
+  const [tcFile, setTcFile] = useState(null)
+  const [tcSubtitles, setTcSubtitles] = useState([])
+  const [tcLoading, setTcLoading] = useState(false)
+  const tcFileRef = useRef()
 
   useEffect(() => { loadPlatforms(); loadMovies(); }, [])
 
@@ -98,7 +114,11 @@ export default function App() {
     try {
       const r = await axios.get(`${API}/movies`)
       setMovies(r.data.movies || [])
-    } catch(e) { console.error('Failed to load movies:', e) }
+      setMovieErr('')
+    } catch(e) {
+      console.error('Failed to load movies:', e)
+      setMovieErr(e.response?.data?.detail || 'Could not load Movie Hub. Check the backend and database connection.')
+    }
   }
 
   async function handleAddMovie() {
@@ -115,6 +135,7 @@ export default function App() {
       setMovieErr(e.response?.data?.detail || 'Failed to add movie.')
     }
   }
+
 
   // ── CLEAN ──────────────────────────────────────────────────────
 
@@ -282,7 +303,14 @@ export default function App() {
     a.download = `${file?.name || 'subtitles'}_cleaned.pdf`; a.click(); URL.revokeObjectURL(url)
   }
 
-    async function loadTrackChanges() {
+  async function exportTrackChangesPDF() {
+    const r = await axios.post(`${API}/export/track-changes-pdf`, { subtitles, filename: file?.name, platform_key: platform }, { responseType: 'blob' })
+    const url = URL.createObjectURL(r.data)
+    const a = document.createElement('a'); a.href = url
+    a.download = `${file?.name || 'subtitles'}_track_changes.pdf`; a.click(); URL.revokeObjectURL(url)
+  }
+
+  async function loadTrackChanges() {
     setTrackChangesErr(''); setTrackChangesLoading(true)
     try {
       const r = await axios.post(`${API}/track-changes`, { subtitles, platform_key: platform })
@@ -295,28 +323,57 @@ export default function App() {
     }
   }
 
-  async function exportTrackChangesPDF() {
-    const r = await axios.post(`${API}/export/track-changes-pdf`, { subtitles, filename: file?.name, platform_key: platform }, { responseType: 'blob' })
-    const url = URL.createObjectURL(r.data)
-    const a = document.createElement('a'); a.href = url
-    a.download = `${file?.name || 'subtitles'}_track_changes.pdf`; a.click(); URL.revokeObjectURL(url)
-  }
-
   // ── QUALITY CHECK ──────────────────────────────────────────────
 
+  function selectQcFile(fileToCheck) {
+    if (!fileToCheck) return
+    setQcFile(fileToCheck); setQcSubtitles([]); setQcResult(null); setQcError('')
+  }
+
+  async function exportQcSRT() {
+    const output = qcResult?.subtitles || qcSubtitles
+    const name = qcFile?.name || file?.name || 'quality-check.srt'
+    const r = await axios.post(`${API}/export/srt`, { subtitles: output, filename: name, platform_key: qcPlatform }, { responseType: 'blob' })
+    const url = URL.createObjectURL(r.data)
+    const a = document.createElement('a'); a.href = url
+    a.download = `${name.replace(/\.[^/.]+$/, '')}_quality_checked.srt`; a.click(); URL.revokeObjectURL(url)
+  }
+
+  async function exportQcTXT() {
+    const output = qcResult?.subtitles || qcSubtitles
+    const name = qcFile?.name || file?.name || 'quality-check.txt'
+    const r = await axios.post(`${API}/export/txt`, { subtitles: output, filename: name }, { responseType: 'blob' })
+    const url = URL.createObjectURL(r.data)
+    const a = document.createElement('a'); a.href = url
+    a.download = `${name.replace(/\.[^/.]+$/, '')}_quality_checked.txt`; a.click(); URL.revokeObjectURL(url)
+  }
+
+  async function exportAdjustedSRT() {
+    const name = tcFile?.name || file?.name || 'adjusted.srt'
+    const r = await axios.post(`${API}/export/srt`, { subtitles: activeTcSubtitles, filename: name, platform_key: 'generic', preserve_exact: true }, { responseType: 'blob' })
+    const url = URL.createObjectURL(r.data)
+    const a = document.createElement('a'); a.href = url
+    a.download = `${name.replace(/\.[^/.]+$/, '')}_timecode_adjusted.srt`; a.click(); URL.revokeObjectURL(url)
+  }
+
+  function clearQcFile() {
+    setQcFile(null); setQcSubtitles([]); setQcResult(null); setQcError('')
+    if (qcFileRef.current) qcFileRef.current.value = ''
+  }
+
   async function handleQualityCheck() {
-    if (!qcFile && subtitles.length === 0) { setQcError('Upload a subtitle file or clean a file first'); return }
+    if (!qcFile && qcSubtitles.length === 0 && subtitles.length === 0) { setQcError('Upload a subtitle file or clean a file first'); return }
 
     setChecking(true); setQcError(''); setQcResult(null)
 
     try {
-      let subs = subtitles
+      let subs = qcSubtitles.length ? qcSubtitles : subtitles
 
       if (qcFile) {
         setQcError('Extracting file for quality check...')
         const fd = new FormData()
         fd.append('file', qcFile)
-        fd.append('platform', platform)
+        fd.append('platform', qcPlatform)
         const response = await fetch(`${API}/extract`, { method: 'POST', body: fd })
         if (!response.ok) throw new Error(`Server error: ${response.status}`)
         
@@ -350,6 +407,7 @@ export default function App() {
           }
         }
         setQcError('') // Clear extraction message
+        setQcSubtitles(subs)
       }
 
       if (!subs.length) {
@@ -359,11 +417,11 @@ export default function App() {
 
       const r = await axios.post(`${API}/quality-check`, {
         subtitles: subs,
-        platform_key: platform,
+        platform_key: qcPlatform,
         filename: qcFile?.name || file?.name || 'subtitles.srt'
       })
-      // Always update the subtitle list with the auto-fixed version from QC
-      if (r.data.subtitles?.length) setSubtitles(r.data.subtitles)
+      // Quality Check owns its result; do not silently replace Clean/Adjust data.
+      if (r.data.subtitles?.length) setQcSubtitles(r.data.subtitles)
       setQcResult(r.data)
     } catch (e) {
       setQcError(e.response?.data?.detail || 'Quality check failed — is backend running?')
@@ -372,21 +430,33 @@ export default function App() {
 
   // ── PLATFORMS ──────────────────────────────────────────────────
 
-  async function handleAddPlatform() {
-    if (!newName.trim()) { setAddErr('Platform name required'); return }
-    setAdding(true); setAddErr(''); setAddMsg('')
-    const fd = new FormData()
-    fd.append('platform_name', newName)
-    if (glFile) fd.append('guidelines_file', glFile)
-    if (glText) fd.append('guidelines_text', glText)
+  async function handleUnifiedProcess() {
+    setUniErr(''); setUniMsg('')
+    if (!uniPlatform.trim()) {
+      setUniErr('Platform Name is required.')
+      return
+    }
+    if (!uniFile && !uniText.trim()) {
+      setUniErr('Upload a guidelines file or paste the guideline text.')
+      return
+    }
+
+    setUniProcessing(true)
     try {
-      const r = await axios.post(`${API}/platforms/add`, fd)
-      setAddMsg(r.data.message)
-      setNewName(''); setGlText(''); setGlFile(null)
-      loadPlatforms()
+      const fdRules = new FormData()
+      fdRules.append('platform_name', uniPlatform)
+      if (uniFile) fdRules.append('guidelines_file', uniFile)
+      if (uniText.trim()) fdRules.append('guidelines_text', uniText.trim())
+      const rRules = await axios.post(`/api/platforms/add`, fdRules)
+      setUniMsg(rRules.data.message || 'Platform rules generated.')
+      await loadPlatforms()
+
+      setUniFile(null); setUniText('')
     } catch (e) {
-      setAddErr(e.response?.data?.detail || 'Failed to add platform')
-    } finally { setAdding(false) }
+      setUniErr(e.response?.data?.detail || 'Processing failed.')
+    } finally {
+      setUniProcessing(false)
+    }
   }
 
   async function handleDeletePlatform(key) {
@@ -545,9 +615,10 @@ export default function App() {
   // Auto-populate start+end TCs when subtitle ID is entered
   function handleTcTargetIdChange(val) {
     setTcTargetId(val)
+    setTcRangeEndId('')
     setTcSuccess(''); setTcError(''); setTcCollision(null)
     if (val.trim()) {
-      const found = subtitles.find(s => s.id === parseInt(val, 10))
+      const found = activeTcSubtitles.find(s => s.id === parseInt(val, 10))
       if (found) {
         setTcValue(found.start_time || '')
         setTcEndValue(found.end_time || '')
@@ -555,16 +626,40 @@ export default function App() {
     }
   }
 
+  async function handleTcFile(fileToLoad) {
+    if (!fileToLoad) return
+    setTcFile(fileToLoad); setTcLoading(true); setTcError(''); setTcSuccess(''); setTcCollision(null)
+    try {
+      const fd = new FormData()
+      fd.append('file', fileToLoad)
+      const r = await axios.post(`${API}/extract`, fd)
+      const extracted = r.data?.subtitles || []
+      const timed = extracted.filter(s => s.start_time && s.end_time)
+      if (!timed.length) throw new Error('This file has no readable timecodes. Upload an SRT/VTT or a timed DOC/DOCX/PDF script.')
+      setTcSubtitles(timed)
+      setTcSuccess(`Loaded ${timed.length} timed subtitles from ${fileToLoad.name}.`)
+    } catch (e) {
+      setTcFile(null); setTcSubtitles([])
+      setTcError(e.response?.data?.detail || e.message || 'Could not extract timed subtitles from this file.')
+    } finally { setTcLoading(false) }
+  }
+
+  function clearTcFile() {
+    setTcFile(null); setTcSubtitles([]); setTcError(''); setTcSuccess(''); setTcCollision(null)
+    setTcTargetId(''); setTcRangeEndId(''); setTcValue(''); setTcEndValue('')
+    if (tcFileRef.current) tcFileRef.current.value = ''
+  }
+
   async function handleAdjustTimecodes() {
-    if (!subtitles.length) { setTcError('No subtitles loaded. Clean or transcribe a file first.'); return }
+    if (!activeTcSubtitles.length) { setTcError('Upload a timed subtitle file here, or load one in Clean/Transcribe.'); return }
     setTcAdjusting(true); setTcError(''); setTcSuccess(''); setTcCollision(null)
     try {
       let payload, r
       if (tcMode === 'offset') {
         if (!tcValue.trim()) { setTcError('Enter an offset value.'); setTcAdjusting(false); return }
-        payload = { subtitles, mode: 'offset', value: tcValue.trim() }
+        payload = { subtitles: activeTcSubtitles, mode: 'offset', value: tcValue.trim() }
         r = await axios.post(`${API}/adjust-timecodes`, payload)
-        setSubtitles(r.data.subtitles || [])
+        if (tcFile) setTcSubtitles(r.data.subtitles || []); else setSubtitles(r.data.subtitles || [])
         setTcSuccess(`✅ All ${r.data.total} subtitles shifted by ${r.data.value}.`)
         setTcValue('')
       } else {
@@ -573,20 +668,30 @@ export default function App() {
         if (!tcValue.trim()) { setTcError('Enter the new start timecode.'); setTcAdjusting(false); return }
         if (tcShiftMode === 'only_this') {
           if (!tcEndValue.trim()) { setTcError('Enter the new end timecode.'); setTcAdjusting(false); return }
-          payload = { subtitles, mode: 'shift_only_this', target_id: parseInt(tcTargetId, 10), new_start: tcValue.trim(), new_end: tcEndValue.trim() }
+          payload = { subtitles: activeTcSubtitles, mode: 'shift_only_this', target_id: parseInt(tcTargetId, 10), new_start: tcValue.trim(), new_end: tcEndValue.trim() }
           r = await axios.post(`${API}/adjust-timecodes`, payload)
-          setSubtitles(r.data.subtitles || [])
+          if (tcFile) setTcSubtitles(r.data.subtitles || []); else setSubtitles(r.data.subtitles || [])
           if (r.data.collision) {
             setTcCollision(r.data.collision_detail)
             setTcSuccess(`⚠️ Subtitle #${tcTargetId} updated — but collision detected! Check warning below.`)
           } else {
             setTcSuccess(`✅ Subtitle #${tcTargetId} timecode updated. No collision.`)
           }
-        } else {
-          // ripple
-          payload = { subtitles, mode: 'fix_from_index', target_id: parseInt(tcTargetId, 10), value: tcValue.trim() }
+        } else if (tcShiftMode === 'range') {
+          if (!tcRangeEndId.trim()) { setTcError('Enter the last subtitle ID the fix should apply up to.'); setTcAdjusting(false); return }
+          payload = { subtitles: activeTcSubtitles, mode: 'fix_range', target_id: parseInt(tcTargetId, 10), range_end_id: parseInt(tcRangeEndId, 10), value: tcValue.trim() }
           r = await axios.post(`${API}/adjust-timecodes`, payload)
-          setSubtitles(r.data.subtitles || [])
+          if (tcFile) setTcSubtitles(r.data.subtitles || []); else setSubtitles(r.data.subtitles || [])
+          if (r.data.warning) {
+            setTcError(r.data.warning)
+          } else {
+            setTcSuccess(`✅ Subtitles #${tcTargetId} through #${tcRangeEndId} shifted (${r.data.touched_ids.length} line${r.data.touched_ids.length===1?'':'s'}). Everything outside that range is untouched.`)
+          }
+        } else {
+          // ripple — to the end of the file
+          payload = { subtitles: activeTcSubtitles, mode: 'fix_from_index', target_id: parseInt(tcTargetId, 10), value: tcValue.trim() }
+          r = await axios.post(`${API}/adjust-timecodes`, payload)
+          if (tcFile) setTcSubtitles(r.data.subtitles || []); else setSubtitles(r.data.subtitles || [])
           setTcSuccess(`✅ Subtitle #${tcTargetId} + all ${r.data.total} subsequent subtitles shifted.`)
         }
       }
@@ -596,6 +701,7 @@ export default function App() {
   }
 
   const flaggedCount = subtitles.filter(s => s.flagged).length
+  const activeTcSubtitles = tcFile ? tcSubtitles : subtitles
   const builtinPlatforms = Object.entries(platforms).filter(([k]) => !k.startsWith('custom_'))
   const customPlatforms = Object.entries(platforms).filter(([k]) => k.startsWith('custom_'))
 
@@ -612,7 +718,7 @@ export default function App() {
         </div>
         <div style={S.tabs}>
           {[['clean','🧹 Clean'],['transcribe','🎙️ Transcribe'],['adjust','⏱️ Adjust TC'],['quality','✅ Quality Check'],['platforms','⚙️ Platforms'],['movie_hub','🌐 Movie Hub']].map(([id,label]) => (
-            <button key={id} style={{...S.tab,...(tab===id?S.tabActive:{})}} onClick={()=>setTab(id)}>{label}</button>
+            <button key={id} style={{...S.tab,...(tab===id?S.tabActive:{})}} onClick={()=>setTab(id)}>{id === 'platforms' ? 'Rules & Guidelines' : label}</button>
           ))}
         </div>
       </div>
@@ -705,6 +811,7 @@ export default function App() {
                 <div style={S.statsGrid}>
                   {[
                     ['Total Lines', cleanStats.total_lines, '#6366f1'],
+                    ['Lines Changed', cleanStats.changed_lines ?? '—', '#0ea5e9'],
                     ['Auto-approved', cleanStats.total_lines - cleanStats.flagged_lines, '#059669'],
                     ['Flagged', cleanStats.flagged_lines, cleanStats.flagged_lines > 0 ? '#d97706' : '#059669'],
                   ].map(([label,val,color]) => (
@@ -726,16 +833,20 @@ export default function App() {
                 <div className='card' style={S.card}>
                   <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
                     <div style={{fontSize:14,fontWeight:700,color: '#0f172a'}}>Cleaned Subtitles</div>
-                    <div style={{display:'flex',gap:8}}>
+                    <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                      <button style={{...S.btnSm,background:'#eef2ff',borderColor:'#6366f1',color:'#4338ca'}}
+                        onClick={loadTrackChanges} disabled={trackChangesLoading}>
+                        {trackChangesLoading ? 'Loading...' : '👁️ View Track Changes'}
+                      </button>
                       <button style={S.btnSm} onClick={exportSRT}>⬇️ SRT</button>
                       <button style={S.btnSm} onClick={exportTXT}>⬇️ TXT</button>
                       <button style={S.btnSm} onClick={exportDOCX}>⬇️ DOCX</button>
                       <button style={S.btnSm} onClick={exportPDF}>⬇️ PDF</button>
-                      <button style={S.btnSm} onClick={exportTrackChangesPDF}>⬇️ Track Changes PDF</button>
                       <button style={{...S.btnSm,background:'#059669',borderColor:'#059669',color: 'white'}}
                         onClick={()=>setTab('quality')}>✅ Quality Check →</button>
                     </div>
                   </div>
+                  {trackChangesErr && <div style={{...S.errBox, marginBottom:12}}>{trackChangesErr}</div>}
                   {flaggedCount > 0 && (
                     <div style={{background:'#fef2f2',border:'1px solid #dc262630',borderRadius:8,padding:'8px 12px',fontSize:11,color:'#dc2626',marginBottom:10}}>
                       ⚠️ {flaggedCount} lines flagged for review — shown in red below. Edit directly in the box.
@@ -780,7 +891,6 @@ export default function App() {
               <div style={{fontSize:18, fontWeight:700, marginBottom:6, textAlign:'center'}}>🎙️ AI Audio / Video Transcription</div>
               <div style={{fontSize:11, color:'#6366f1', marginBottom:20, textAlign:'center'}}>Powered by local Faster-Whisper. Runs entirely on your machine. Auto-generates frame-accurate SRT.</div>
 
-              {/* Case 1 & 2 & 2B explanation */}
               <div style={{display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, marginBottom:16}}>
                 <div style={{background:'#ffffff', border:'1px solid #4338ca30', borderRadius:8, padding:'10px 12px', fontSize:11}}>
                   <div style={{color:'#6366f1', fontWeight:700, marginBottom:4}}>📄 Case 1 — No Script</div>
@@ -796,7 +906,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Audio upload row */}
               <div style={{display:'flex', gap:10, marginBottom:14}}>
                 <div style={{flex:1, ...S.uploadZone}} onClick={()=>document.getElementById('audio-upload').click()}>
                   <div style={{fontSize:22, marginBottom:4}}>📁</div>
@@ -829,7 +938,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Optional script upload for Case 2 / 2B */}
               <div style={{marginBottom:14}}>
                 <div style={{fontSize:11, fontWeight:700, color:'#d97706', marginBottom:6}}>📋 Optional: Upload Script for Alignment (Case 2 / 2B)</div>
                 <div style={{fontSize:10, color:'#64748b', marginBottom:8}}>
@@ -841,7 +949,7 @@ export default function App() {
                   <div className='uploadZone' style={{...S.uploadZone, padding:12, borderColor:'#05966940'}} onClick={()=>scriptFileRef.current.click()}>
                     <div style={{fontSize:11, color:'#059669'}}>Click to upload script file (DOC, DOCX, PDF, SRT, TXT)</div>
                     <input ref={scriptFileRef} type="file" hidden accept=".doc,.docx,.pdf,.srt,.txt,.vtt"
-                      onChange={e=>e.target.files[0]&&setScriptFile(e.target.files[0])}/>
+                      onChange={e=>scriptFileRef.current.files[0]&&setScriptFile(scriptFileRef.current.files[0])}/>
                   </div>
                 ) : (
                   <div style={{...S.fileChip, borderColor:'#05966940'}}>
@@ -880,17 +988,41 @@ export default function App() {
 
         {/* ══ ADJUST TIMECODES TAB ══ */}
         {tab === 'adjust' && (
-          <div style={{maxWidth:700, margin:'0 auto'}}>
+          <div style={{maxWidth:1080, margin:'0 auto', display:'grid', gridTemplateColumns:'1fr 320px', gap:20, alignItems:'start'}}>
             <div className='card' style={S.card}>
               <div style={{fontSize:18, fontWeight:700, marginBottom:4}}>⏱️ Timecode Adjuster</div>
               <div style={{fontSize:11, color:'#6366f1', marginBottom:18}}>
-                Fix subtitles that are slightly off from the video. Load subtitles in the Clean or Transcribe tab first.
+                Fix subtitles that are slightly off from the video. Upload a timed file here, or use subtitles already loaded elsewhere.
               </div>
 
-              {/* Mode selector */}
+              <div style={{marginBottom:18}}>
+                <div style={{fontSize:11,fontWeight:700,color:'#334155',marginBottom:7}}>Timed subtitle file (optional)</div>
+                {!tcFile ? (
+                  <div className='uploadZone' style={{...S.uploadZone,padding:14}} onClick={()=>tcFileRef.current?.click()}>
+                    <div style={{fontSize:22,marginBottom:5}}>Upload</div>
+                    <div style={S.uploadTitle}>{tcLoading ? 'Reading timecodes...' : 'Upload directly for timestamp adjustment'}</div>
+                    <div style={S.uploadSub}>SRT / VTT / DOC / DOCX / PDF / XML / TTML</div>
+                    <input ref={tcFileRef} type='file' hidden accept='.srt,.vtt,.doc,.docx,.pdf,.xml,.ttml,.dfxp,.txt'
+                      onChange={e=>handleTcFile(e.target.files?.[0])}/>
+                  </div>
+                ) : (
+                  <div style={S.fileChip}>
+                    <span style={{fontSize:18}}>TC</span>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:13,color:'#334155'}}>{tcFile.name}</div>
+                      <div style={{fontSize:10,color:'#059669'}}>{tcSubtitles.length} timed subtitles loaded independently</div>
+                    </div>
+                    <button className='btn-x-hover icon-spin' style={S.btnX} onClick={clearTcFile}>X</button>
+                  </div>
+                )}
+                {!tcFile && subtitles.length > 0 && (
+                  <div style={{fontSize:10,color:'#059669',marginTop:7}}>Using {subtitles.length} subtitles already loaded in Clean/Transcribe.</div>
+                )}
+              </div>
+
               <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:20}}>
                 <div style={{background:'#ffffff', border:`2px solid ${tcMode==='offset'?'#4338ca':'#e2e8f0'}`, borderRadius:10, padding:'14px 16px', cursor:'pointer'}}
-                  onClick={()=>{setTcMode('offset');setTcValue('');setTcEndValue('');setTcTargetId('');setTcSuccess('');setTcError('');setTcCollision(null)}}>
+                  onClick={()=>{setTcMode('offset');setTcValue('');setTcEndValue('');setTcTargetId('');setTcRangeEndId('');setTcSuccess('');setTcError('');setTcCollision(null)}}>
                   <div style={{fontSize:13, fontWeight:700, color:tcMode==='offset'?'#6366f1':'#334155', marginBottom:4}}>± Shift All Subtitles</div>
                   <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>
                     Move <strong style={{color:'#64748b'}}>every</strong> subtitle forward (+) or backward (−) by the same amount.
@@ -898,16 +1030,14 @@ export default function App() {
                   </div>
                 </div>
                 <div style={{background:'#ffffff', border:`2px solid ${tcMode==='edit_single'?'#d97706':'#e2e8f0'}`, borderRadius:10, padding:'14px 16px', cursor:'pointer'}}
-                  onClick={()=>{setTcMode('edit_single');setTcValue('');setTcEndValue('');setTcTargetId('');setTcSuccess('');setTcError('');setTcCollision(null)}}>
+                  onClick={()=>{setTcMode('edit_single');setTcValue('');setTcEndValue('');setTcTargetId('');setTcRangeEndId('');setTcSuccess('');setTcError('');setTcCollision(null)}}>
                   <div style={{fontSize:13, fontWeight:700, color:tcMode==='edit_single'?'#d97706':'#334155', marginBottom:4}}>✏️ Edit Specific Subtitle</div>
                   <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>
-                    Pick a subtitle by its # number. Its current timecodes auto-fill. Choose:
-                    <br/><span style={{color:'#d97706'}}>Ripple</span> (shift all after it) or <span style={{color:'#dc2626'}}>This Only</span> (collision detected).
+                    Pick a subtitle by its # number. Its current timecodes auto-fill. Choose how far the fix should reach — see the three options below.
                   </div>
                 </div>
               </div>
 
-              {/* SHIFT ALL MODE */}
               {tcMode === 'offset' && (
                 <div style={{marginBottom:14}}>
                   <div style={{fontSize:11, color:'#64748b', marginBottom:8}}>
@@ -925,7 +1055,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* EDIT SPECIFIC SUBTITLE MODE */}
               {tcMode === 'edit_single' && (
                 <>
                   <div style={{marginBottom:12}}>
@@ -939,7 +1068,7 @@ export default function App() {
                       onChange={e=>handleTcTargetIdChange(e.target.value)}
                     />
                     {tcTargetId && (() => {
-                      const found = subtitles.find(s=>s.id===parseInt(tcTargetId,10))
+                      const found = activeTcSubtitles.find(s=>s.id===parseInt(tcTargetId,10))
                       return found ? (
                         <div style={{marginTop:6, padding:'8px 12px', background:'#fef3c7', border:'1px solid #d9770630', borderRadius:6, fontSize:11, fontFamily:'monospace', color:'#d97706', lineHeight:1.6}}>
                           <span style={{color:'#64748b'}}>#{found.id}</span>{'  '}
@@ -963,37 +1092,60 @@ export default function App() {
                     </div>
                     <div>
                       <div style={{fontSize:10, color:'#64748b', marginBottom:5, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>
-                        Out Timecode (end) {tcShiftMode==='ripple' && <span style={{color:'#64748b', fontStyle:'italic', fontWeight:400}}> — auto-adjusted</span>}
+                        Out Timecode (end) {tcShiftMode!=='only_this' && <span style={{color:'#64748b', fontStyle:'italic', fontWeight:400}}> — auto-adjusted</span>}
                       </div>
                       <input style={{...S.input, fontFamily:'monospace', fontSize:13, marginBottom:0,
                         borderColor: tcShiftMode==='only_this' ? '#dc2626' : '#e2e8f0',
-                        opacity: tcShiftMode==='ripple' ? 0.45 : 1,
-                        cursor: tcShiftMode==='ripple' ? 'not-allowed' : 'text'}}
+                        opacity: tcShiftMode!=='only_this' ? 0.45 : 1,
+                        cursor: tcShiftMode!=='only_this' ? 'not-allowed' : 'text'}}
                         placeholder='00:01:07,500'
                         value={tcEndValue}
                         onChange={e=>{setTcEndValue(e.target.value);setTcSuccess('');setTcError('');setTcCollision(null)}}
-                        readOnly={tcShiftMode==='ripple'}
+                        readOnly={tcShiftMode!=='only_this'}
                       />
                     </div>
                   </div>
 
-                  <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:14}}>
+                  <div style={{fontSize:10, color:'#64748b', marginBottom:6, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>How far should this fix reach?</div>
+                  <div style={{display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, marginBottom:14}}>
                     <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='ripple'?'#d97706':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
                       onClick={()=>setTcShiftMode('ripple')}>
-                      <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='ripple'?'#d97706':'#334155', marginBottom:3}}>🔁 Ripple Shift</div>
-                      <div style={{fontSize:10, color:'#64748b'}}>Change IN timecode and shift every subtitle after it by the same delta. Duration is preserved. No collisions possible.</div>
+                      <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='ripple'?'#d97706':'#334155', marginBottom:3}}>🔁 Ripple to End</div>
+                      <div style={{fontSize:10, color:'#64748b'}}>Shifts this line and every line AFTER it, all the way to the end of the file. Use when the drift never gets corrected again later in the file.</div>
+                    </div>
+                    <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='range'?'#0ea5e9':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
+                      onClick={()=>setTcShiftMode('range')}>
+                      <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='range'?'#0ea5e9':'#334155', marginBottom:3}}>📐 Ripple to a Stopping Point</div>
+                      <div style={{fontSize:10, color:'#64748b'}}>Shifts this line and the lines after it, but ONLY up to a subtitle # you choose. Use when the drift fixes itself again partway through the file — e.g. lines 50–80 are off, but 81 onward is already correct.</div>
                     </div>
                     <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='only_this'?'#dc2626':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
                       onClick={()=>setTcShiftMode('only_this')}>
-                      <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='only_this'?'#dc2626':'#334155', marginBottom:3}}>📌 This Subtitle Only</div>
-                      <div style={{fontSize:10, color:'#64748b'}}>Change both IN and OUT for this subtitle only. Others stay untouched. Will warn if new timecodes collide with neighbors.</div>
+                      <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='only_this'?'#dc2626':'#334155', marginBottom:3}}>📌 This Line Only</div>
+                      <div style={{fontSize:10, color:'#64748b'}}>Changes IN and OUT for just this one line. No other line moves. Will warn if the new timecodes overlap a neighbor.</div>
                     </div>
                   </div>
 
-                  {tcTargetId && subtitles.find(s=>s.id===parseInt(tcTargetId,10)) && (
+                  {tcShiftMode === 'range' && (
+                    <div style={{marginBottom:14}}>
+                      <div style={{fontSize:10, color:'#64748b', marginBottom:6, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>
+                        Stop the ripple at subtitle # (inclusive)
+                      </div>
+                      <input style={{...S.input, fontFamily:'monospace', fontSize:15, marginBottom:0, borderColor:'#0ea5e9', width:130}}
+                        placeholder='e.g. 80'
+                        type='number' min={tcTargetId || 1}
+                        value={tcRangeEndId}
+                        onChange={e=>{setTcRangeEndId(e.target.value);setTcSuccess('');setTcError('')}}
+                      />
+                      <div style={{fontSize:10, color:'#64748b', marginTop:6}}>
+                        Everything from #{tcTargetId || '?'} up to and including #{tcRangeEndId || '?'} will shift by the same amount. Subtitle #{tcRangeEndId ? parseInt(tcRangeEndId,10)+1 : '(end+1)'} onward stays exactly where it is.
+                      </div>
+                    </div>
+                  )}
+
+                  {tcTargetId && activeTcSubtitles.find(s=>s.id===parseInt(tcTargetId,10)) && (
                     <div style={{marginBottom:14}}>
                       <div style={{fontSize:10, color:'#64748b', marginBottom:6, textTransform:'uppercase', letterSpacing:0.8}}>Context — surrounding subtitles</div>
-                      {subtitles.filter(s=>s.id>=Math.max(1,parseInt(tcTargetId,10)-1)&&s.id<=parseInt(tcTargetId,10)+1).map((s,i)=>(
+                      {activeTcSubtitles.filter(s=>s.id>=Math.max(1,parseInt(tcTargetId,10)-1)&&s.id<=parseInt(tcTargetId,10)+1).map((s,i)=>(
                         <div key={i} style={{
                           background: s.id===parseInt(tcTargetId,10) ? '#fef3c7' : '#ffffff',
                           border: s.id===parseInt(tcTargetId,10) ? '1px solid #d9770640' : '1px solid #e2e8f0',
@@ -1011,29 +1163,41 @@ export default function App() {
                 </>
               )}
 
-              {subtitles.length > 0 && (
+              {activeTcSubtitles.length > 0 && (
                 <div style={{background:'#e0e7ff', border:'1px solid #4338ca30', borderRadius:8, padding:'8px 14px', fontSize:11, color:'#6366f1', marginBottom:12}}>
-                  📊 {subtitles.length} subtitles · First: <span style={{fontFamily:'monospace'}}>{subtitles.find(s=>s.start_time)?.start_time||'—'}</span> · Last: <span style={{fontFamily:'monospace'}}>{[...subtitles].reverse().find(s=>s.end_time)?.end_time||'—'}</span>
+                  📊 {activeTcSubtitles.length} subtitles · First: <span style={{fontFamily:'monospace'}}>{activeTcSubtitles.find(s=>s.start_time)?.start_time||'—'}</span> · Last: <span style={{fontFamily:'monospace'}}>{[...activeTcSubtitles].reverse().find(s=>s.end_time)?.end_time||'—'}</span>
                 </div>
               )}
-              {!subtitles.length && (
+              {!activeTcSubtitles.length && (
                 <div style={{background:'#eef2ff', border:'1px solid #4338ca30', borderRadius:8, padding:'10px 14px', fontSize:11, color:'#64748b', marginBottom:12}}>
                   ⚠️ No subtitles loaded. Go to <strong style={{color:'#6366f1'}}>Clean</strong> or <strong style={{color:'#6366f1'}}>Transcribe</strong> tab first.
                 </div>
               )}
 
               {(() => {
-                const disabled = tcAdjusting || !subtitles.length ||
+                const disabled = tcAdjusting || !activeTcSubtitles.length ||
                   (tcMode==='offset' && !tcValue.trim()) ||
-                  (tcMode==='edit_single' && (!tcTargetId.trim() || !tcValue.trim() || (tcShiftMode==='only_this' && !tcEndValue.trim())))
+                  (tcMode==='edit_single' && (
+                    !tcTargetId.trim() || !tcValue.trim() ||
+                    (tcShiftMode==='only_this' && !tcEndValue.trim()) ||
+                    (tcShiftMode==='range' && !tcRangeEndId.trim())
+                  ))
+                const label = tcAdjusting ? 'Applying...'
+                  : tcMode==='offset' ? '⏱️ Shift All Subtitles'
+                  : tcShiftMode==='ripple' ? '🔁 Apply Ripple Shift'
+                  : tcShiftMode==='range' ? '📐 Apply Ripple to Stopping Point'
+                  : '📌 Update This Line Only'
                 return (
                   <button style={{...S.btnPrimary, ...(disabled?S.btnOff:{})}} onClick={handleAdjustTimecodes} disabled={disabled}>
-                    {tcAdjusting ? 'Applying...' : tcMode==='offset' ? '⏱️ Shift All Subtitles' : tcShiftMode==='ripple' ? '🔁 Apply Ripple Shift' : '📌 Update This Subtitle Only'}
+                    {label}
                   </button>
                 )
               })()}
 
               {tcSuccess && <div style={{marginTop:12, background: tcCollision?'#fef3c7':'#ecfdf5', border:`1px solid ${tcCollision?'#d9770630':'#05966930'}`, borderRadius:8, padding:'10px 14px', fontSize:12, color: tcCollision?'#d97706':'#059669'}}>{tcSuccess}</div>}
+              {tcSuccess && activeTcSubtitles.length > 0 && (
+                <button style={{...S.btnOutline,marginTop:8,width:'100%'}} onClick={exportAdjustedSRT}>Download adjusted SRT</button>
+              )}
               {tcCollision && (
                 <div style={{marginTop:8, background:'#fef2f2', border:'1px solid #dc262640', borderRadius:8, padding:'10px 14px', fontSize:11, color:'#dc2626'}}>
                   ⚠️ <strong>Collision Warning:</strong> {tcCollision}
@@ -1042,16 +1206,90 @@ export default function App() {
               )}
               {tcError && <div style={{...S.errBox, marginTop:12}}><div style={{fontSize:12,color:'#dc2626'}}>{tcError}</div></div>}
             </div>
+
+            <div className='card' style={{...S.card, background:'#fafbff', position:'sticky', top:20}}>
+              <div style={{fontSize:13, fontWeight:700, marginBottom:10, color:'#334155'}}>ℹ️ What does this section do?</div>
+              <div style={{fontSize:11, color:'#475569', lineHeight:1.7, marginBottom:14}}>
+                Sometimes a subtitle's timecode doesn't quite line up with the actual video — the line shows a second too early, or a whole stretch of dialogue drifts out of sync because the original script was timed against a slightly different cut of the footage. This tool lets you correct those timecodes by hand, directly on the text, without needing to touch the video file at all.
+              </div>
+
+              <div style={{fontSize:11, fontWeight:700, color:'#334155', marginBottom:6}}>The three ways to fix a line:</div>
+              <div style={{fontSize:11, color:'#475569', lineHeight:1.6, marginBottom:10}}>
+                <span style={{color:'#d97706', fontWeight:700}}>🔁 Ripple to End</span> — one line is wrong, and so is everything after it. Fixing line 50 also fixes 51, 52, 53... all the way to the last line, by the same amount.
+              </div>
+              <div style={{fontSize:11, color:'#475569', lineHeight:1.6, marginBottom:10}}>
+                <span style={{color:'#0ea5e9', fontWeight:700}}>📐 Ripple to a Stopping Point</span> — only a <em>section</em> drifted, and it goes back to being correct later on. For example lines 50 through 80 are off, but 81 onward already lines up fine. Fixing line 50 with a stopping point of 80 corrects exactly that stretch and leaves 81+ exactly as it was.
+              </div>
+              <div style={{fontSize:11, color:'#475569', lineHeight:1.6, marginBottom:14}}>
+                <span style={{color:'#dc2626', fontWeight:700}}>📌 This Line Only</span> — just one single line is wrong, a one-off mistake, not a sign that anything after it drifted too. Nothing else in the file changes.
+              </div>
+
+              <div style={{fontSize:11, fontWeight:700, color:'#334155', marginBottom:6}}>± Shift All Subtitles</div>
+              <div style={{fontSize:11, color:'#475569', lineHeight:1.6, marginBottom:14}}>
+                Use this instead of the three options above when the <em>entire file</em> is off by the same amount from the very first line — e.g. the whole thing is consistently 2 seconds early. One offset value moves every single subtitle by the same amount.
+              </div>
+
+              <div style={{borderTop:'1px solid #e2e8f0', paddingTop:12}}>
+                <div style={{fontSize:10, color:'#94a3b8', lineHeight:1.6}}>
+                  <strong>Tip:</strong> "Subtitle #" refers to the line number shown next to each subtitle, not a video timestamp. Type that number in and the current timecodes for that line load automatically, so you can see exactly what you're changing before you apply it.
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
         {/* ══ QUALITY CHECK TAB ══ */}
+        {tab === 'movie_hub' && (
+          <div style={S.twoCol}>
+            <div style={S.left}>
+              <div className='card' style={S.card}>
+                <div style={{fontSize:18,fontWeight:700,color:'#0f172a',marginBottom:5}}>Movie Hub</div>
+                <div style={{fontSize:11,color:'#64748b',lineHeight:1.6,marginBottom:18}}>
+                  Keep shared screening and reference links in one place for the subtitle team.
+                </div>
+                <div style={S.label}>Add a movie or reference</div>
+                <input style={{...S.input,marginBottom:10}} placeholder='Title' value={newMovie.title}
+                  onChange={e=>setNewMovie({...newMovie,title:e.target.value})}/>
+                <input style={{...S.input,marginBottom:10}} placeholder='https://example.com/movie' value={newMovie.url}
+                  onChange={e=>setNewMovie({...newMovie,url:e.target.value})}/>
+                <input style={{...S.input,marginBottom:12}} placeholder='Added by (optional)' value={newMovie.added_by}
+                  onChange={e=>setNewMovie({...newMovie,added_by:e.target.value})}/>
+                <button style={S.btnPrimary} onClick={handleAddMovie}>Add to Movie Hub</button>
+                {movieMsg && <div style={{marginTop:12,padding:'9px 12px',background:'#ecfdf5',border:'1px solid #05966930',borderRadius:8,fontSize:12,color:'#059669'}}>{movieMsg}</div>}
+                {movieErr && <div style={{...S.errBox,marginTop:12}}>{movieErr}</div>}
+              </div>
+            </div>
+
+            <div style={S.right}>
+              <div className='card' style={S.card}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                  <div style={S.label}>Shared links ({movies.length})</div>
+                  <button style={S.btnSm} onClick={loadMovies}>Refresh</button>
+                </div>
+                {movies.length === 0 ? (
+                  <div style={{...S.empty,padding:32}}>
+                    <div style={{fontSize:16,fontWeight:700,color:'#334155',marginBottom:6}}>No movies added yet</div>
+                    <div style={{fontSize:11,color:'#64748b'}}>Use the form to add the first shared link.</div>
+                  </div>
+                ) : movies.map(movie => (
+                  <a key={movie.id || `${movie.title}-${movie.url}`} href={/^https?:\/\//i.test(movie.url || '') ? movie.url : '#'} target='_blank' rel='noreferrer'
+                    style={{display:'block',textDecoration:'none',border:'1px solid #e2e8f0',borderRadius:10,padding:'12px 14px',marginBottom:9,background:'#f8fafc'}}>
+                    <div style={{fontSize:13,fontWeight:700,color:'#0f172a',marginBottom:4}}>{movie.title}</div>
+                    <div style={{fontSize:10,color:'#6366f1',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{movie.url}</div>
+                    <div style={{fontSize:10,color:'#94a3b8',marginTop:6}}>Added by {movie.added_by || 'Anonymous'}</div>
+                  </a>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
         {tab === 'quality' && (
           <div style={S.twoCol}>
             <div style={S.left}>
               <div className='card' style={S.card}>
                 <div style={S.label}>Platform to Check Against</div>
-                <select style={S.select} value={platform} onChange={e=>setPlatform(e.target.value)}>
+                <select style={S.select} value={qcPlatform} onChange={e=>{setQcPlatform(e.target.value);setQcResult(null);setQcError('')}}>
                   <optgroup label="Built-in Platforms">
                     {builtinPlatforms.map(([k,p]) => <option key={k} value={k}>{p.name||k}</option>)}
                   </optgroup>
@@ -1065,29 +1303,29 @@ export default function App() {
 
               <div className='card' style={S.card}>
                 <div style={S.label}>Upload File to Check (or use cleaned file from Clean tab)</div>
-                {subtitles.length > 0 && !qcFile && (
+                {(qcSubtitles.length > 0 || subtitles.length > 0) && !qcFile && (
                   <div style={{background:'#ecfdf5',border:'1px solid #05966930',borderRadius:8,padding:'10px 14px',fontSize:12,color:'#059669',marginBottom:12}}>
-                    ✅ Will use {subtitles.length} lines from the Clean tab
+                    ✅ Will use {qcSubtitles.length || subtitles.length} loaded lines
                   </div>
                 )}
                 {!qcFile ? (
                   <div className='uploadZone' style={{...S.uploadZone,...(qcDragOver?S.uploadDrag:{})}}
                     onDragOver={e=>{e.preventDefault();setQcDragOver(true)}}
                     onDragLeave={()=>setQcDragOver(false)}
-                    onDrop={e=>{e.preventDefault();setQcDragOver(false);e.dataTransfer.files[0]&&setQcFile(e.dataTransfer.files[0])}}
+                    onDrop={e=>{e.preventDefault();setQcDragOver(false);selectQcFile(e.dataTransfer.files[0])}}
                     onClick={()=>qcFileRef.current.click()}>
                     <div style={{fontSize:24,marginBottom:6}}>📋</div>
                     <div style={S.uploadTitle}>Upload a different file to check</div>
                     <div style={S.uploadSub}>SRT · TXT · DOC · any format</div>
                     <input ref={qcFileRef} type="file" hidden
-                      accept=".srt,.txt,.doc,.docx,.pdf,.rtf"
-                      onChange={e=>e.target.files[0]&&setQcFile(e.target.files[0])}/>
+                      accept=".srt,.vtt,.txt,.doc,.docx,.pdf,.rtf,.xml,.ttml,.dfxp,.xlsx,.xls,.csv,.json"
+                      onChange={e=>qcFileRef.current.files[0]&&selectQcFile(qcFileRef.current.files[0])}/>
                   </div>
                 ) : (
                   <div style={S.fileChip}>
                     <span style={{fontSize:18}}>📄</span>
                     <div style={{flex:1}}><div style={{fontSize:13,color:'#334155'}}>{qcFile.name}</div></div>
-                    <button className='btn-x-hover icon-spin' style={S.btnX} onClick={()=>setQcFile(null)}>✕</button>
+                    <button className='btn-x-hover icon-spin' style={S.btnX} onClick={clearQcFile}>✕</button>
                   </div>
                 )}
               </div>
@@ -1134,10 +1372,10 @@ export default function App() {
                       ℹ️ {qcResult.info_count} info note(s) — reading speed slightly above target, review if timing allows
                     </div>
                   )}
-                  {qcResult.is_ready_for_delivery && subtitles.length > 0 && (
+                  {qcResult.is_ready_for_delivery && qcSubtitles.length > 0 && (
                     <div style={{marginTop:10,display:'flex',gap:8}}>
-                      <button style={{...S.btnPrimary,flex:1,fontSize:12,padding:'8px 12px'}} onClick={exportSRT}>⬇ Export SRT</button>
-                      <button style={{...S.btnSecondary,flex:1,fontSize:12,padding:'8px 12px'}} onClick={exportTXT}>⬇ Export TXT</button>
+                      <button style={{...S.btnPrimary,flex:1,fontSize:12,padding:'8px 12px'}} onClick={exportQcSRT}>⬇ Export SRT</button>
+                      <button style={{...S.btnSecondary,flex:1,fontSize:12,padding:'8px 12px'}} onClick={exportQcTXT}>⬇ Export TXT</button>
                     </div>
                   )}
                 </div>
@@ -1199,7 +1437,7 @@ export default function App() {
                 <div style={{...S.empty,border:'1px solid #05966930',background:'#ecfdf5'}}>
                   <div style={{fontSize:48,marginBottom:14}}>🎉</div>
                   <div style={{fontSize:17,fontWeight:700,color:'#059669',marginBottom:8}}>No defects found!</div>
-                  <div style={{fontSize:12,color:'#059669'}}>File is ready for delivery to {platforms[platform]?.name || platform}</div>
+                  <div style={{fontSize:12,color:'#059669'}}>File is ready for delivery to {platforms[qcPlatform]?.name || qcPlatform}</div>
                 </div>
               ) : (
                 <div style={S.empty}>
@@ -1217,165 +1455,115 @@ export default function App() {
           </div>
         )}
 
-        {/* ══ PLATFORMS TAB ══ */}
+        {/* ══ PLATFORMS & GUIDELINES TAB ══ */}
         {tab === 'platforms' && (
           <div style={S.twoCol}>
             <div style={S.left}>
               <div className='card' style={S.card}>
-                <div style={S.label}>Add New OTT Platform</div>
-                <input style={S.input} placeholder="Platform name (e.g. Zee5, SonyLiv, Voot)" value={newName} onChange={e=>setNewName(e.target.value)}/>
-                <div style={{fontSize:11,color:'#64748b',marginBottom:6}}>Upload guidelines document (optional)</div>
-                {!glFile ? (
-                  <div className='uploadZone' style={{...S.uploadZone,padding:14}} onClick={()=>document.getElementById('gl-in').click()}>
-                    <div style={{fontSize:11,color:'#64748b',marginBottom:6}}>PDF · DOC · TXT</div>
-                    <button style={S.btnOutline}>Upload Guidelines</button>
-                    <input id="gl-in" type="file" hidden accept=".doc,.docx,.pdf,.txt,.rtf" onChange={e=>e.target.files[0]&&setGlFile(e.target.files[0])}/>
+                <div style={S.label}>🔎 Search Platform Rules</div>
+                <div style={{fontSize:12,color:'#64748b',marginBottom:14}}>
+                  Search across all platform rules, or filter by a specific platform.
+                </div>
+                <input
+                  type='text' placeholder='Search a keyword, e.g. "duration" or "frame gap"'
+                  value={searchKeyword} onChange={e=>setSearchKeyword(e.target.value)}
+                  style={{...S.input, marginBottom:10}}
+                />
+                <select style={{...S.select, marginBottom:10}} value={searchPlatformFilter} onChange={e=>setSearchPlatformFilter(e.target.value)}>
+                  <option value=''>All Platforms</option>
+                  {Object.entries(platforms).map(([k,p]) => <option key={k} value={k}>{p.name||k}</option>)}
+                </select>
+                <div style={{display:'flex',gap:8, marginBottom: 16}}>
+                  <button style={S.btnOutline} onClick={() => { setSearchKeyword(''); setSearchPlatformFilter(''); }}>Clear Filters</button>
+                </div>
+              </div>
+
+              <div className='card' style={S.card}>
+                <div style={S.label}>➕ Add Custom Platform</div>
+                <div style={{fontSize:11,color:'#64748b',marginBottom:14}}>
+                  Upload a document to extract quality check rules automatically.
+                </div>
+                <input style={S.input} placeholder="Platform Name (e.g. Netflix)" value={uniPlatform} onChange={e=>setUniPlatform(e.target.value)}/>
+                <div style={{fontSize:11,color:'#64748b',marginBottom:6}}>Upload guidelines document</div>
+                {!uniFile ? (
+                  <div className='uploadZone' style={{...S.uploadZone,padding:14}} onClick={()=>document.getElementById('unified-gl-in').click()}>
+                    <div style={{fontSize:11,color:'#64748b',marginBottom:6}}>PDF · DOC · TXT · XLSX</div>
+                    <button style={S.btnOutline}>Upload Document</button>
+                    <input id="unified-gl-in" type="file" hidden accept=".doc,.docx,.pdf,.txt,.rtf,.xls,.xlsx" onChange={e=>e.target.files[0]&&setUniFile(e.target.files[0])}/>
                   </div>
                 ) : (
                   <div style={{...S.fileChip,marginBottom:10}}>
-                    <span>📄</span><span style={{flex:1,fontSize:12}}>{glFile.name}</span>
-                    <button className='btn-x-hover icon-spin' style={S.btnX} onClick={()=>setGlFile(null)}>✕</button>
+                    <span>📄</span><span style={{flex:1,fontSize:12}}>{uniFile.name}</span>
+                    <button className='btn-x-hover icon-spin' style={S.btnX} onClick={()=>setUniFile(null)}>✕</button>
                   </div>
                 )}
+                
                 <div style={{fontSize:11,color:'#64748b',marginBottom:6,marginTop:10}}>Or paste guidelines text</div>
-                <textarea style={S.textarea} placeholder="Paste OTT platform subtitle guidelines here..." value={glText} onChange={e=>setGlText(e.target.value)} rows={5}/>
-                <button style={{...S.btnPrimary,marginTop:10,...(adding?S.btnOff:{})}} onClick={handleAddPlatform} disabled={adding}>
-                  {adding ? 'AI reading guidelines...' : '➕ Add Platform'}
+                <textarea style={{...S.textarea, marginBottom:12}} placeholder="Paste guidelines text here..." value={uniText} onChange={e=>setUniText(e.target.value)} rows={4}/>
+
+                <button style={{...S.btnPrimary,...(uniProcessing?S.btnOff:{})}} onClick={handleUnifiedProcess} disabled={uniProcessing}>
+                  {uniProcessing ? 'AI Processing...' : '🚀 Generate QC Rules'}
                 </button>
-                {addMsg&&<div style={{background:'#ecfdf5',border:'1px solid #05966930',borderRadius:8,padding:'10px 14px',fontSize:12,color:'#059669',marginTop:10}}>✅ {addMsg}</div>}
-                {addErr&&<div style={S.errBox}><div style={{fontSize:12,color:'#dc2626'}}>{addErr}</div></div>}
+                {uniMsg&&<div style={{background:'#ecfdf5',border:'1px solid #05966930',borderRadius:8,padding:'10px 14px',fontSize:12,color:'#059669',marginTop:10}}>✅ {uniMsg}</div>}
+                {uniErr&&<div style={{...S.errBox, marginTop: 10}}><div style={{fontSize:12,color:'#dc2626'}}>{uniErr}</div></div>}
               </div>
             </div>
 
             <div style={S.right}>
-              {customPlatforms.length > 0 && (
-                <div className='card' style={S.card}>
-                  <div style={S.label}>Your Custom Platforms</div>
-                  {customPlatforms.map(([k,p]) => (
-                    <div key={k} style={{background:'#f8fafc',border:'1px solid #cbd5e1',borderRadius:8,padding:'12px 14px',marginBottom:8,display:'flex',alignItems:'flex-start',gap:10,cursor:'pointer'}} onClick={()=>{setEditingPlatform({...p, platform_key: k});setEditRulesText((p.rules||[]).join('\n'))}}>
-                      <div style={{flex:1}}>
-                        <div style={{fontSize:13,fontWeight:700,color: '#0f172a',marginBottom:2}}>{p.name||k}</div>
-                        <div style={{fontSize:11,color:'#64748b'}}>{p.max_chars_per_line} chars/line · {p.max_lines} lines · {(p.rules||[]).length} rules</div>
-                      </div>
-                      <button style={{background:'none',border:'none',cursor:'pointer',fontSize:16,color:'#64748b'}} onClick={(e)=>{e.stopPropagation();handleDeletePlatform(k)}}>🗑</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
               <div className='card' style={S.card}>
-                <div style={S.label}>Built-in Platforms (from OTT Clients Protocol)</div>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
-                  {builtinPlatforms.map(([k,p]) => (
-                    <div key={k} style={{background:'#f8fafc',border:'1px solid #cbd5e1',borderRadius:8,padding:'10px 12px',cursor:'pointer'}} onClick={()=>{setEditingPlatform({...p, platform_key: k});setEditRulesText((p.rules||[]).join('\n'))}}>
-                      <div style={{fontSize:12,fontWeight:700,color:'#334155',marginBottom:3}}>{p.name||k}</div>
-                      <div style={{fontSize:10,color:'#64748b'}}>{p.max_chars_per_line} chars · {p.max_lines} lines · {p.file_format||'PAC'}</div>
-                      {p.reading_speed_max_cps&&<div style={{fontSize:10,color:'#64748b'}}>Max {p.reading_speed_max_cps} CPS</div>}
-                    </div>
-                  ))}
+                <div style={S.label}>Platform Rules</div>
+                <div style={{fontSize:12,color:'#64748b',marginBottom:14}}>
+                  Click any platform to edit its rules.
+                </div>
+                
+                <div style={{display:'flex', flexDirection:'column', gap:10}}>
+                  {Object.entries(platforms)
+                    .filter(([k, p]) => {
+                      if (searchPlatformFilter && k !== searchPlatformFilter) return false;
+                      if (searchKeyword.trim()) {
+                        const kw = searchKeyword.toLowerCase();
+                        if ((p.name || k).toLowerCase().includes(kw)) return true;
+                        if ((p.rules || []).some(r => r.toLowerCase().includes(kw))) return true;
+                        return false;
+                      }
+                      return true;
+                    })
+                    .map(([k,p]) => {
+                      const isCustom = k.startsWith('custom_');
+                      const matchingRules = searchKeyword.trim() ? (p.rules || []).filter(r => r.toLowerCase().includes(searchKeyword.toLowerCase())) : [];
+                      
+                      return (
+                        <div key={k} style={{background:'#f8fafc',border:'1px solid #cbd5e1',borderRadius:8,padding:'12px 14px',display:'flex',flexDirection:'column',gap:10,cursor:'pointer'}} onClick={()=>{setEditingPlatform({...p, platform_key: k});setEditRulesText((p.rules||[]).join('\n'))}}>
+                          <div style={{display:'flex',alignItems:'flex-start',gap:10}}>
+                            <div style={{flex:1}}>
+                              <div style={{fontSize:13,fontWeight:700,color: '#0f172a',marginBottom:2}}>
+                                {p.name||k} 
+                                <span style={{fontSize:10,fontWeight:400,color:'#64748b',background:'#e2e8f0',padding:'2px 6px',borderRadius:4,marginLeft:6}}>{isCustom ? 'CUSTOM' : 'BUILT-IN'}</span>
+                                {isCustom && p.created_at && <span style={{fontSize:10,fontWeight:400,color:'#94a3b8',marginLeft:6}}>{new Date(p.created_at).toLocaleDateString()}</span>}
+                              </div>
+                              <div style={{fontSize:11,color:'#64748b'}}>{p.max_chars_per_line} chars/line · {p.max_lines} lines · {(p.rules||[]).length} rules</div>
+                            </div>
+                            {isCustom && <button style={{background:'none',border:'none',cursor:'pointer',fontSize:16,color:'#64748b'}} onClick={(e)=>{e.stopPropagation();handleDeletePlatform(k)}}>🗑</button>}
+                          </div>
+                          {searchKeyword.trim() && matchingRules.length > 0 && (
+                            <div style={{background:'#ffffff', border:'1px solid #e2e8f0', borderRadius: 6, padding: '8px 10px'}}>
+                              <div style={{fontSize: 10, fontWeight: 700, color: '#6366f1', marginBottom: 4}}>Matching Rules:</div>
+                              {matchingRules.slice(0, 3).map((r, i) => (
+                                <div key={i} style={{fontSize: 11, color: '#334155', marginBottom: 2}}>• {r}</div>
+                              ))}
+                              {matchingRules.length > 3 && <div style={{fontSize: 10, color: '#64748b', marginTop: 2}}>+ {matchingRules.length - 3} more...</div>}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                 </div>
               </div>
             </div>
           </div>
         )}
       </div>
-            {/* ══ TRACK CHANGES MODAL — on-screen view, see before you download ══ */}
-      {trackChangesOpen && trackChangesData && (
-        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,0.8)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:999}}
-          onClick={(e)=>{if(e.target===e.currentTarget) setTrackChangesOpen(false)}}>
-          <div style={{background:'#ffffff',border:'1px solid #4338ca',borderRadius:12,padding:24,width:760,maxWidth:'92%',maxHeight:'88vh',display:'flex',flexDirection:'column'}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
-              <div style={{fontSize:18,fontWeight:700}}>📝 Track Changes — {trackChangesData.platform}</div>
-              <button style={{background:'none',border:'none',color:'#64748b',fontSize:20,cursor:'pointer'}} onClick={()=>setTrackChangesOpen(false)}>✕</button>
-            </div>
-            <div style={{fontSize:12,color:'#64748b',marginBottom:16}}>
-              {trackChangesData.changed_lines} of {trackChangesData.total_lines} lines were changed during cleaning · {trackChangesData.unchanged_lines} needed no changes
-            </div>
 
-            <div style={{overflowY:'auto',flex:1,paddingRight:6}}>
-              {trackChangesData.changes.length === 0 ? (
-                <div style={{textAlign:'center',color:'#64748b',padding:40}}>
-                  No changes were made — every line was already clean.
-                </div>
-              ) : (
-                trackChangesData.changes.map(c => (
-                  <div key={c.id} style={{border:'1px solid #e2e8f0',borderRadius:10,padding:14,marginBottom:10,
-                    background: c.flagged ? '#fff1f2' : '#f8fafc'}}>
-                    <div style={{fontSize:11,color:'#94a3b8',marginBottom:6,fontWeight:600}}>Line {c.id}</div>
-                    <div style={{fontSize:13,color:'#d97706',marginBottom:4}}>
-                      <b>Previously:</b> {c.original_text}
-                    </div>
-                    <div style={{fontSize:14,color:'#059669',marginBottom:8}}>
-                      <b>Cleaned:</b> {c.new_text}
-                    </div>
-                    <div style={{fontSize:11,color:'#64748b'}}>
-                      {c.rules_applied.map((r,i) => <div key={i}>• {r}</div>)}
-                    </div>
-                    {c.flagged && (
-                      <div style={{fontSize:11,color:'#dc2626',marginTop:6,fontWeight:600}}>⚠ {c.flag_reason}</div>
-                    )}
-                  </div>
-                ))
-              )}
-            </div>
-
-            <div style={{display:'flex',gap:10,marginTop:16}}>
-              <button style={{...S.btnPrimary, flex:1}} onClick={exportTrackChangesPDF}>⬇️ Download Full Report (PDF)</button>
-              <button style={{...S.btnOutline}} onClick={()=>setTrackChangesOpen(false)}>Close</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ══ MOVIE HUB TAB ══ */}
-      {tab === 'movie_hub' && (
-        <div style={{display:'flex', gap:20}}>
-          {/* Add Movie Form */}
-          <div className='card' style={{...S.card, width: 350, alignSelf:'flex-start'}}>
-            <div style={S.label}>Share a Website</div>
-            
-            {movieErr && <div style={{...S.errBox, marginBottom:10}}>{movieErr}</div>}
-            {movieMsg && <div style={{...S.errBox, background:'#05966933', color:'#059669', borderColor:'#059669', padding:'10px', marginBottom:10}}>{movieMsg}</div>}
-
-            <div style={{marginBottom:10}}>
-              <div style={{fontSize:12, color:'#334155', marginBottom:4}}>Site Name</div>
-              <input style={S.input} placeholder="e.g. YTS, 1337x, etc." value={newMovie.title} onChange={e=>setNewMovie({...newMovie, title: e.target.value})} />
-            </div>
-            <div style={{marginBottom:10}}>
-              <div style={{fontSize:12, color:'#334155', marginBottom:4}}>Website URL</div>
-              <input style={S.input} placeholder="https://..." value={newMovie.url} onChange={e=>setNewMovie({...newMovie, url: e.target.value})} />
-            </div>
-            <div style={{marginBottom:15}}>
-              <div style={{fontSize:12, color:'#334155', marginBottom:4}}>Added By (Optional)</div>
-              <input style={S.input} placeholder="Your Name" value={newMovie.added_by} onChange={e=>setNewMovie({...newMovie, added_by: e.target.value})} />
-            </div>
-            
-            <button style={S.btnPrimary} onClick={handleAddMovie}>+ Add to Hub</button>
-          </div>
-
-          {/* Movie List */}
-          <div style={{flex:1, display:'flex', flexDirection:'column', gap:10}}>
-            {movies.length === 0 ? (
-              <div className='card' style={{...S.card, textAlign:'center', color:'#64748b', padding:40}}>
-                <div style={{fontSize:40, marginBottom:10}}>🌐</div>
-                No websites shared yet. Be the first!
-              </div>
-            ) : (
-              movies.map(m => (
-                <div key={m.id} className='card' style={{...S.card, display:'flex', justifyContent:'space-between', alignItems:'center'}}>
-                  <div>
-                    <div style={{fontSize:16, fontWeight:700, color:'#0f172a', marginBottom:4}}>{m.title}</div>
-                    <div style={{fontSize:12, color:'#64748b'}}>Added by: <span style={{color:'#6366f1'}}>{m.added_by}</span> • {new Date(m.created_at).toLocaleDateString()}</div>
-                  </div>
-                  <a href={m.url.startsWith('http') ? m.url : `https://${m.url}`} target="_blank" rel="noopener noreferrer" style={{...S.btnOutline, textDecoration:'none', display:'inline-block'}}>
-                    🔗 Open Link
-                  </a>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-      )}
 
       {/* ══ EDIT PLATFORM MODAL ══ */}
       {editingPlatform && (
@@ -1410,6 +1598,7 @@ export default function App() {
 // ─── STYLES ──────────────────────────────────────────────────────
 
 const S = {
+  badge: { fontSize:11, fontWeight:600, padding:'2px 9px', borderRadius:20, background:'#dbeafe', color:'#1e40af' },
   root: { minHeight:'100vh', background:'#f8fafc', backgroundImage:'radial-gradient(circle at 50% -20%, #eef2ff 0%, #f8fafc 60%)', color:'#0f172a', fontFamily:"'Inter',system-ui,sans-serif", paddingBottom: 40 },
   header: { background:'rgba(255, 255, 255, 0.85)', backdropFilter:'blur(12px)', WebkitBackdropFilter:'blur(12px)', borderBottom:'1px solid rgba(226, 232, 240, 0.8)', padding:'16px 32px', display:'flex', alignItems:'center', justifyContent:'space-between', flexWrap:'wrap', gap:10, position:'sticky', top:0, zIndex:100 },
   headerLeft: { display:'flex', alignItems:'center', gap:16 },
