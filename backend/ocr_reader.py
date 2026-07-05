@@ -522,11 +522,14 @@ def ocr_fallback_for_rtf(file_bytes: bytes, existing_text_length: int) -> str:
     return ocr_all_images(images)
 
 
-def ocr_fallback_for_pdf(file_bytes: bytes, existing_text_length: int) -> str:
+def ocr_fallback_for_pdf(file_bytes: bytes, existing_text_length: int, force_page_render: bool = False) -> str:
     """Same decision logic, but for PDFs — tries embedded images first, falls back to full-page rendering if none are found."""
     images = extract_images_from_pdf(file_bytes)
 
-    if not images and existing_text_length < 200:
+    if force_page_render:
+        print("[ocr_reader] Searchable timings found but dialogue text is missing - rendering PDF pages for OCR")
+        images = render_pdf_pages_as_images(file_bytes)
+    elif not images and existing_text_length < 200:
         # No embedded image objects AND almost no real text extracted —
         # likely a fully scanned PDF where each page IS the image, not an
         # object inside it. Render pages directly as a last resort.

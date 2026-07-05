@@ -4,7 +4,7 @@ import axios from 'axios'
 const API = '/api'
 
 const SEVERITY_COLOR = { critical: '#dc2626', error: '#d97706', warning: '#6366f1', info: '#2563eb' }
-const SEVERITY_BG = { critical: '#fee2e2', error: '#2a1f0f', warning: '#eef2ff', info: '#eff6ff' }
+const SEVERITY_BG = { critical: '#fee2e2', error: '#fef3c7', warning: '#eef2ff', info: '#eff6ff' }
 
 const STRUCTURE_LABELS = {
   srt_timecoded: 'SRT Timecoded',
@@ -18,6 +18,10 @@ export default function App() {
   const [tab, setTab] = useState('clean')
   const [platforms, setPlatforms] = useState({})
   const [platform, setPlatform] = useState('discovery_max')
+  const [trackChangesOpen, setTrackChangesOpen] = useState(false)
+  const [trackChangesData, setTrackChangesData] = useState(null)
+  const [trackChangesLoading, setTrackChangesLoading] = useState(false)
+  const [trackChangesErr, setTrackChangesErr] = useState('')
 
   // Clean tab
   const [file, setFile] = useState(null)
@@ -56,6 +60,7 @@ export default function App() {
   const [scriptFile, setScriptFile] = useState(null)  // optional script for alignment (Case 2)
   const [whisperSubs, setWhisperSubs] = useState([])  // raw whisper output
   const [recording, setRecording] = useState(false)
+  const [screenRecording, setScreenRecording] = useState(false)
   const [mediaRecorder, setMediaRecorder] = useState(null)
   const [transcribing, setTranscribing] = useState(false)
   const [transcribeProgress, setTranscribeProgress] = useState({ pct: 0, msg: '' })
@@ -128,6 +133,17 @@ export default function App() {
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}))
         throw new Error(errData.detail || `Server error: ${response.status}`)
+      }
+
+      const contentType = response.headers.get('content-type')
+      if (contentType && contentType.includes('application/json')) {
+        const data = await response.json()
+        setSubtitles(data.subtitles || [])
+        setCleanStats(data.stats || null)
+        setCleanProgress(100)
+        setCleanText('Extraction complete!')
+        setExtracting(false)
+        return
       }
 
       const reader = response.body.getReader()
@@ -266,6 +282,26 @@ export default function App() {
     a.download = `${file?.name || 'subtitles'}_cleaned.pdf`; a.click(); URL.revokeObjectURL(url)
   }
 
+    async function loadTrackChanges() {
+    setTrackChangesErr(''); setTrackChangesLoading(true)
+    try {
+      const r = await axios.post(`${API}/track-changes`, { subtitles, platform_key: platform })
+      setTrackChangesData(r.data)
+      setTrackChangesOpen(true)
+    } catch (e) {
+      setTrackChangesErr(e.response?.data?.detail || 'Could not load track changes')
+    } finally {
+      setTrackChangesLoading(false)
+    }
+  }
+
+  async function exportTrackChangesPDF() {
+    const r = await axios.post(`${API}/export/track-changes-pdf`, { subtitles, filename: file?.name, platform_key: platform }, { responseType: 'blob' })
+    const url = URL.createObjectURL(r.data)
+    const a = document.createElement('a'); a.href = url
+    a.download = `${file?.name || 'subtitles'}_track_changes.pdf`; a.click(); URL.revokeObjectURL(url)
+  }
+
   // ── QUALITY CHECK ──────────────────────────────────────────────
 
   async function handleQualityCheck() {
@@ -284,26 +320,32 @@ export default function App() {
         const response = await fetch(`${API}/extract`, { method: 'POST', body: fd })
         if (!response.ok) throw new Error(`Server error: ${response.status}`)
         
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
-        
-        while (true) {
-          const { value, done } = await reader.read()
-          if (done) break
-          buffer += decoder.decode(value, { stream: true })
-          const lines = buffer.split('\n')
-          buffer = lines.pop() || ''
+        const contentType = response.headers.get('content-type')
+        if (contentType && contentType.includes('application/json')) {
+          const data = await response.json()
+          subs = data.subtitles || []
+        } else {
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ''
           
-          for (const line of lines) {
-            const trimmed = line.trim()
-            if (!trimmed.startsWith('data: ')) continue
-            try {
-              const data = JSON.parse(trimmed.substring(6))
-              if (data.status === 'error') throw new Error(data.error)
-              if (data.status === 'completed') subs = data.result?.subtitles || []
-            } catch (e) {
-              if (e.message !== 'Unexpected end of JSON input') throw e
+          while (true) {
+            const { value, done } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop() || ''
+            
+            for (const line of lines) {
+              const trimmed = line.trim()
+              if (!trimmed.startsWith('data: ')) continue
+              try {
+                const data = JSON.parse(trimmed.substring(6))
+                if (data.status === 'error') throw new Error(data.error)
+                if (data.status === 'completed') subs = data.result?.subtitles || []
+              } catch (e) {
+                if (e.message !== 'Unexpected end of JSON input') throw e
+              }
             }
           }
         }
@@ -398,6 +440,50 @@ export default function App() {
       mediaRecorder.stop()
       mediaRecorder.stream.getTracks().forEach(t => t.stop())
       setRecording(false)
+    }
+  }
+
+  async function startScreenRecording() {
+    try {
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true }).catch(() => null)
+      if (!displayStream) return // User cancelled
+      
+      const recorder = new MediaRecorder(displayStream)
+      const chunks = []
+      recorder.ondataavailable = e => chunks.push(e.data)
+      recorder.onstop = () => {
+        const blob = new Blob(chunks, { type: 'video/webm' })
+        const f = new File([blob], 'screen_recording.webm', { type: 'video/webm' })
+        setAudioFile(f)
+      }
+      
+      recorder.__originalStreams = [displayStream]
+      
+      displayStream.getVideoTracks()[0].onended = () => {
+        if (recorder.state !== 'inactive') {
+          recorder.stop()
+          recorder.__originalStreams.forEach(s => s.getTracks().forEach(t => t.stop()))
+          setScreenRecording(false)
+        }
+      }
+
+      recorder.start()
+      setMediaRecorder(recorder)
+      setScreenRecording(true)
+      setTranscribeError('')
+    } catch (e) {
+      setTranscribeError('Screen recording failed: ' + e.message)
+    }
+  }
+
+  function stopScreenRecording() {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop()
+      mediaRecorder.stream.getTracks().forEach(t => t.stop())
+      if (mediaRecorder.__originalStreams) {
+        mediaRecorder.__originalStreams.forEach(s => s.getTracks().forEach(t => t.stop()))
+      }
+      setScreenRecording(false)
     }
   }
 
@@ -542,7 +628,11 @@ export default function App() {
                 <div style={S.label}>Step 1 — Select OTT Platform</div>
                 <select style={S.select} value={platform} onChange={e=>setPlatform(e.target.value)}>
                   <optgroup label="Built-in Platforms">
-                    {builtinPlatforms.map(([k,p]) => <option key={k} value={k}>{p.name || k}</option>)}
+                    {builtinPlatforms.length > 0 ? (
+                      builtinPlatforms.map(([k,p]) => <option key={k} value={k}>{p.name || k}</option>)
+                    ) : (
+                      <option disabled>Loading platforms (or Backend Down)...</option>
+                    )}
                   </optgroup>
                   {customPlatforms.length > 0 && (
                     <optgroup label="Custom Platforms">
@@ -589,7 +679,7 @@ export default function App() {
               </div>
 
               <div style={{display:'flex',gap:10}}>
-                <button style={{...S.btnOutline,flex:1,...(extracting||cleaning||!file?S.btnOff:{}),borderColor:'#4338ca',color:'#6366f1'}} onClick={handleExtract} disabled={extracting||cleaning||!file}>
+                <button style={{...S.btnOutline,flex:1,...(extracting||cleaning||!file?S.btnOff:{})}} onClick={handleExtract} disabled={extracting||cleaning||!file}>
                   {extracting ? '📄 Extracting...' : '📄 Extract Text'}
                 </button>
                 <button style={{...S.btnPrimary,flex:1,...(cleaning||extracting||!file?S.btnOff:{})}} onClick={handleClean} disabled={cleaning||extracting||!file}>
@@ -635,13 +725,14 @@ export default function App() {
               {subtitles.length > 0 ? (
                 <div className='card' style={S.card}>
                   <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
-                    <div style={{fontSize:14,fontWeight:700,color: '#ffffff'}}>Cleaned Subtitles</div>
+                    <div style={{fontSize:14,fontWeight:700,color: '#0f172a'}}>Cleaned Subtitles</div>
                     <div style={{display:'flex',gap:8}}>
                       <button style={S.btnSm} onClick={exportSRT}>⬇️ SRT</button>
                       <button style={S.btnSm} onClick={exportTXT}>⬇️ TXT</button>
                       <button style={S.btnSm} onClick={exportDOCX}>⬇️ DOCX</button>
                       <button style={S.btnSm} onClick={exportPDF}>⬇️ PDF</button>
-                      <button style={{...S.btnSm,background:'#059669',borderColor:'#059669',color: '#ffffff'}}
+                      <button style={S.btnSm} onClick={exportTrackChangesPDF}>⬇️ Track Changes PDF</button>
+                      <button style={{...S.btnSm,background:'#059669',borderColor:'#059669',color: 'white'}}
                         onClick={()=>setTab('quality')}>✅ Quality Check →</button>
                     </div>
                   </div>
@@ -673,7 +764,7 @@ export default function App() {
                   <div style={{fontSize:12,color:'#64748b',marginBottom:20}}>Supports all OTT subtitle and script formats</div>
                   <div style={{display:'flex',flexWrap:'wrap',gap:8,justifyContent:'center'}}>
                     {['Table with Timecodes (FBoy Island style)','Plain Paragraph Script (Everybody Loves Raymond)','SRT / VTT Subtitle Files','XML / TTML / DFXP','CCSL Spotting List (Juno style)','Excel Spotting Lists','Already Cleaned Scripts','Double Dialogue Scripts'].map(f=>(
-                      <div key={f} style={{background:'#f1f5f9',border:'1px solid #cbd5e1',borderRadius:6,padding:'5px 10px',fontSize:11,color:'#64748b'}}>{f}</div>
+                      <div key={f} style={{background:'#f8fafc',border:'1px solid #cbd5e1',borderRadius:6,padding:'5px 10px',fontSize:11,color:'#64748b'}}>{f}</div>
                     ))}
                   </div>
                 </div>
@@ -713,11 +804,17 @@ export default function App() {
                   <div style={S.uploadSub}>MP3, MP4, M4A, WAV, WEBM</div>
                   <input id="audio-upload" type="file" hidden accept="audio/*,video/*" onChange={e=>{if(e.target.files[0])setAudioFile(e.target.files[0])}}/>
                 </div>
-                <div style={{flex:1, ...S.uploadZone, borderColor: recording ? '#dc2626' : '#cbd5e1', background: recording ? '#fee2e2' : '#f8fafc'}}
+                <div style={{flex:1, ...S.uploadZone, borderColor: recording ? '#dc2626' : '#cbd5e1', background: recording ? '#fee2e2' : '#f8fafc', opacity: screenRecording ? 0.5 : 1, pointerEvents: screenRecording ? 'none' : 'auto'}}
                      onClick={recording ? stopRecording : startRecording}>
                   <div style={{fontSize:22, marginBottom:4}}>{recording ? '🛑' : '🎤'}</div>
                   <div style={S.uploadTitle}>{recording ? 'Stop Recording' : 'Live Record'}</div>
                   <div style={S.uploadSub}>{recording ? 'Recording in progress...' : 'Use your microphone'}</div>
+                </div>
+                <div style={{flex:1, ...S.uploadZone, borderColor: screenRecording ? '#dc2626' : '#cbd5e1', background: screenRecording ? '#fee2e2' : '#f8fafc', opacity: recording ? 0.5 : 1, pointerEvents: recording ? 'none' : 'auto'}}
+                     onClick={screenRecording ? stopScreenRecording : startScreenRecording}>
+                  <div style={{fontSize:22, marginBottom:4}}>{screenRecording ? '🛑' : '🖥️'}</div>
+                  <div style={S.uploadTitle}>{screenRecording ? 'Stop Screen' : 'Record Screen'}</div>
+                  <div style={S.uploadSub}>{screenRecording ? 'Recording in progress...' : 'Record screen & system audio'}</div>
                 </div>
               </div>
 
@@ -742,8 +839,8 @@ export default function App() {
                 </div>
                 {!scriptFile ? (
                   <div className='uploadZone' style={{...S.uploadZone, padding:12, borderColor:'#05966940'}} onClick={()=>scriptFileRef.current.click()}>
-                    <div style={{fontSize:11, color:'#059669'}}>Click to upload script file (PMW, DOC, DOCX, PDF, SRT, TXT)</div>
-                    <input ref={scriptFileRef} type="file" hidden accept=".pmw,.doc,.docx,.pdf,.srt,.txt,.vtt"
+                    <div style={{fontSize:11, color:'#059669'}}>Click to upload script file (DOC, DOCX, PDF, SRT, TXT)</div>
+                    <input ref={scriptFileRef} type="file" hidden accept=".doc,.docx,.pdf,.srt,.txt,.vtt"
                       onChange={e=>e.target.files[0]&&setScriptFile(e.target.files[0])}/>
                   </div>
                 ) : (
@@ -805,7 +902,7 @@ export default function App() {
                   <div style={{fontSize:13, fontWeight:700, color:tcMode==='edit_single'?'#d97706':'#334155', marginBottom:4}}>✏️ Edit Specific Subtitle</div>
                   <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>
                     Pick a subtitle by its # number. Its current timecodes auto-fill. Choose:
-                    <br/><span style={{color:'#d97706'}}>Ripple</span> (shift all after it) or <span style={{color:'#ef4444'}}>This Only</span> (collision detected).
+                    <br/><span style={{color:'#d97706'}}>Ripple</span> (shift all after it) or <span style={{color:'#dc2626'}}>This Only</span> (collision detected).
                   </div>
                 </div>
               </div>
@@ -869,7 +966,7 @@ export default function App() {
                         Out Timecode (end) {tcShiftMode==='ripple' && <span style={{color:'#64748b', fontStyle:'italic', fontWeight:400}}> — auto-adjusted</span>}
                       </div>
                       <input style={{...S.input, fontFamily:'monospace', fontSize:13, marginBottom:0,
-                        borderColor: tcShiftMode==='only_this' ? '#ef4444' : '#e2e8f0',
+                        borderColor: tcShiftMode==='only_this' ? '#dc2626' : '#e2e8f0',
                         opacity: tcShiftMode==='ripple' ? 0.45 : 1,
                         cursor: tcShiftMode==='ripple' ? 'not-allowed' : 'text'}}
                         placeholder='00:01:07,500'
@@ -886,9 +983,9 @@ export default function App() {
                       <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='ripple'?'#d97706':'#334155', marginBottom:3}}>🔁 Ripple Shift</div>
                       <div style={{fontSize:10, color:'#64748b'}}>Change IN timecode and shift every subtitle after it by the same delta. Duration is preserved. No collisions possible.</div>
                     </div>
-                    <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='only_this'?'#ef4444':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
+                    <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='only_this'?'#dc2626':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
                       onClick={()=>setTcShiftMode('only_this')}>
-                      <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='only_this'?'#ef4444':'#334155', marginBottom:3}}>📌 This Subtitle Only</div>
+                      <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='only_this'?'#dc2626':'#334155', marginBottom:3}}>📌 This Subtitle Only</div>
                       <div style={{fontSize:10, color:'#64748b'}}>Change both IN and OUT for this subtitle only. Others stay untouched. Will warn if new timecodes collide with neighbors.</div>
                     </div>
                   </div>
@@ -1050,7 +1147,7 @@ export default function App() {
             <div style={S.right}>
               {qcResult?.defects?.length > 0 ? (
                 <div className='card' style={S.card}>
-                  <div style={{fontSize:14,fontWeight:700,color: '#ffffff',marginBottom:12}}>
+                  <div style={{fontSize:14,fontWeight:700,color: '#0f172a',marginBottom:12}}>
                     {(qcResult.error_count||0) > 0
                       ? `❌ ${qcResult.error_count} Error(s) — Must Fix Before Delivery`
                       : `⚠️ Warnings & Notes — File is Deliverable`}
@@ -1060,7 +1157,7 @@ export default function App() {
                     {qcResult.defects.filter(d=>['critical','error'].includes(d.severity)).map((d,i) => (
                       <div key={`e${i}`} style={{background:SEVERITY_BG[d.severity]||'#f1f5f9',border:`1px solid ${SEVERITY_COLOR[d.severity]||'#cbd5e1'}30`,borderRadius:8,padding:'10px 14px',marginBottom:8,borderLeft:`3px solid ${SEVERITY_COLOR[d.severity]||'#4338ca'}`}}>
                         <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4}}>
-                          <span style={{fontSize:10,fontWeight:700,padding:'2px 7px',borderRadius:20,background:SEVERITY_COLOR[d.severity]||'#4338ca',color: '#ffffff'}}>{d.severity?.toUpperCase()}</span>
+                          <span style={{fontSize:10,fontWeight:700,padding:'2px 7px',borderRadius:20,background:SEVERITY_COLOR[d.severity]||'#4338ca',color: 'white'}}>{d.severity?.toUpperCase()}</span>
                           <span style={{fontSize:11,fontWeight:700,color:'#334155'}}>{d.type?.replace(/_/g,' ')}</span>
                           {d.line_id&&<span style={{fontSize:10,color:'#64748b',marginLeft:'auto'}}>Line {d.line_id}</span>}
                         </div>
@@ -1111,7 +1208,7 @@ export default function App() {
                   <div style={{fontSize:12,color:'#64748b',marginBottom:20}}>Checks your file against real OTT platform rules</div>
                   <div style={{textAlign:'left',maxWidth:360}}>
                     {['File naming convention (EHD_123456E_ENG.PAC)','Zero subtitle format and fields','Character limit per line per platform','Duration min/max per platform','Reading speed (CPS)','HOH and EMT element removal','Profanity replacement (fxxx, cxxx etc.)','Spacing and punctuation defects','Double spaces, trailing spaces','ALL CAPS usage'].map(c=>(
-                      <div key={c} style={{fontSize:12,color:'#64748b',padding:'4px 0',borderBottom:'1px solid #f1f5f9'}}>✓ {c}</div>
+                      <div key={c} style={{fontSize:12,color:'#64748b',padding:'4px 0',borderBottom:'1px solid #e2e8f0'}}>✓ {c}</div>
                     ))}
                   </div>
                 </div>
@@ -1157,7 +1254,7 @@ export default function App() {
                   {customPlatforms.map(([k,p]) => (
                     <div key={k} style={{background:'#f8fafc',border:'1px solid #cbd5e1',borderRadius:8,padding:'12px 14px',marginBottom:8,display:'flex',alignItems:'flex-start',gap:10,cursor:'pointer'}} onClick={()=>{setEditingPlatform({...p, platform_key: k});setEditRulesText((p.rules||[]).join('\n'))}}>
                       <div style={{flex:1}}>
-                        <div style={{fontSize:13,fontWeight:700,color: '#ffffff',marginBottom:2}}>{p.name||k}</div>
+                        <div style={{fontSize:13,fontWeight:700,color: '#0f172a',marginBottom:2}}>{p.name||k}</div>
                         <div style={{fontSize:11,color:'#64748b'}}>{p.max_chars_per_line} chars/line · {p.max_lines} lines · {(p.rules||[]).length} rules</div>
                       </div>
                       <button style={{background:'none',border:'none',cursor:'pointer',fontSize:16,color:'#64748b'}} onClick={(e)=>{e.stopPropagation();handleDeletePlatform(k)}}>🗑</button>
@@ -1182,6 +1279,54 @@ export default function App() {
           </div>
         )}
       </div>
+            {/* ══ TRACK CHANGES MODAL — on-screen view, see before you download ══ */}
+      {trackChangesOpen && trackChangesData && (
+        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,0.8)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:999}}
+          onClick={(e)=>{if(e.target===e.currentTarget) setTrackChangesOpen(false)}}>
+          <div style={{background:'#ffffff',border:'1px solid #4338ca',borderRadius:12,padding:24,width:760,maxWidth:'92%',maxHeight:'88vh',display:'flex',flexDirection:'column'}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+              <div style={{fontSize:18,fontWeight:700}}>📝 Track Changes — {trackChangesData.platform}</div>
+              <button style={{background:'none',border:'none',color:'#64748b',fontSize:20,cursor:'pointer'}} onClick={()=>setTrackChangesOpen(false)}>✕</button>
+            </div>
+            <div style={{fontSize:12,color:'#64748b',marginBottom:16}}>
+              {trackChangesData.changed_lines} of {trackChangesData.total_lines} lines were changed during cleaning · {trackChangesData.unchanged_lines} needed no changes
+            </div>
+
+            <div style={{overflowY:'auto',flex:1,paddingRight:6}}>
+              {trackChangesData.changes.length === 0 ? (
+                <div style={{textAlign:'center',color:'#64748b',padding:40}}>
+                  No changes were made — every line was already clean.
+                </div>
+              ) : (
+                trackChangesData.changes.map(c => (
+                  <div key={c.id} style={{border:'1px solid #e2e8f0',borderRadius:10,padding:14,marginBottom:10,
+                    background: c.flagged ? '#fff1f2' : '#f8fafc'}}>
+                    <div style={{fontSize:11,color:'#94a3b8',marginBottom:6,fontWeight:600}}>Line {c.id}</div>
+                    <div style={{fontSize:13,color:'#d97706',marginBottom:4}}>
+                      <b>Previously:</b> {c.original_text}
+                    </div>
+                    <div style={{fontSize:14,color:'#059669',marginBottom:8}}>
+                      <b>Cleaned:</b> {c.new_text}
+                    </div>
+                    <div style={{fontSize:11,color:'#64748b'}}>
+                      {c.rules_applied.map((r,i) => <div key={i}>• {r}</div>)}
+                    </div>
+                    {c.flagged && (
+                      <div style={{fontSize:11,color:'#dc2626',marginTop:6,fontWeight:600}}>⚠ {c.flag_reason}</div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div style={{display:'flex',gap:10,marginTop:16}}>
+              <button style={{...S.btnPrimary, flex:1}} onClick={exportTrackChangesPDF}>⬇️ Download Full Report (PDF)</button>
+              <button style={{...S.btnOutline}} onClick={()=>setTrackChangesOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ══ MOVIE HUB TAB ══ */}
       {tab === 'movie_hub' && (
         <div style={{display:'flex', gap:20}}>
@@ -1253,7 +1398,7 @@ export default function App() {
               <button style={{...S.btnPrimary, flex:1}} onClick={handleSaveRules}>💾 Save Rules</button>
             </div>
             {editPlatformMsg && <div style={{marginTop:12,background:'#ecfdf5',border:'1px solid #05966930',borderRadius:8,padding:'8px',color:'#059669',fontSize:12,textAlign:'center'}}>✅ {editPlatformMsg}</div>}
-            {editPlatformErr && <div style={{marginTop:12,background:'#2a0a0a',border:'1px solid #dc262630',borderRadius:8,padding:'8px',color:'#dc2626',fontSize:12,textAlign:'center'}}>❌ {editPlatformErr}</div>}
+            {editPlatformErr && <div style={{marginTop:12,background:'#fef2f2',border:'1px solid #dc262630',borderRadius:8,padding:'8px',color:'#dc2626',fontSize:12,textAlign:'center'}}>❌ {editPlatformErr}</div>}
           </div>
         </div>
       )}
@@ -1265,52 +1410,52 @@ export default function App() {
 // ─── STYLES ──────────────────────────────────────────────────────
 
 const S = {
-  root: { minHeight:'100vh', background:'#f8fafc', color:'#0f172a', fontFamily:"'Segoe UI',system-ui,sans-serif" },
-  header: { background:'#ffffff', borderBottom:'1px solid #e2e8f0', padding:'14px 24px', display:'flex', alignItems:'center', justifyContent:'space-between', flexWrap:'wrap', gap:10 },
-  headerLeft: { display:'flex', alignItems:'center', gap:12 },
-  logo: { width:38, height:38, background:'linear-gradient(135deg,#4338ca,#4338ca)', borderRadius:10, display:'flex', alignItems:'center', justifyContent:'center', fontWeight:800, fontSize:18, color: '#ffffff' },
-  logoTitle: { fontSize:17, fontWeight:700, color: '#ffffff' },
-  logoSub: { fontSize:10, color:'#64748b', marginTop:2 },
-  tabs: { display:'flex', gap:8, flexWrap:'wrap' },
-  tab: { padding:'7px 14px', background:'transparent', border:'1px solid #e2e8f0', borderRadius:8, color:'#64748b', fontSize:12, fontWeight:600, cursor:'pointer' },
-  tabActive: { background:'#4338ca20', borderColor:'#4338ca', color:'#6366f1' },
-  body: { padding:'20px 24px', maxWidth:1400, margin:'0 auto' },
-  twoCol: { display:'grid', gridTemplateColumns:'380px 1fr', gap:20 },
-  left: { display:'flex', flexDirection:'column', gap:14 },
-  right: { display:'flex', flexDirection:'column', gap:14 },
+  root: { minHeight:'100vh', background:'#f8fafc', backgroundImage:'radial-gradient(circle at 50% -20%, #eef2ff 0%, #f8fafc 60%)', color:'#0f172a', fontFamily:"'Inter',system-ui,sans-serif", paddingBottom: 40 },
+  header: { background:'rgba(255, 255, 255, 0.85)', backdropFilter:'blur(12px)', WebkitBackdropFilter:'blur(12px)', borderBottom:'1px solid rgba(226, 232, 240, 0.8)', padding:'16px 32px', display:'flex', alignItems:'center', justifyContent:'space-between', flexWrap:'wrap', gap:10, position:'sticky', top:0, zIndex:100 },
+  headerLeft: { display:'flex', alignItems:'center', gap:16 },
+  logo: { width:46, height:46, background:'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)', borderRadius:12, display:'flex', alignItems:'center', justifyContent:'center', fontWeight:800, fontSize:22, color: 'white', boxShadow: '0 4px 14px 0 rgba(99,102,241,0.39)' },
+  logoTitle: { fontSize:19, fontWeight:800, color: '#0f172a', letterSpacing: '-0.03em' },
+  logoSub: { fontSize:12, color:'#64748b', marginTop:2, fontWeight:500, letterSpacing: '-0.01em' },
+  tabs: { display:'flex', gap:6, flexWrap:'wrap', background:'#f1f5f9', padding:6, borderRadius:14, border:'1px solid #e2e8f0' },
+  tab: { padding:'8px 16px', background:'transparent', border:'none', borderRadius:10, color:'#64748b', fontSize:13, fontWeight:600, cursor:'pointer', transition: 'all 0.2s ease' },
+  tabActive: { background:'#ffffff', color:'#4f46e5', boxShadow:'0 2px 6px rgba(0,0,0,0.05)' },
+  body: { padding:'32px 32px', maxWidth:1400, margin:'0 auto' },
+  twoCol: { display:'grid', gridTemplateColumns:'400px 1fr', gap:32 },
+  left: { display:'flex', flexDirection:'column', gap:24 },
+  right: { display:'flex', flexDirection:'column', gap:24 },
   
-  card: { background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:16, padding:24, boxShadow:'0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03)' },
+  card: { background:'#ffffff', border:'1px solid rgba(226, 232, 240, 0.8)', borderRadius:20, padding:32, boxShadow:'0 10px 25px -5px rgba(0, 0, 0, 0.02), 0 8px 10px -6px rgba(0, 0, 0, 0.01)', transition: 'transform 0.3s ease, box-shadow 0.3s ease' },
 
-  label: { fontSize:11, fontWeight:700, color:'#4338ca', textTransform:'uppercase', letterSpacing:0.8, marginBottom:10 },
-  select: { width:'100%', padding:'10px 12px', background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:8, color:'#0f172a', fontSize:13, cursor:'pointer' },
-  platformMeta: { display:'flex', gap:8, marginTop:8, fontSize:11, color:'#64748b', flexWrap:'wrap' },
-  uploadZone: { border:'1.5px dashed #cbd5e1', borderRadius:10, padding:22, textAlign:'center', cursor:'pointer', background:'#f8fafc' },
-  uploadDrag: { borderColor:'#4338ca', background:'#eef2ff' },
-  uploadTitle: { fontSize:13, fontWeight:600, color:'#334155', marginBottom:4 },
-  uploadSub: { fontSize:11, color:'#64748b', marginBottom:8 },
-  fileChip: { display:'flex', alignItems:'center', gap:10, background:'#f1f5f9', border:'1px solid #4338ca30', borderRadius:8, padding:'10px 14px' },
-  btnX: { background:'none', border:'none', color:'#64748b', cursor:'pointer', fontSize:14, padding:'2px 5px', borderRadius:4 },
-  btnPrimary: { width:'100%', padding:13, background:'linear-gradient(135deg,#4338ca,#4338ca)', border:'none', borderRadius:10, color: '#ffffff', fontSize:14, fontWeight:700, cursor:'pointer' },
-  btnOff: { opacity:0.5, cursor:'not-allowed' },
-  btnSm: { padding:'6px 12px', background:'#f1f5f9', border:'1px solid #e2e8f0', borderRadius:7, color:'#334155', fontSize:11, fontWeight:600, cursor:'pointer' },
-  btnOutline: { padding:'7px 14px', background:'transparent', border:'1px solid #e2e8f0', borderRadius:8, color:'#334155', fontSize:12, cursor:'pointer' },
-  errBox: { background:'#fef2f2', border:'1px solid #dc262630', borderRadius:10, padding:'14px 16px', textAlign:'center' },
-  statsGrid: { background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:10, padding:14, display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 },
-  statItem: { textAlign:'center' },
-  statNum: { fontSize:22, fontWeight:800, color:'#6366f1', marginBottom:2 },
-  statLabel: { fontSize:10, color:'#64748b', textTransform:'uppercase', letterSpacing:0.5 },
-  subList: { maxHeight:560, overflowY:'auto', border:'1px solid #e2e8f0', borderRadius:8 },
-  subRow: { padding:'18px 24px', borderBottom:'1px solid #e2e8f0', textAlign:'center' },
-  subFlagged: { background:'#fef2f2', borderLeft:'3px solid #dc2626' },
-  timecode: { fontSize:11, color:'#6366f1', fontFamily:'Consolas, monospace', marginBottom:6 },
-  subText: { fontSize:13, color:'#0f172a', lineHeight:1.8, outline:'none' },
-  empty: { display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:300, textAlign:'center', padding:30, background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:12 },
-  input: { width:'100%', padding:'10px 12px', background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:8, color:'#0f172a', fontSize:13, marginBottom:10, outline:'none' },
-  textarea: { width:'100%', padding:'10px 12px', background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:8, color:'#0f172a', fontSize:12, resize:'vertical', fontFamily:'inherit', outline:'none' },
-  progressContainer: { marginTop: 12, padding: 12, background: '#e2e8f0', borderRadius: 10, border: '1px solid #4338ca20' },
-  progressBarOuter: { width: '100%', height: 6, background: '#e2e8f0', borderRadius: 10, overflow: 'hidden', marginBottom: 8 },
-  progressBarInner: { height: '100%', background: 'linear-gradient(90deg, #4338ca, #4338ca)', transition: 'width 0.3s ease' },
-  progressMeta: { display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#6366f1' },
-  progressMsg: { color: '#334155' },
-  progressPct: { fontWeight: 700 },
+  label: { fontSize:12, fontWeight:800, color:'#4f46e5', textTransform:'uppercase', letterSpacing:1.2, marginBottom:16, display: 'flex', alignItems: 'center', gap: 6 },
+  select: { width:'100%', padding:'14px 16px', background:'#f8fafc', border:'1.5px solid #e2e8f0', borderRadius:12, color:'#0f172a', fontSize:14, fontWeight:600, cursor:'pointer', transition: 'all 0.2s ease', appearance: 'none', backgroundImage: 'url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'%2364748b\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'%3e%3cpolyline points=\'6 9 12 15 18 9\'%3e%3c/polyline%3e%3c/svg%3e")', backgroundRepeat: 'no-repeat', backgroundPosition: 'right 16px center', backgroundSize: '16px' },
+  platformMeta: { display:'flex', gap:10, marginTop:16, fontSize:12, color:'#64748b', flexWrap:'wrap', background:'#f8fafc', padding:'12px 16px', borderRadius:10, border:'1px solid #e2e8f0', fontWeight: 500 },
+  uploadZone: { border:'2px dashed #cbd5e1', borderRadius:16, padding:32, textAlign:'center', cursor:'pointer', background:'#f8fafc', transition:'all 0.3s ease', display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight: 200 },
+  uploadDrag: { borderColor:'#6366f1', background:'#eef2ff', transform:'scale(1.02)' },
+  uploadTitle: { fontSize:16, fontWeight:700, color:'#1e293b', marginBottom:8, marginTop:16 },
+  uploadSub: { fontSize:13, color:'#64748b', marginBottom:12, lineHeight: 1.5, maxWidth: '80%' },
+  fileChip: { display:'flex', alignItems:'center', gap:16, background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:14, padding:'16px 20px', boxShadow:'0 4px 12px rgba(0,0,0,0.03)' },
+  btnX: { background:'#f1f5f9', border:'none', color:'#64748b', cursor:'pointer', fontSize:14, width:32, height:32, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', transition:'all 0.2s ease' },
+  btnPrimary: { width:'100%', padding:'14px 24px', background:'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)', border:'none', borderRadius:12, color: 'white', fontSize:15, fontWeight:700, cursor:'pointer', boxShadow:'0 4px 14px rgba(99, 102, 241, 0.25)', transition:'all 0.3s ease', display:'flex', alignItems:'center', justifyContent:'center', gap:8, letterSpacing: '0.01em' },
+  btnOff: { opacity:0.6, cursor:'not-allowed', filter:'grayscale(0.6)', transform: 'none !important', boxShadow: 'none !important' },
+  btnSm: { padding:'8px 16px', background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:8, color:'#334155', fontSize:13, fontWeight:600, cursor:'pointer', transition:'all 0.2s ease', boxShadow:'0 1px 2px rgba(0,0,0,0.02)' },
+  btnOutline: { padding:'14px 24px', background:'#ffffff', border:'1.5px solid #e2e8f0', borderRadius:12, color:'#475569', fontSize:15, fontWeight:700, cursor:'pointer', transition:'all 0.2s ease', display:'flex', alignItems:'center', justifyContent:'center', gap:8 },
+  errBox: { background:'#fef2f2', border:'1px solid #fca5a5', borderRadius:12, padding:'16px 20px', display:'flex', alignItems:'flex-start', gap:12 },
+  statsGrid: { background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:14, padding:20, display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 },
+  statItem: { background:'#ffffff', padding:'16px', borderRadius:10, boxShadow:'0 2px 6px rgba(0,0,0,0.02)', border:'1px solid #f1f5f9', textAlign:'center', display:'flex', flexDirection:'column', justifyContent:'center' },
+  statNum: { fontSize:28, fontWeight:800, color:'#6366f1', marginBottom:6, letterSpacing:'-0.03em' },
+  statLabel: { fontSize:11, color:'#64748b', textTransform:'uppercase', letterSpacing:0.8, fontWeight:700 },
+  subList: { maxHeight:600, overflowY:'auto', border:'1px solid #e2e8f0', borderRadius:14, background:'#f8fafc', padding: 10 },
+  subRow: { padding:'24px 32px', background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:12, marginBottom:10, boxShadow:'0 1px 3px rgba(0,0,0,0.02)', transition: 'border-color 0.2s ease' },
+  subFlagged: { background:'#fff1f2', border:'1px solid #fda4af' },
+  timecode: { fontSize:13, color:'#6366f1', fontFamily:"'JetBrains Mono', Consolas, monospace", marginBottom:10, fontWeight:600, display:'inline-block', background:'#eef2ff', padding:'6px 10px', borderRadius:8 },
+  subText: { fontSize:16, color:'#1e293b', lineHeight:1.7, outline:'none', padding:'8px 0', fontWeight: 400 },
+  empty: { display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:380, textAlign:'center', padding:40, background:'#ffffff', border:'2px dashed #cbd5e1', borderRadius:20, boxShadow:'0 4px 6px rgba(0,0,0,0.01)' },
+  input: { width:'100%', padding:'14px 16px', background:'#ffffff', border:'1.5px solid #e2e8f0', borderRadius:12, color:'#0f172a', fontSize:14, marginBottom:12, outline:'none', transition:'all 0.2s ease', boxShadow:'0 1px 2px rgba(0,0,0,0.01)', fontWeight: 500 },
+  textarea: { width:'100%', padding:'16px', background:'#ffffff', border:'1.5px solid #e2e8f0', borderRadius:12, color:'#0f172a', fontSize:14, resize:'vertical', fontFamily:"'JetBrains Mono', Consolas, monospace", outline:'none', transition:'all 0.2s ease', lineHeight:1.6 },
+  progressContainer: { marginTop: 16, padding: 24, background: '#ffffff', borderRadius: 16, border: '1px solid #e2e8f0', boxShadow:'0 10px 15px -3px rgba(0,0,0,0.03)' },
+  progressBarOuter: { width: '100%', height: 10, background: '#f1f5f9', borderRadius: 10, overflow: 'hidden', marginBottom: 16 },
+  progressBarInner: { height: '100%', background: 'linear-gradient(90deg, #6366f1 0%, #a855f7 100%)', transition: 'width 0.4s cubic-bezier(0.4, 0, 0.2, 1)', borderRadius:10 },
+  progressMeta: { display: 'flex', justifyContent: 'space-between', fontSize: 14, color: '#6366f1', fontWeight: 600 },
+  progressMsg: { color: '#475569' },
+  progressPct: { fontWeight: 800, color: '#4f46e5' },
 }

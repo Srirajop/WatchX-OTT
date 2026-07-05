@@ -505,14 +505,114 @@ def _error_result(platform_key, structure, filename, error_msg):
 
 # --- PLATFORM RULE EXTRACTOR ---
 
-def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> dict:
-    """Extract rules from a custom platform guidelines document."""
-    client, model_name, _ = _get_client_and_model()
 
-    prompt = f"""Read this subtitle guidelines document for "{platform_name}" and extract EVERY key formatting, grammar, punctuation, profanity, and timing rule into an exhaustive list. 
-Do NOT just extract 2 or 3 rules. You MUST extract EVERY distinct instruction you can find in the document.
+def _repair_truncated_json(text: str) -> str:
+    """
+    Attempt to close a JSON object/array that was cut off by a token limit.
+    Closes any unclosed strings, arrays, and objects so json.loads can succeed.
+    """
+    # Count open/close braces and brackets
+    in_string = False
+    escape_next = False
+    depth_brace = 0
+    depth_bracket = 0
+    result = list(text)
 
-Return ONLY valid JSON. NEVER include any // comments in the JSON.
+    for ch in text:
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\':
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if not in_string:
+            if ch == '{':
+                depth_brace += 1
+            elif ch == '}':
+                depth_brace -= 1
+            elif ch == '[':
+                depth_bracket += 1
+            elif ch == ']':
+                depth_bracket -= 1
+
+    # If we're still inside a string, close it
+    suffix = ''
+    if in_string:
+        suffix += '"'
+    # Close open arrays and objects
+    suffix += ']' * depth_bracket
+    suffix += '}' * depth_brace
+    return text + suffix
+
+
+def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str) -> list:
+    """
+    Call LLM for a single chunk of guidelines text.
+    Returns list of rule strings extracted from this chunk.
+    """
+    prompt = f"""Read this section of subtitle guidelines for "{platform_name}".
+
+YOUR TASK:
+Extract EVERY distinct rule or instruction you can find, but categorize them into two groups.
+Return a JSON object with two arrays of strings.
+
+{{
+    "script_rules": [],      // Rules about textual formatting, grammar, punctuation, line limits, reading speed, quotes, italics, casing.
+    "subtitler_rules": []    // Operational rules for human subtitlers (e.g. frame rates, timecode formats, syncing, positioning, file delivery).
+}}
+
+RULES FOR EXTRACTION:
+- Extract EVERY distinct rule you can find — do not skip any.
+- Include specific numeric limits (character counts, duration, CPS, etc.) in full.
+- Each item must be one complete, self-contained rule sentence.
+- Do not include markdown code blocks. Return ONLY the raw JSON object.
+
+GUIDELINES SECTION:
+---
+{chunk}
+---"""
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=3000,
+        )
+        result_text = (response.choices[0].message.content or "").strip()
+        # Strip markdown code fences
+        result_text = re.sub(r"```(?:json)?\s*", "", result_text).strip().rstrip("`")
+        # Try direct parse first
+        try:
+            parsed = json.loads(result_text)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        # Try repairing truncated JSON
+        try:
+            repaired = _repair_truncated_json(result_text)
+            parsed = json.loads(repaired)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[RULES ERROR] LLM call failed: {e}")
+    return {"script_rules": [], "subtitler_rules": []}
+
+
+def _call_llm_for_metadata(client, model_name: str, platform_name: str, sample: str) -> dict:
+    """
+    Extract numeric/structural metadata from the guidelines document.
+    Returns a dict with numeric fields.
+    """
+    prompt = f"""Read this subtitle guidelines document excerpt for "{platform_name}" and extract the numeric/structural metadata.
+
+Return ONLY valid JSON (no comments, no markdown):
 {{
   "name": "{platform_name}",
   "max_chars_per_line": 42,
@@ -525,13 +625,12 @@ Return ONLY valid JSON. NEVER include any // comments in the JSON.
   "file_format": "PAC",
   "two_speaker_format": "hyphen_no_space",
   "zero_subtitle_required": true,
-  "rules": ["Rule 1: ...", "Rule 2: ...", "Rule 3: ...", "Rule 4: ...", "Rule 5: ...", "(... include ALL rules found in the document ...)"],
-  "summary": "One sentence summary"
+  "summary": "One sentence summary of this platform's subtitle style"
 }}
 
-DOCUMENT:
+DOCUMENT EXCERPT:
 ---
-{guidelines_text[:4000]}
+{sample[:3000]}
 ---"""
 
     try:
@@ -539,17 +638,38 @@ DOCUMENT:
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=2000,
+            max_tokens=800,
         )
         result_text = (response.choices[0].message.content or "").strip()
-        cleaned = re.sub(r"```(?:json)?\s*", "", result_text).strip()
-        match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        result_text = re.sub(r"```(?:json)?\s*", "", result_text).strip().rstrip("`")
+        match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if match:
-            return json.loads(match.group())
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                repaired = _repair_truncated_json(match.group())
+                return json.loads(repaired)
     except Exception as e:
-        print(f"[WARN] Platform rule extraction failed: {e}")
+        print(f"[WARN] LLM metadata extraction failed: {e}")
+    return {}
 
-    return {
+
+def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> dict:
+    """
+    Extract ALL rules from a custom platform guidelines document.
+
+    Strategy:
+    1. Split the document into ~6000-char chunks (no arbitrary 4000-char cutoff).
+    2. Run each chunk through the LLM independently to extract a flat rules array.
+    3. De-duplicate and merge all rules from all chunks.
+    4. Run a second LLM pass on the first chunk to extract numeric metadata
+       (char limits, duration, CPS, file format, etc.).
+    5. Combine metadata + merged rules into the final platform dict.
+    """
+    CHUNK_SIZE = 6000
+    client, model_name, _ = _get_client_and_model()
+
+    default = {
         "name": platform_name, "max_chars_per_line": 42, "max_lines": 2,
         "min_duration_seconds": 1.0, "max_duration_seconds": 7.0,
         "min_interval_seconds": 0.02, "reading_speed_target_cps": 17,
@@ -558,3 +678,79 @@ DOCUMENT:
         "rules": ["Maximum 42 characters per line", "Maximum 2 lines", "Standard guidelines"],
         "summary": f"Custom platform: {platform_name}"
     }
+
+    if not guidelines_text or not guidelines_text.strip():
+        return default
+
+    # ── Step 1: chunk the document ──────────────────────────────────────────
+    text = guidelines_text.strip()
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + CHUNK_SIZE
+        # Try to break at a newline boundary to avoid mid-sentence splits
+        if end < len(text):
+            nl = text.rfind('\n', start, end)
+            if nl > start:
+                end = nl
+        chunks.append(text[start:end])
+        start = end
+
+    print(f"[RULES] Extracting rules from {len(chunks)} chunk(s) for '{platform_name}'")
+
+    # ── Step 2: extract rules from each chunk ───────────────────────────────
+    all_script_rules = []
+    all_subtitler_rules = []
+    for i, chunk in enumerate(chunks):
+        print(f"[RULES] Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
+        chunk_res = _call_llm_for_rules(client, model_name, platform_name, chunk)
+        
+        s_rules = chunk_res.get("script_rules", [])
+        m_rules = chunk_res.get("subtitler_rules", [])
+        print(f"[RULES] Chunk {i+1} yielded {len(s_rules)} script rules, {len(m_rules)} manual rules")
+        
+        if isinstance(s_rules, list): all_script_rules.extend(s_rules)
+        if isinstance(m_rules, list): all_subtitler_rules.extend(m_rules)
+
+    # ── Step 3: de-duplicate (case-insensitive, strip whitespace) ───────────
+    def _dedup(rule_list):
+        seen = set()
+        out = []
+        for r in rule_list:
+            if not isinstance(r, str): continue
+            key = r.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(r.strip())
+        return out
+
+    unique_script_rules = _dedup(all_script_rules)
+    unique_subtitler_rules = _dedup(all_subtitler_rules)
+
+    print(f"[RULES] Total unique script rules: {len(unique_script_rules)}, subtitler rules: {len(unique_subtitler_rules)}")
+
+    if not unique_script_rules and not unique_subtitler_rules:
+        # Fallback: return defaults so the platform is still saved
+        return default
+
+    # ── Step 4: extract numeric metadata from the first chunk ───────────────
+    metadata = _call_llm_for_metadata(client, model_name, platform_name, chunks[0])
+
+    # ── Step 5: merge ────────────────────────────────────────────────────────
+    result = {
+        "name":                     metadata.get("name", platform_name),
+        "max_chars_per_line":       metadata.get("max_chars_per_line", 42),
+        "max_lines":                metadata.get("max_lines", 2),
+        "min_duration_seconds":     metadata.get("min_duration_seconds", 1.0),
+        "max_duration_seconds":     metadata.get("max_duration_seconds", 7.0),
+        "min_interval_seconds":     metadata.get("min_interval_seconds", 0.02),
+        "reading_speed_target_cps": metadata.get("reading_speed_target_cps", 17),
+        "reading_speed_max_cps":    metadata.get("reading_speed_max_cps", 21),
+        "file_format":              metadata.get("file_format", "PAC"),
+        "two_speaker_format":       metadata.get("two_speaker_format", "hyphen_no_space"),
+        "zero_subtitle_required":   metadata.get("zero_subtitle_required", True),
+        "summary":                  metadata.get("summary", f"Custom platform: {platform_name}"),
+        "rules":                    unique_script_rules,
+        "subtitler_rules":          unique_subtitler_rules,
+    }
+    return result

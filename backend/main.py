@@ -90,7 +90,7 @@ async def clean_file_endpoint(
 ):
     import asyncio
     
-    ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",
+    ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",".pmw",
                ".rtf",".srt",".vtt",".webvtt",".xlsx",".xls",
                ".csv",".txt",".json"]
 
@@ -105,7 +105,10 @@ async def clean_file_endpoint(
     if not file_bytes:
         raise HTTPException(400, "Uploaded file is empty")
 
-    file_data = read_file(file_bytes, filename)
+    try:
+        file_data = read_file(file_bytes, filename)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     raw_text = file_data["raw_text"]
     structure = file_data["structure"]
 
@@ -300,7 +303,7 @@ async def extract_file_endpoint(
     file: UploadFile = File(...),
     platform: str = Form(default="discovery_max")
 ):
-    ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",
+    ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",".pmw",
                ".rtf",".srt",".vtt",".webvtt",".xlsx",".xls",
                ".csv",".txt",".json"]
 
@@ -314,7 +317,10 @@ async def extract_file_endpoint(
     if not file_bytes:
         raise HTTPException(400, "Uploaded file is empty")
 
-    file_data = read_file(file_bytes, filename)
+    try:
+        file_data = read_file(file_bytes, filename)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     raw_text = file_data["raw_text"]
     structure = file_data["structure"]
 
@@ -717,58 +723,171 @@ def get_platforms():
         return {"platforms": {p["key"]: p for p in get_platform_list()}}
 
 
+
 @app.post("/platforms/add")
 async def add_platform(
     platform_name: str = Form(...),
+    version_label: str = Form(default="Current"),
+    sheet_name: str = Form(default=""),          # optional: target a specific Excel sheet
     guidelines_file: UploadFile = File(None),
     guidelines_text: str = Form(default="")
 ):
-    import time
     if not platform_name.strip():
         raise HTTPException(400, "Platform name is required")
 
-    base_key = "custom_" + re.sub(r'[^a-z0-9]', '_', platform_name.lower().strip())
-    platform_key = f"{base_key}_{int(time.time())}"
+    version_slug = re.sub(r'[^a-z0-9]', '_', (version_label or 'current').lower().strip()).strip('_')
+    platform_family = "custom_" + re.sub(r'[^a-z0-9]', '_', platform_name.lower().strip())
+    platform_key = f"{platform_family}__{version_slug}"
 
     raw_guidelines = ""
     if guidelines_file and guidelines_file.filename:
         file_bytes = await guidelines_file.read()
-        file_data = read_file(file_bytes, guidelines_file.filename)
-        raw_guidelines = file_data["raw_text"]
+        if not file_bytes:
+            raise HTTPException(400, "Uploaded guidelines file is empty")
+
+        ext = guidelines_file.filename.lower().rsplit(".", 1)[-1]
+        if sheet_name.strip() and ext in ("xlsx", "xls"):
+            # ── SHEET-SPECIFIC extraction: isolate one sheet from the workbook ──
+            from file_reader import read_excel_sheet
+            raw_guidelines = read_excel_sheet(file_bytes, sheet_name.strip())
+            print(f"[PLATFORMS] Read sheet '{sheet_name}' → {len(raw_guidelines)} chars")
+        else:
+            file_data = read_file(file_bytes, guidelines_file.filename)
+            raw_guidelines = file_data["raw_text"]
+            print(f"[PLATFORMS] Read {len(raw_guidelines)} chars from '{guidelines_file.filename}'")
     elif guidelines_text.strip():
         raw_guidelines = guidelines_text.strip()
 
-    if raw_guidelines:
-        platform_data = extract_platform_rules_with_ai(raw_guidelines, platform_name.strip())
-    else:
-        platform_data = {
-            "name": platform_name.strip(),
-            "max_chars_per_line": 42,
-            "max_lines": 2,
-            "rules": ["Maximum 42 characters per line", "Maximum 2 lines", "Standard guidelines"],
-            "summary": f"Custom: {platform_name.strip()}"
-        }
+    if not raw_guidelines.strip():
+        raise HTTPException(400, "No readable text found in the uploaded document. "
+                            "Please try a different format (PDF, DOCX, TXT).")
 
-    platform_data["guidelines_raw"] = raw_guidelines
+    print(f"[PLATFORMS] Extracting rules for '{platform_name}' v'{version_label}' from {len(raw_guidelines)} chars")
+    platform_data = extract_platform_rules_with_ai(raw_guidelines, platform_name.strip())
+
+    platform_data["platform_family"] = platform_family
+    platform_data["version_label"]   = version_label.strip() or "Current"
+    platform_data["guidelines_raw"]  = raw_guidelines
+
     save_custom_platform(platform_key, platform_data)
+
+    rules_count = len(platform_data.get("rules", []))
+    print(f"[PLATFORMS] Saved '{platform_name}' ({version_label}) as '{platform_key}' with {rules_count} rules")
 
     return {
         "success": True,
         "platform_key": platform_key,
+        "platform_family": platform_family,
+        "version_label": platform_data["version_label"],
         "platform_name": platform_name.strip(),
-        "rules_extracted": len(platform_data.get("rules", [])),
-        "message": f"Platform '{platform_name}' added with {len(platform_data.get('rules', []))} rules"
+        "rules_extracted": rules_count,
+        "message": f"Platform '{platform_name}' ({platform_data['version_label']}) saved with {rules_count} rules extracted"
+    }
+
+
+@app.post("/platforms/preview-excel")
+async def preview_excel_sheets(guidelines_file: UploadFile = File(...)):
+    """
+    Return the list of sheet names (+ row counts) from an uploaded Excel file
+    WITHOUT extracting any rules. Used by the bulk-import UI so subtitlers
+    can see what sheets exist and map each one to a platform name/version.
+    """
+    file_bytes = await guidelines_file.read()
+    if not file_bytes:
+        raise HTTPException(400, "File is empty")
+    ext = guidelines_file.filename.lower().rsplit(".", 1)[-1]
+    if ext not in ("xlsx", "xls"):
+        raise HTTPException(400, "Only Excel (.xlsx / .xls) files are supported for sheet preview")
+    from file_reader import list_excel_sheets
+    sheets = list_excel_sheets(file_bytes)
+    if not sheets:
+        raise HTTPException(422, "Could not read any sheets from this file")
+    return {"filename": guidelines_file.filename, "sheets": sheets}
+
+
+@app.post("/platforms/bulk-add")
+async def bulk_add_platforms(
+    guidelines_file: UploadFile = File(...),
+    mappings: str = Form(...)   # JSON string: [{sheet_name, platform_name, version_label}]
+):
+    """
+    Process a multi-sheet Excel file and import each mapped sheet as a
+    separate platform version in one request.
+
+    mappings example:
+    [
+      {"sheet_name": "Netflix",      "platform_name": "Netflix",      "version_label": "Current"},
+      {"sheet_name": "Discovery Max","platform_name": "Discovery Max","version_label": "2023 Guidelines"}
+    ]
+    """
+    import json as _json
+    try:
+        mapping_list = _json.loads(mappings)
+    except Exception:
+        raise HTTPException(400, "Invalid mappings JSON")
+
+    file_bytes = await guidelines_file.read()
+    if not file_bytes:
+        raise HTTPException(400, "File is empty")
+
+    from file_reader import read_excel_sheet
+
+    results = []
+    for entry in mapping_list:
+        sheet   = entry.get("sheet_name", "").strip()
+        p_name  = entry.get("platform_name", "").strip()
+        version = entry.get("version_label", "Current").strip() or "Current"
+
+        if not sheet or not p_name:
+            results.append({"sheet_name": sheet, "status": "skipped", "reason": "Missing sheet or platform name"})
+            continue
+
+        try:
+            raw = read_excel_sheet(file_bytes, sheet)
+            if not raw.strip():
+                results.append({"sheet_name": sheet, "platform_name": p_name, "status": "skipped",
+                                 "reason": "Sheet is empty or could not be read"})
+                continue
+
+            version_slug   = re.sub(r'[^a-z0-9]', '_', version.lower()).strip('_')
+            platform_family = "custom_" + re.sub(r'[^a-z0-9]', '_', p_name.lower())
+            platform_key    = f"{platform_family}__{version_slug}"
+
+            print(f"[BULK] Processing sheet '{sheet}' → '{p_name}' ({version}) — {len(raw)} chars")
+            platform_data = extract_platform_rules_with_ai(raw, p_name)
+            platform_data["platform_family"] = platform_family
+            platform_data["version_label"]   = version
+            platform_data["guidelines_raw"]  = raw
+
+            save_custom_platform(platform_key, platform_data)
+            rules_count = len(platform_data.get("rules", []))
+
+            results.append({
+                "sheet_name": sheet,
+                "platform_name": p_name,
+                "version_label": version,
+                "platform_key": platform_key,
+                "rules_extracted": rules_count,
+                "status": "ok"
+            })
+        except Exception as e:
+            results.append({"sheet_name": sheet, "platform_name": p_name, "status": "error", "reason": str(e)})
+
+    ok = [r for r in results if r.get("status") == "ok"]
+    return {
+        "total": len(mapping_list),
+        "imported": len(ok),
+        "results": results,
+        "message": f"Imported {len(ok)} of {len(mapping_list)} platforms from '{guidelines_file.filename}'"
     }
 
 
 @app.delete("/platforms/{platform_key}")
 def delete_platform(platform_key: str):
-    if not platform_key.startswith("custom_"):
-        raise HTTPException(400, "Cannot delete built-in platforms")
     from database import get_connection
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM platforms WHERE platform_key=%s AND is_custom=TRUE", (platform_key,))
+    cursor.execute("DELETE FROM platforms WHERE platform_key=%s", (platform_key,))
     affected = cursor.rowcount
     conn.commit()
     cursor.close()
@@ -778,36 +897,99 @@ def delete_platform(platform_key: str):
     return {"success": True}
 
 
-@app.put("/platforms/{platform_key}")
-async def update_platform(platform_key: str, data: dict):
-    if not platform_key.startswith("custom_"):
-        raise HTTPException(400, "Cannot modify built-in platforms")
-    
-    rules = data.get("rules", [])
-    if not isinstance(rules, list):
-        raise HTTPException(400, "Rules must be an array")
-
+@app.delete("/platforms/family/{family_key}")
+def delete_platform_family(family_key: str):
+    """Delete ALL versions of a platform family at once."""
     from database import get_connection
-    import json
-    
     conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT config_json FROM platforms WHERE platform_key=%s AND is_custom=TRUE", (platform_key,))
-    row = cursor.fetchone()
-    if not row:
-        cursor.close()
-        conn.close()
-        raise HTTPException(404, "Custom platform not found")
-        
-    config = json.loads(row["config_json"])
-    config["rules"] = rules
-    
-    cursor.execute("UPDATE platforms SET config_json=%s WHERE platform_key=%s", (json.dumps(config), platform_key))
+    cursor = conn.cursor()
+    # Match by family key OR by platform_key prefix (covers built-ins which use key as family)
+    cursor.execute(
+        "DELETE FROM platforms WHERE platform_family=%s OR platform_key=%s",
+        (family_key, family_key)
+    )
+    affected = cursor.rowcount
     conn.commit()
     cursor.close()
     conn.close()
-    
-    return {"success": True, "message": "Rules updated successfully"}
+    if affected == 0:
+        raise HTTPException(404, "No versions found for this platform family")
+    return {"success": True, "deleted_versions": affected}
+
+
+@app.patch("/platforms/{platform_key}/meta")
+async def update_platform_meta(platform_key: str, data: dict):
+    """
+    Update name, version_label, and/or rules for one platform version.
+    Works on any platform (built-in or custom).
+    """
+    import json as _json
+    from database import get_connection
+
+    name          = data.get("name")
+    version_label = data.get("version_label")
+    rules         = data.get("rules")
+    subtitler_rules = data.get("subtitler_rules")
+
+    if not any([name, version_label is not None, rules is not None, subtitler_rules is not None]):
+        raise HTTPException(400, "Nothing to update — provide name, version_label, rules, or subtitler_rules")
+
+    conn   = get_connection()
+    cursor = conn.cursor()
+
+    parts  = []
+    params = []
+    if name is not None:
+        parts.append("name=%s");          params.append(name.strip())
+    if version_label is not None:
+        parts.append("version_label=%s"); params.append(version_label.strip())
+    if rules is not None:
+        if not isinstance(rules, list):
+            raise HTTPException(400, "Rules must be an array")
+        parts.append("rules=%s");         params.append(_json.dumps(rules))
+    if subtitler_rules is not None:
+        if not isinstance(subtitler_rules, list):
+            raise HTTPException(400, "Subtitler rules must be an array")
+        parts.append("subtitler_rules=%s"); params.append(_json.dumps(subtitler_rules))
+
+    params.append(platform_key)
+    cursor.execute(f"UPDATE platforms SET {', '.join(parts)} WHERE platform_key=%s", params)
+    affected = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    if affected == 0:
+        raise HTTPException(404, "Platform not found")
+    return {"success": True, "platform_key": platform_key}
+
+
+@app.patch("/platforms/family/{family_key}/name")
+async def rename_platform_family(family_key: str, data: dict):
+    """
+    Rename the display name for ALL versions of a platform family at once.
+    e.g. 'Nickelodeon V10' → 'Nickelodeon' across every version in the group.
+    """
+    new_name = (data.get("name") or "").strip()
+    if not new_name:
+        raise HTTPException(400, "New name is required")
+
+    from database import get_connection
+    conn   = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE platforms SET name=%s WHERE platform_family=%s OR platform_key=%s",
+        (new_name, family_key, family_key)
+    )
+    affected = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    if affected == 0:
+        raise HTTPException(404, "Platform family not found")
+    return {"success": True, "family_key": family_key, "new_name": new_name, "updated": affected}
+
 
 
 # ─── HELPER ──────────────────────────────────────────────────────

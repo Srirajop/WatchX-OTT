@@ -1,10 +1,29 @@
 # file_reader.py — Reads ANY subtitle/script file format
-# Handles: DOC, DOCX, PDF, SRT, VTT, XML, TTML, RTF, TXT, XLSX, XLS, CSV
+# Handles: DOC, DOCX, PDF, SRT, VTT, XML, TTML, RTF, TXT, XLSX, XLS, CSV, PMW
 # Preserves structure for AI to understand context
 
 import io
 import re
 import chardet
+
+
+class UnsupportedPMWError(ValueError):
+    pass
+_PDF_METADATA_LINE = re.compile(r'^\s*(?:===|Original\s+title:|Translated\s+title:|Language:|File:|Printed\s+on\s+.+\bPage\s+\d+\s*$)', re.IGNORECASE)
+_PDF_TIMECODE = re.compile(r'\b\d{2}:\d{2}:\d{2}[.:;]\d{2}\b')
+
+def _pdf_text_needs_outline_ocr(text: str) -> bool:
+    timecode_lines = word_count = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or _PDF_METADATA_LINE.match(line):
+            continue
+        if _PDF_TIMECODE.search(line):
+            timecode_lines += 1
+            line = _PDF_TIMECODE.sub(' ', line)
+            line = re.sub(r'\b\d+(?:[.:]\d+)*\b', ' ', line)
+        word_count += len(re.findall(r"[A-Za-z][A-Za-z'-]{1,}", line))
+    return timecode_lines >= 20 and word_count < max(20, timecode_lines // 5)
 
 
 def read_file(file_bytes: bytes, filename: str) -> dict:
@@ -32,12 +51,15 @@ def read_file(file_bytes: bytes, filename: str) -> dict:
         "csv": read_csv,
         "txt": read_plain,
         "json": read_json,
+        "pmw": read_pmw,
     }
 
     reader = readers.get(ext, read_plain)
 
     try:
         raw_text = reader(file_bytes)
+    except UnsupportedPMWError:
+        raise
     except Exception:
         raw_text = decode_bytes(file_bytes)
 
@@ -71,9 +93,10 @@ def read_file(file_bytes: bytes, filename: str) -> dict:
     if ext == "pdf":
         try:
             from ocr_reader import ocr_fallback_for_pdf
-            ocr_text = ocr_fallback_for_pdf(file_bytes, len(raw_text.strip()))
+            outline_text_missing = _pdf_text_needs_outline_ocr(raw_text)
+            ocr_text = ocr_fallback_for_pdf(file_bytes, len(raw_text.strip()), force_page_render=outline_text_missing)
             if ocr_text:
-                raw_text = raw_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
+                raw_text = ocr_text if outline_text_missing else raw_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
         except Exception as e:
             print(f"[file_reader] OCR fallback skipped for PDF: {e}")
 
@@ -138,6 +161,65 @@ def decode_bytes(b: bytes) -> str:
         return b.decode(enc, errors="ignore")
     except:
         return b.decode("utf-8", errors="ignore")
+
+
+def _useful_pmw_text(text: str) -> bool:
+    if not text:
+        return False
+    words = re.findall(r"[^\W\d_]{2,}", text, re.UNICODE)
+    timecodes = re.findall(r"\b\d{1,2}[:.]\d{2}[:.]\d{2}(?:[,.:;]\d{1,3})?\b", text)
+    printable = sum(c.isprintable() or c in "\r\n\t" for c in text)
+    return printable / max(len(text), 1) >= 0.75 and (len(words) >= 4 or (timecodes and len(words) >= 1))
+
+
+def read_pmw(file_bytes: bytes) -> str:
+    """Read text/XML, ZIP, SQLite, and embedded-text Poliscript PMW variants."""
+    import zipfile
+    candidates = []
+    if file_bytes.startswith(b"PK"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+                for info in archive.infolist():
+                    name = info.filename.lower()
+                    if not info.is_dir() and info.file_size <= 20 * 1024 * 1024 and name.endswith((".xml", ".json", ".txt", ".srt", ".vtt", ".csv", ".pmw")):
+                        candidates.append(decode_bytes(archive.read(info)))
+        except (zipfile.BadZipFile, RuntimeError):
+            pass
+    if file_bytes.startswith(b"SQLite format 3\x00"):
+        import os, sqlite3, tempfile
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pmw", delete=False) as tmp:
+                tmp.write(file_bytes); path = tmp.name
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            rows = []
+            for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                safe_table = table.replace('"', '""')
+                try:
+                    for row in db.execute(f'SELECT * FROM "{safe_table}"'):
+                        values = [str(v).strip() for v in row if isinstance(v, str) and v.strip()]
+                        if values: rows.append(" | ".join(values))
+                except sqlite3.DatabaseError:
+                    continue
+            db.close(); candidates.append("\n".join(rows))
+        except (OSError, sqlite3.DatabaseError):
+            pass
+        finally:
+            if path:
+                try: os.unlink(path)
+                except OSError: pass
+    candidates.extend([
+        decode_bytes(file_bytes),
+        "\n".join(m.decode("ascii", errors="ignore") for m in re.findall(rb"[\x20-\x7e]{4,}", file_bytes)),
+        "\n".join(m.decode("utf-16-le", errors="ignore") for m in re.findall(rb"(?:[\x20-\x7e]\x00){4,}", file_bytes)),
+        "\n".join(m.decode("utf-16-be", errors="ignore") for m in re.findall(rb"(?:\x00[\x20-\x7e]){4,}", file_bytes)),
+    ])
+    useful = [t.replace("\x00", "") for t in candidates if _useful_pmw_text(t.replace("\x00", ""))]
+    if not useful:
+        raise UnsupportedPMWError("This PMW uses a proprietary GTS/Iyuno variant that could not be decoded. Please provide a sample PMW from this source so support can be matched to its exact version, or export it as SRT/EBU-STL/TXT.")
+    def score(text):
+        return len(re.findall(r"[^\W\d_]{2,}", text, re.UNICODE)) + 8 * len(re.findall(r"\d{1,2}:\d{2}:\d{2}", text))
+    return max(useful, key=score)
 
 
 def read_docx(file_bytes: bytes) -> str:
@@ -612,6 +694,103 @@ def read_rtf(file_bytes: bytes) -> str:
         print(f"[file_reader] OCR fallback skipped for RTF: {e}")
 
     return extracted_text
+
+
+
+def list_excel_sheets(file_bytes: bytes) -> list[dict]:
+    """
+    Return a lightweight list of sheets in an Excel file WITHOUT reading all
+    cell content. Each entry: {"name": str, "row_count": int}.
+    Used by the /platforms/preview-excel endpoint so the UI can show the
+    subtitler which sheets exist before they decide what to import.
+    """
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        sheets = []
+        for ws in wb.worksheets:
+            try:
+                rows = ws.max_row or 0
+            except Exception:
+                rows = 0
+            sheets.append({"name": ws.title, "row_count": rows})
+        wb.close()
+        return sheets
+    except Exception:
+        try:
+            import xlrd
+            wb = xlrd.open_workbook(file_contents=file_bytes)
+            return [{"name": s.name, "row_count": s.nrows} for s in wb.sheets()]
+        except Exception:
+            return []
+
+
+def read_excel_sheet(file_bytes: bytes, sheet_name: str) -> str:
+    """
+    Extract text from ONE named sheet of an Excel file, ignoring all other
+    sheets completely. This prevents rule bleed-over when a multi-platform
+    guidelines workbook is uploaded for a single OTT.
+
+    Returns the sheet content as pipe-delimited rows (same format as
+    read_excel, but for a single sheet only).
+    """
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        # Case-insensitive sheet name matching
+        sheet = next(
+            (ws for ws in wb.worksheets if ws.title.strip().lower() == sheet_name.strip().lower()),
+            None
+        )
+        if sheet is None:
+            # Fall back to reading all sheets if the name isn't found
+            return read_excel(file_bytes)
+        sections = [f"=== SHEET: {sheet.title} ==="]
+        for row in sheet.iter_rows(values_only=True):
+            cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+            if cells:
+                sections.append(" | ".join(cells))
+                
+        extracted_text = "\n".join(sections)
+        # OCR fallback for XLSX
+        try:
+            from ocr_reader import ocr_fallback_for_xlsx
+            ocr_text = ocr_fallback_for_xlsx(file_bytes, len(extracted_text))
+            if ocr_text:
+                extracted_text = extracted_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
+        except Exception as e:
+            print(f"[file_reader] OCR fallback skipped for XLSX sheet: {e}")
+        return extracted_text
+    except Exception:
+        try:
+            import xlrd
+            wb = xlrd.open_workbook(file_contents=file_bytes)
+            sheet = next(
+                (s for s in wb.sheets() if s.name.strip().lower() == sheet_name.strip().lower()),
+                None
+            )
+            if sheet is None:
+                return read_excel(file_bytes)
+            sections = [f"=== SHEET: {sheet.name} ==="]
+            for r in range(sheet.nrows):
+                cells = [str(sheet.cell_value(r, c)).strip()
+                         for c in range(sheet.ncols)
+                         if str(sheet.cell_value(r, c)).strip()]
+                if cells:
+                    sections.append(" | ".join(cells))
+            
+            extracted_text = "\n".join(sections)
+            # OCR fallback for XLS
+            try:
+                from ocr_reader import ocr_fallback_for_xls
+                ocr_text = ocr_fallback_for_xls(file_bytes, len(extracted_text))
+                if ocr_text:
+                    extracted_text = extracted_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
+            except Exception as e:
+                print(f"[file_reader] OCR fallback skipped for XLS sheet: {e}")
+            return extracted_text
+        except Exception:
+            return ""
 
 
 def read_excel(file_bytes: bytes) -> str:

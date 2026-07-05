@@ -42,6 +42,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS platforms (
             id INT AUTO_INCREMENT PRIMARY KEY,
             platform_key VARCHAR(100) UNIQUE NOT NULL,
+            platform_family VARCHAR(100) DEFAULT NULL,
+            version_label VARCHAR(100) DEFAULT 'Current',
             name VARCHAR(200) NOT NULL,
             max_chars_per_line INT DEFAULT 42,
             max_lines INT DEFAULT 2,
@@ -54,6 +56,7 @@ def init_db():
             two_speaker_format VARCHAR(50) DEFAULT 'hyphen_no_space',
             zero_subtitle_required BOOLEAN DEFAULT TRUE,
             rules JSON,
+            subtitler_rules JSON,
             profanity_table JSON,
             remove_elements JSON,
             summary TEXT,
@@ -62,6 +65,16 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Safe migration: add versioning columns if they don't already exist
+    for col_def in [
+        "ALTER TABLE platforms ADD COLUMN platform_family VARCHAR(100) DEFAULT NULL",
+        "ALTER TABLE platforms ADD COLUMN version_label VARCHAR(100) DEFAULT 'Current'",
+    ]:
+        try:
+            cursor.execute(col_def)
+        except Exception:
+            pass  # Column already exists — ignore
 
     # Jobs table
     cursor.execute("""
@@ -132,13 +145,27 @@ def get_all_platforms():
     cursor.close()
     conn.close()
     result = {}
+    _list_fields = {"rules", "subtitler_rules", "remove_elements"}
+    _dict_fields = {"profanity_table"}
     for row in rows:
-        for field in ["rules", "profanity_table", "remove_elements"]:
-            if isinstance(row.get(field), str):
+        for field in _list_fields:
+            val = row.get(field)
+            if isinstance(val, str):
                 try:
-                    row[field] = json.loads(row[field])
-                except:
+                    row[field] = json.loads(val)
+                except Exception:
                     row[field] = []
+            elif val is None:
+                row[field] = []
+        for field in _dict_fields:
+            val = row.get(field)
+            if isinstance(val, str):
+                try:
+                    row[field] = json.loads(val)
+                except Exception:
+                    row[field] = {}
+            elif val is None:
+                row[field] = {}
         result[row["platform_key"]] = row
     return result
 
@@ -146,19 +173,68 @@ def get_all_platforms():
 def save_custom_platform(platform_key: str, data: dict):
     conn = get_connection()
     cursor = conn.cursor()
+
+    family  = data.get("platform_family", platform_key)
+    version = (data.get("version_label") or "Current").strip()
+
+    # ── Overwrite guard ────────────────────────────────────────────────────────
+    # If a row already exists with the same OTT family AND version label (but
+    # possibly a different key — e.g. old "custom_netflix" vs new
+    # "custom_netflix__current") we re-use that existing key so the
+    # ON DUPLICATE KEY UPDATE below overwrites it instead of creating a duplicate.
+    cursor.execute(
+        """SELECT platform_key FROM platforms
+           WHERE platform_family = %s
+             AND LOWER(TRIM(version_label)) = LOWER(TRIM(%s))
+             AND platform_key != %s
+           LIMIT 1""",
+        (family, version, platform_key)
+    )
+    existing = cursor.fetchone()
+    if existing:
+        platform_key = existing[0]   # redirect upsert to the existing row
+    # ──────────────────────────────────────────────────────────────────────────
+
     cursor.execute("""
-        INSERT INTO platforms
-        (platform_key, name, max_chars_per_line, max_lines,
-         min_duration_seconds, max_duration_seconds, min_interval_seconds,
-         reading_speed_target_cps, reading_speed_max_cps,
-         file_format, two_speaker_format, zero_subtitle_required,
-         rules, summary, is_custom, guidelines_raw)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO platforms (
+            platform_key, platform_family, version_label, name,
+            max_chars_per_line, max_lines,
+            min_duration_seconds, max_duration_seconds, min_interval_seconds,
+            reading_speed_target_cps, reading_speed_max_cps,
+            file_format, two_speaker_format, zero_subtitle_required,
+            rules, subtitler_rules, summary, is_custom, guidelines_raw
+        ) VALUES (
+            %s, %s, %s, %s,
+            %s, %s,
+            %s, %s, %s,
+            %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, TRUE, %s
+        )
         ON DUPLICATE KEY UPDATE
-        name=VALUES(name), rules=VALUES(rules),
-        summary=VALUES(summary), guidelines_raw=VALUES(guidelines_raw)
+            platform_family = VALUES(platform_family),
+            version_label = VALUES(version_label),
+            name = VALUES(name),
+            max_chars_per_line = VALUES(max_chars_per_line),
+            max_lines = VALUES(max_lines),
+            min_duration_seconds = VALUES(min_duration_seconds),
+            max_duration_seconds = VALUES(max_duration_seconds),
+            min_interval_seconds = VALUES(min_interval_seconds),
+            reading_speed_target_cps = VALUES(reading_speed_target_cps),
+            reading_speed_max_cps = VALUES(reading_speed_max_cps),
+            file_format = VALUES(file_format),
+            two_speaker_format = VALUES(two_speaker_format),
+            zero_subtitle_required = VALUES(zero_subtitle_required),
+            rules = VALUES(rules),
+            subtitler_rules = VALUES(subtitler_rules),
+            summary = VALUES(summary),
+            is_custom = TRUE,
+            guidelines_raw = VALUES(guidelines_raw)
     """, (
-        platform_key, data.get("name", platform_key),
+        platform_key,
+        family,
+        version,
+        data.get("name", platform_key),
         data.get("max_chars_per_line", 42),
         data.get("max_lines", 2),
         data.get("min_duration_seconds", 1.0),
@@ -170,9 +246,9 @@ def save_custom_platform(platform_key: str, data: dict):
         data.get("two_speaker_format", "hyphen_no_space"),
         data.get("zero_subtitle_required", True),
         json.dumps(data.get("rules", [])),
+        json.dumps(data.get("subtitler_rules", [])),
         data.get("summary", ""),
-        True,
-        data.get("guidelines_raw", "")[:5000]
+        data.get("guidelines_raw", "")[:20000]
     ))
     conn.commit()
     cursor.close()

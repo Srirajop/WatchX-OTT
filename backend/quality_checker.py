@@ -156,9 +156,9 @@ def auto_fix_subtitles(subtitles: list, platform_key: str) -> list:
     platform = get_platform(platform_key)
     max_chars = platform.get("max_chars_per_line", 42)
     max_chars_italics = platform.get("max_chars_italics", max_chars)
-    profanity_table = get_profanity_table(platform_key)
-    remove_elements = platform.get("remove_elements", [])
-    rules_text = " ".join(platform.get("rules", []))
+    profanity_table = get_profanity_table(platform_key) or {}
+    remove_elements = platform.get("remove_elements") or []
+    rules_text = " ".join(platform.get("rules") or [])
     speaker_fmt = platform.get("two_speaker_format", "")
 
     # Determine number rule from platform rules
@@ -603,7 +603,7 @@ def check_spacing_punctuation(subtitles: list) -> list:
 
 def check_hoh_emt(subtitles: list, platform: dict) -> list:
     defects = []
-    remove_elements = platform.get("remove_elements", [])
+    remove_elements = platform.get("remove_elements") or []
     if "HOH" not in remove_elements and "EMT" not in remove_elements:
         return defects
     hoh_patterns = [
@@ -703,7 +703,7 @@ def _tc_to_seconds(tc: str):
 
 def check_platform_specific_rules(subtitles: list, platform: dict) -> list:
     defects = []
-    rules = platform.get("rules", [])
+    rules = platform.get("rules") or []
     rules_text = " ".join(rules).lower()
 
     if not subtitles: return defects
@@ -797,90 +797,216 @@ def check_platform_specific_rules(subtitles: list, platform: dict) -> list:
     return defects
 
 
-def deduce_change_rules(orig: str, new: str, platform_rules: list, rule_hints: list | None = None) -> list:
+def deduce_change_rules(orig: str, new: str, platform_rules: list, rule_hints: list | None = None) -> list:  # noqa: C901
     """
-    Compare original vs cleaned text and explain WHY each change was made,
-    matched against the platform's actual rule descriptions where possible.
-    Used by both the on-screen Track Changes view and the PDF export,
-    so the explanation is identical in both places.
+    Compare original vs cleaned text and explain exactly WHY each change was made.
+
+    ANTI-HALLUCINATION DESIGN
+    ─────────────────────────
+    Every check is a strict before/after text comparison — ZERO AI involvement.
+    When a rule is matched it is linked to the real platform rule text, so
+    subtitlers see exactly which company guideline was applied.
+    When the change cannot be attributed to a specific deterministic rule, it
+    is labelled as 'AI/LLM edit — review manually' rather than inventing a
+    reason. This keeps the audit trail 100% honest.
     """
     import re as _re
     if orig == new:
         return []
 
-    rules = []
+    applied = []
     orig_lower = orig.lower()
-    new_lower = new.lower()
+    new_lower  = new.lower()
+    plist = platform_rules or []
 
-    def add_rule(keywords: list, verified_edit: str):
+    def add(keywords: list, fallback: str):
+        """
+        Search the real platform rule list for any line containing a keyword.
+        Use the best-matching real rule as the label (proof that the rule
+        exists in the guidelines).  If no platform rule matches, use 'fallback'
+        — a plain description of the verified edit itself.  Either way the
+        subtitler sees evidence, not a guess.
+        """
         matches = [
-            (max(len(k) for k in keywords if k in r.lower()), r)
-            for r in platform_rules
-            if any(k in r.lower() for k in keywords)
+            (max(len(k) for k in keywords if k.lower() in r.lower()), r)
+            for r in plist
+            if any(k.lower() in r.lower() for k in keywords)
         ]
-        if matches:
-            # Prefer the most specific phrase (for example "double
-            # punctuation" over the generic word "punctuation").
-            rules.append(f"Rule: {max(matches, key=lambda match: match[0])[1]}")
-            return
-        if verified_edit:
-            # The before/after text proves this exact deterministic edit, but
-            # the selected platform has no explicit matching rule. Describe
-            # the edit honestly without mislabelling it as a platform rule.
-            rules.append(f"Verified edit: {verified_edit}")
+        label = (
+            f"Rule: {max(matches, key=lambda m: m[0])[1]}"
+            if matches
+            else (f"Verified edit: {fallback}" if fallback else None)
+        )
+        if label and label not in applied:
+            applied.append(label)
 
-    # Hints are emitted by deterministic transformations at the exact moment
-    # they occur. They are stronger evidence than trying to reverse-engineer a
-    # split cue from only one fragment of its original paragraph.
+    # ── Hints emitted by auto_fix (highest confidence — deterministic) ──────
     for hint in rule_hints or []:
         if hint == "line_limit":
-            add_rule(["maximum", "characters per line", "maximum 2 lines", "max 2 lines"], "")
+            add(["maximum", "characters per line", "max 2 lines", "maximum 2 lines"],
+                "Line split to fit within platform character / line limit")
         elif hint == "zero_subtitle":
-            add_rule(["zero subtitle required", "zero subtitle"], "")
+            add(["zero subtitle"], "Zero subtitle fields corrected")
 
-    if ("<i>" in new or "</i>" in new) and not ("<i>" in orig or "</i>" in orig):
-        add_rule(["italic", "song", "voice"], "Applied italics formatting (generic)")
+    orig_no_tags = _re.sub(r'<[^>]+>', '', orig)
+    new_no_tags  = _re.sub(r'<[^>]+>', '', new)
 
-    if _re.search(r'\[.*?\]|\(.*?\)', orig) and not _re.search(r'\[.*?\]|\(.*?\)', new):
-        add_rule(["hoh", "emt", "stage", "direction"], "Removed non-dialogue elements (HOH / stage directions)")
-
+    # ── 1. Line split ────────────────────────────────────────────────────────
     if "\n" in new and "\n" not in orig:
-        add_rule(["maximum", "character", "lines per"], "Split line to enforce platform character/line limits")
+        add(["maximum", "character", "lines per"],
+            "Line split to fit within character / line limit")
 
-    if (new.startswith("-") and not orig.startswith("-")) or ("\n-" in new and "\n-" not in orig):
-        add_rule(["hyphen", "two speaker", "interrupted"], "Applied two-speaker formatting")
+    # ── 2. HOH / EMT / stage directions removed ──────────────────────────────
+    orig_brackets = _re.findall(r'\[.*?\]|\(.*?\)', orig)
+    new_brackets  = _re.findall(r'\[.*?\]|\(.*?\)', new)
+    if orig_brackets and len(new_brackets) < len(orig_brackets):
+        removed_b = [b for b in orig_brackets if b not in new_brackets]
+        add(["hoh", "emt", "stage", "direction", "remove"],
+            f"Removed non-dialogue element(s): {', '.join(removed_b[:3])}")
 
-    if "****" in new and "****" not in orig:
-        add_rule(["asterisk", "bleep"], "Replaced profanity/bleep with asterisks")
-    elif "xxx" in new_lower and "xxx" not in orig_lower:
-        add_rule(["profanity", "xxx", "fxxx"], "Applied profanity censoring")
+    # ── 3. Italics ADDED ─────────────────────────────────────────────────────
+    if ("<i>" in new or "</i>" in new) and "<i>" not in orig:
+        add(["italic", "song", "voice", "narrator", "narrat", "phone", "foreign"],
+            "Italics added (song lyrics / narration / VO / phone / foreign word)")
 
-    uk_words = ['colour', 'favourite', 'neighbour', 'realise', 'centre', 'theatre', 'programme', 'travelling']
-    if any(w in orig_lower for w in uk_words) and not any(w in new_lower for w in uk_words):
-        add_rule(["spelling"], "Converted to standard US English spelling")
+    # ── 4. Italics REMOVED ───────────────────────────────────────────────────
+    if ("<i>" in orig or "</i>" in orig) and "<i>" not in new:
+        add(["no italic", "no text style", "italic"],
+            "Italics removed (platform does not allow italic formatting)")
 
-    if _re.search(r'\b\d\b|\b10\b', orig) and not _re.search(r'\b\d\b|\b10\b', new):
-        add_rule(["number", "1-10", "1-9", "spell out"], "Spelled out numbers as words")
+    # ── 5. Two-speaker: hyphen without space ─────────────────────────────────
+    if _re.search(r'(^|\n)- \S', orig) and _re.search(r'(^|\n)-\S', new):
+        add(["hyphen without space", "two speaker", "two speakers"],
+            "Two-speaker lines: '- text' changed to '-text' (no space after hyphen)")
 
+    # ── 6. Two-speaker: hyphen with space ────────────────────────────────────
+    elif _re.search(r'(^|\n)-\S', orig) and _re.search(r'(^|\n)- \S', new):
+        add(["hyphen with space", "two speaker", "two speakers"],
+            "Two-speaker lines: '-text' changed to '- text' (space after hyphen)")
+
+    # ── 7. Hyphen added for new two-speaker block ────────────────────────────
+    elif (new.lstrip().startswith("-") and not orig.lstrip().startswith("-")) or \
+         ("\n-" in new and "\n-" not in orig):
+        add(["hyphen", "two speaker", "two speakers", "interrupted"],
+            "Two-speaker hyphen formatting applied")
+
+    # ── 8. Em-dash → double hyphen ───────────────────────────────────────────
+    if "\u2014" in orig and "--" in new and "\u2014" not in new:
+        add(["double hyphen", "interrupted", "--", "abrupt"],
+            "Em-dash (\u2014) converted to double hyphen (--) for interrupted speech")
+
+    # ── 9. Profanity: **** asterisks ─────────────────────────────────────────
+    if new.count("****") > orig.count("***"):
+        add(["asterisk", "bleep", "profanity"],
+            "Beeped profanity replaced with asterisks (****)")
+
+    # ── 10. Profanity: xxx-format ────────────────────────────────────────────
+    xxx_pat = r'\b[a-z]xxx\w*\b'
+    if _re.search(xxx_pat, new_lower) and not _re.search(xxx_pat, orig_lower):
+        add(["profanity", "xxx", "fxxx", "cxxx", "pxxx"],
+            "Profanity replaced with xxx-format censoring (e.g. fxxx, cxxx)")
+
+    # ── 11. Numbers → words ──────────────────────────────────────────────────
+    digit_words = {
+        "zero", "one", "two", "three", "four", "five",
+        "six", "seven", "eight", "nine", "ten"
+    }
+    orig_has_digit = bool(_re.search(r'(?<!\d)\b(?:[0-9]|10)\b(?!\d)', orig))
+    new_has_digit  = bool(_re.search(r'(?<!\d)\b(?:[0-9]|10)\b(?!\d)', new))
+    new_has_word   = any(w in new_lower.split() for w in digit_words)
+    if orig_has_digit and not new_has_digit and new_has_word:
+        add(["number", "1-10", "1-9", "spell out", "words"],
+            "Number(s) converted to word form per platform rule")
+
+    # ── 12. Filler words removed ─────────────────────────────────────────────
+    filler_pat = r'\b(u+gh+|h+mm+|erm+|a+h+|o+h+|u+m+|u+h+)\b'
+    orig_f = _re.findall(filler_pat, orig, _re.IGNORECASE)
+    new_f  = _re.findall(filler_pat, new,  _re.IGNORECASE)
+    if orig_f and len(new_f) < len(orig_f):
+        removed_f = list({x.lower() for x in orig_f} - {x.lower() for x in new_f})
+        add(["filler", "ugh", "hmm", "erm", "edit out"],
+            f"Filler word(s) removed: {', '.join(removed_f[:4])}")
+
+    # ── 13. Character name / speaker label removed ───────────────────────────
+    char_pat = r'^[A-Z][A-Z0-9 \'/().]{1,40}[:\-]\s*'
+    if _re.match(char_pat, orig) and not _re.match(char_pat, new):
+        label_m = _re.match(char_pat, orig)
+        add(["character name", "character label", "speaker"],
+            f"Speaker label removed: '{label_m.group().strip()}'")
+
+    # ── 14. British → US English spelling ────────────────────────────────────
+    uk_us = [
+        ('colour','color'), ('favourite','favorite'), ('neighbour','neighbor'),
+        ('realise','realize'), ('recognise','recognize'), ('centre','center'),
+        ('theatre','theater'), ('programme','program'), ('travelling','traveling'),
+        ('cancelled','canceled'), ('defence','defense'), ('licence','license'),
+        ('humour','humor'), ('behaviour','behavior'), ('flavour','flavor'),
+        ('honour','honor'), ('labour','labor'),
+    ]
+    uk_changed = [
+        f"{u}→{a}" for u, a in uk_us
+        if u in orig_lower and a in new_lower and u not in new_lower
+    ]
+    if uk_changed:
+        add(["spelling", "us english", "american"],
+            f"British → US English: {', '.join(uk_changed[:3])}")
+
+    # ── 15. Double space removed ─────────────────────────────────────────────
     if "  " in orig and "  " not in new:
-        add_rule(["space"], "Removed double spaces")
-    if _re.search(r'[!?]{2,}', orig) and not _re.search(r'[!?]{2,}', new):
-        add_rule(["double punctuation", "punctuation"], "Removed double punctuation marks")
+        add(["double space", "space"], "Double space removed")
+
+    # ── 16. Double / mixed punctuation removed ───────────────────────────────
+    bad_punct = _re.findall(r'[!?]{2,}|[!?][?!]', orig)
+    if bad_punct and not _re.search(r'[!?]{2,}|[!?][?!]', new):
+        add(["double punctuation", "avoid double", "!!", "punctuation"],
+            f"Double / mixed punctuation removed: {', '.join(set(bad_punct[:3]))}")
+
+    # ── 17. Space before punctuation ────────────────────────────────────────
     if _re.search(r' [.,!?;:]', orig) and not _re.search(r' [.,!?;:]', new):
-        add_rule(["space before", "punctuation"], "Removed space before punctuation")
+        add(["space before punctuation", "punctuation", "no space"],
+            "Space before punctuation mark removed")
 
-    if orig.strip() and new.strip() and orig.strip()[0].islower() and new.strip()[0].isupper():
-        add_rule(["capital", "sentence case"], "Corrected sentence capitalisation")
+    # ── 18. Ellipsis normalised ──────────────────────────────────────────────
+    if _re.search(r'\.{4,}', orig) and not _re.search(r'\.{4,}', new):
+        add(["ellipsis", "three dots", "..."],
+            "Ellipsis normalised to exactly three dots (...)")
 
-    # Do not guess. A change can come from an AI rewrite or another cause this
-    # deterministic comparison cannot prove. The audit trail must not present
-    # a generic punctuation/style claim as an applied rule.
-    if not rules:
-        rules.append("No rule applied")
+    # ── 19. Sentence capitalisation ──────────────────────────────────────────
+    strip_lead = lambda s: _re.sub(r'^(</?[ib]>|-|\s)+', '', s.strip())  # noqa: E731
+    o_lead = strip_lead(orig_no_tags)
+    n_lead = strip_lead(new_no_tags)
+    if o_lead and n_lead and o_lead[0].islower() and n_lead[0].isupper():
+        add(["capital", "sentence case", "upper case"],
+            "First letter capitalised (sentence case rule)")
 
+    # ── 20. Acronym dots removed (F.B.I. → FBI) ─────────────────────────────
+    if _re.search(r'\b[A-Z]\.[A-Z]\.', orig) and \
+       not _re.search(r'\b[A-Z]\.[A-Z]\.', new):
+        acronyms = _re.findall(r'\b(?:[A-Z]\.){2,}[A-Z]?\.?', orig)
+        add(["acronym", "periods", "fbi", "nasa", "no periods"],
+            f"Acronym dots removed: {', '.join(acronyms[:3])}")
+
+    # ── 21. Entire subtitle line wiped ───────────────────────────────────────
+    if orig_no_tags.strip() and not new_no_tags.strip():
+        add(["hoh", "emt", "stage direction", "filler", "remove"],
+            "Entire subtitle removed (HOH/EMT element or filler)")
+
+    # ── HONEST FALLBACK ──────────────────────────────────────────────────────
+    # A change occurred but no deterministic pattern matched it. This means
+    # the LLM made a creative edit (grammar fix, rephrasing, punctuation
+    # the regex didn't catch, etc.). Labelling it as a specific rule would be
+    # hallucination, so we flag it explicitly for manual review instead.
+    if not applied:
+        applied.append(
+            "\u26a0 AI/LLM edit \u2014 exact rule cannot be determined automatically. "
+            "Please review this change manually against your platform guidelines "
+            "before delivery."
+        )
+
+    # De-duplicate while preserving order
     seen = set()
     unique = []
-    for r in rules:
+    for r in applied:
         if r not in seen:
             seen.add(r)
             unique.append(r)
