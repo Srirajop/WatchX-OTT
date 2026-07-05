@@ -232,6 +232,7 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
     """
     from PIL import Image
     import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
     try:
         img = Image.open(io.BytesIO(image_bytes))
@@ -297,6 +298,7 @@ def _ocr_via_grid_detection(pil_image) -> str:
         return ""
 
     import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
     from PIL import Image as PILImage
 
     rows_text = []

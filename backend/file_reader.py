@@ -26,6 +26,36 @@ def _pdf_text_needs_outline_ocr(text: str) -> bool:
     return timecode_lines >= 20 and word_count < max(20, timecode_lines // 5)
 
 
+def _merge_pdf_timecodes_with_ocr(file_bytes: bytes, raw_text: str) -> str:
+    from ocr_reader import render_pdf_pages_as_images, ocr_image_bytes
+    import re
+    
+    pages_text = re.split(r'===\s*PAGE\s*\d+\s*===', raw_text)
+    if pages_text and not pages_text[0].strip():
+        pages_text.pop(0)
+        
+    images = render_pdf_pages_as_images(file_bytes)
+    
+    merged = []
+    for i, img in enumerate(images):
+        page_num = i + 1
+        merged.append(f"=== PAGE {page_num} ===")
+        
+        if i < len(pages_text):
+            merged.append("--- ACCURATE TIMECODES ---")
+            merged.append(pages_text[i].strip())
+            
+        merged.append("--- OCR SUBTITLES (Match with timecodes above) ---")
+        try:
+            ocr_result = ocr_image_bytes(img)
+            merged.append(ocr_result.strip())
+        except Exception as e:
+            merged.append(f"[OCR Failed: {e} - Ensure Tesseract OCR is installed]")
+        merged.append("")
+        
+    return "\n".join(merged)
+
+
 def read_file(file_bytes: bytes, filename: str) -> dict:
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "txt"
 
@@ -94,9 +124,12 @@ def read_file(file_bytes: bytes, filename: str) -> dict:
         try:
             from ocr_reader import ocr_fallback_for_pdf
             outline_text_missing = _pdf_text_needs_outline_ocr(raw_text)
-            ocr_text = ocr_fallback_for_pdf(file_bytes, len(raw_text.strip()), force_page_render=outline_text_missing)
-            if ocr_text:
-                raw_text = ocr_text if outline_text_missing else raw_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
+            if outline_text_missing:
+                raw_text = _merge_pdf_timecodes_with_ocr(file_bytes, raw_text)
+            else:
+                ocr_text = ocr_fallback_for_pdf(file_bytes, len(raw_text.strip()), force_page_render=False)
+                if ocr_text:
+                    raw_text = raw_text + "\n\n=== OCR EXTRACTED CONTENT ===\n" + ocr_text
         except Exception as e:
             print(f"[file_reader] OCR fallback skipped for PDF: {e}")
 
@@ -216,7 +249,7 @@ def read_pmw(file_bytes: bytes) -> str:
     ])
     useful = [t.replace("\x00", "") for t in candidates if _useful_pmw_text(t.replace("\x00", ""))]
     if not useful:
-        raise UnsupportedPMWError("This PMW uses a proprietary GTS/Iyuno variant that could not be decoded. Please provide a sample PMW from this source so support can be matched to its exact version, or export it as SRT/EBU-STL/TXT.")
+        raise UnsupportedPMWError("This PMW file uses a closed, proprietary binary format that cannot be directly decoded. Please export the file as an SRT, VTT, or TXT from your GTS/Iyuno software and upload that instead.")
     def score(text):
         return len(re.findall(r"[^\W\d_]{2,}", text, re.UNICODE)) + 8 * len(re.findall(r"\d{1,2}:\d{2}:\d{2}", text))
     return max(useful, key=score)
