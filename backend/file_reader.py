@@ -29,6 +29,7 @@ def _pdf_text_needs_outline_ocr(text: str) -> bool:
 def _merge_pdf_timecodes_with_ocr(file_bytes: bytes, raw_text: str) -> str:
     from ocr_reader import render_pdf_pages_as_images, ocr_image_bytes
     import re
+    from concurrent.futures import ThreadPoolExecutor
     
     pages_text = re.split(r'===\s*PAGE\s*\d+\s*===', raw_text)
     if pages_text and not pages_text[0].strip():
@@ -36,27 +37,52 @@ def _merge_pdf_timecodes_with_ocr(file_bytes: bytes, raw_text: str) -> str:
         
     images = render_pdf_pages_as_images(file_bytes)
     
+    def process_page(img):
+        try:
+            return ocr_image_bytes(img).strip()
+        except Exception as e:
+            return f'[OCR Failed: {e} - Ensure Tesseract OCR is installed]'
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        ocr_results = list(executor.map(process_page, images))
+
     merged = []
-    for i, img in enumerate(images):
+    for i, ocr_result in enumerate(ocr_results):
         page_num = i + 1
-        merged.append(f"=== PAGE {page_num} ===")
+        merged.append(f'=== PAGE {page_num} ===')
         
         if i < len(pages_text):
-            merged.append("--- ACCURATE TIMECODES ---")
+            merged.append('--- ACCURATE TIMECODES ---')
             merged.append(pages_text[i].strip())
             
-        merged.append("--- OCR SUBTITLES (Match with timecodes above) ---")
-        try:
-            ocr_result = ocr_image_bytes(img)
-            merged.append(ocr_result.strip())
-        except Exception as e:
-            merged.append(f"[OCR Failed: {e} - Ensure Tesseract OCR is installed]")
-        merged.append("")
+        merged.append('--- OCR SUBTITLES (Match with timecodes above) ---')
+        merged.append(ocr_result)
+        merged.append('')
         
-    return "\n".join(merged)
+    return '\n'.join(merged)
 
+def _full_pdf_ocr(file_bytes: bytes) -> str:
+    from ocr_reader import render_pdf_pages_as_images, ocr_image_bytes
+    from concurrent.futures import ThreadPoolExecutor
+    
+    images = render_pdf_pages_as_images(file_bytes)
+    def process_page(img):
+        try:
+            return ocr_image_bytes(img).strip()
+        except Exception as e:
+            return f'[OCR Failed: {e}]'
 
-def read_file(file_bytes: bytes, filename: str) -> dict:
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        ocr_results = list(executor.map(process_page, images))
+        
+    merged = []
+    for i, ocr_result in enumerate(ocr_results):
+        merged.append(f'=== PAGE {i+1} ===')
+        merged.append(ocr_result)
+        merged.append('')
+    return '\n'.join(merged)
+
+def read_file(file_bytes: bytes, filename: str, force_ocr: bool = False) -> dict:
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "txt"
 
     # ── Magic-byte sniffing: detect misnamed files ──────────────────────────
@@ -86,12 +112,18 @@ def read_file(file_bytes: bytes, filename: str) -> dict:
 
     reader = readers.get(ext, read_plain)
 
-    try:
-        raw_text = reader(file_bytes)
-    except UnsupportedPMWError:
-        raise
-    except Exception:
-        raw_text = decode_bytes(file_bytes)
+    if force_ocr and ext == 'pdf':
+        try:
+            raw_text = _full_pdf_ocr(file_bytes)
+        except Exception:
+            raw_text = decode_bytes(file_bytes)
+    else:
+        try:
+            raw_text = reader(file_bytes)
+        except UnsupportedPMWError:
+            raise
+        except Exception:
+            raw_text = decode_bytes(file_bytes)
 
     # ── Garbled-output guard ─────────────────────────────────────────────────
     # If the extracted text has too many non-printable / non-ASCII chars,
@@ -490,76 +522,30 @@ def read_legacy_doc(file_bytes: bytes) -> str:
 def read_pdf(file_bytes: bytes) -> str:
     sections = []
     try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for i, page in enumerate(pdf.pages):
-                sections.append(f"=== PAGE {i+1} ===")
-                # Extract tables with style preservation
-                tables = page.extract_tables()
-                valid_tables = [t for t in tables if any(cell and str(cell).strip() for row in t for cell in row)]
-                
-                if valid_tables:
-                    for t_idx, table in enumerate(valid_tables):
-                        sections.append(f"=== TABLE {t_idx+1} ===")
-                        for row in table:
-                            cells = [re.sub(r'\s+', ' ', str(c)).strip() for c in row if c is not None and str(c).strip()]
-                            if cells: sections.append(" | ".join(cells))
-                else:
-                    # Fallback to spatial parsing with font awareness
-                    words = page.extract_words(keep_blank_chars=True, extra_attrs=["fontname", "size"])
-                    lines_dict = {}
-                    for w in words:
-                        text = w['text']
-                        if 'Bold' in w.get('fontname', ''): text = f"**{text}**"
-                        elif 'Italic' in w.get('fontname', ''): text = f"*{text}*"
-                        y = round(w['top'])
-                        if y not in lines_dict: lines_dict[y] = []
-                        lines_dict[y].append((w['x0'], text))
-                    for y in sorted(lines_dict.keys()):
-                        row_items = sorted(lines_dict[y], key=lambda x: x[0])
-                        line = " ".join(item[1] for item in row_items).strip()
-                        if line:
-                            sections.append(line)
-
-        # ── CCSL / Spotting List spatial repair ───────────────────────────
-        # Detect if pdfplumber extracted ONLY header rows (no actual data).
-        # This happens with complex CCSL PDFs where table cells render but are
-        # empty in extract_tables() output.
-        full_text = "\n".join(sections)
-        data_lines = [
-            l for l in full_text.splitlines()
-            if l.strip() and not l.startswith("===") and "|" in l
-            and not re.match(
-                r'^\s*(Sh#|Sh\s*Time\s*In|ShTimeIn|Scene\s*Description|Title\s*\||'
-                r'Time\s*In\s*\||Time\s*Out\s*\||Dur\s*\||Titles?\s*\|?)\s*',
-                l.strip(), re.IGNORECASE
-            )
-        ]
-        if not data_lines:
-            # All table data is missing — parse word-by-word using bounding boxes
-            spatial = _read_pdf_spatial(file_bytes)
-            if spatial and spatial.strip():
-                return spatial
-
-        return full_text
-
+        import fitz
+        doc = fitz.open(stream=file_bytes, filetype='pdf')
+        for i, page in enumerate(doc):
+            sections.append(f'=== PAGE {i+1} ===')
+            text = page.get_text('text')
+            sections.append(text.strip())
+        return '\n'.join(sections)
     except Exception as e:
         import sys
-        print(f"pdfplumber error: {e}", file=sys.stderr)
+        print(f'PyMuPDF error: {e}', file=sys.stderr)
         try:
             import PyPDF2
+            import io
             reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
             pages = []
             for i, p in enumerate(reader.pages):
-                t = p.extract_text() or ""
+                t = p.extract_text() or ''
                 if t.strip():
-                    pages.append(f"=== PAGE {i+1} ===\n{t}")
-            return "\n".join(pages)
+                    pages.append(f'=== PAGE {i+1} ===\n{t}')
+            return '\n'.join(pages)
         except Exception as e2:
             import sys
-            print(f"PyPDF2 fallback error: {e2}", file=sys.stderr)
-            return ""
-
+            print(f'PyPDF2 fallback error: {e2}', file=sys.stderr)
+            return ''
 
 def _read_pdf_spatial(file_bytes: bytes) -> str:
     """

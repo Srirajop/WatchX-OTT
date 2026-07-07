@@ -103,33 +103,8 @@ def init_db():
         )
     """)
 
-    # Insert all built-in platforms
-    for key, p in PLATFORMS.items():
-        cursor.execute("""
-            INSERT IGNORE INTO platforms
-            (platform_key, name, max_chars_per_line, max_lines,
-             min_duration_seconds, max_duration_seconds, min_interval_seconds,
-             reading_speed_target_cps, reading_speed_max_cps,
-             file_format, two_speaker_format, zero_subtitle_required,
-             rules, profanity_table, remove_elements, is_custom)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            key, p["name"],
-            p.get("max_chars_per_line", 42),
-            p.get("max_lines", 2),
-            p.get("min_duration_seconds", 1.0),
-            p.get("max_duration_seconds", 7.0),
-            p.get("min_interval_seconds", 0.02),
-            p.get("reading_speed_target_cps", 17),
-            p.get("reading_speed_max_cps", 21),
-            p.get("file_format", "PAC"),
-            p.get("two_speaker_format", "hyphen_no_space"),
-            p.get("zero_subtitle_required", True),
-            json.dumps(p.get("rules", [])),
-            json.dumps(p.get("profanity_table", {})),
-            json.dumps(p.get("remove_elements", [])),
-            False
-        ))
+    # Delete old built-in platforms (is_custom = False)
+    cursor.execute("DELETE FROM platforms WHERE is_custom = 0")
 
     conn.commit()
     cursor.close()

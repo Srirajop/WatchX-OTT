@@ -86,7 +86,8 @@ def chunk_text(text: str, max_chunk_size: int = 7000) -> list[str]:
 @app.post("/clean")
 async def clean_file_endpoint(
     file: UploadFile = File(...),
-    platform: str = Form(default="discovery_max")
+    platform: str = Form(default="discovery_max"),
+    force_ocr: bool = Form(False)
 ):
     import asyncio
     
@@ -106,7 +107,7 @@ async def clean_file_endpoint(
         raise HTTPException(400, "Uploaded file is empty")
 
     try:
-        file_data = read_file(file_bytes, filename)
+        file_data = read_file(file_bytes, filename, force_ocr=force_ocr)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     raw_text = file_data["raw_text"]
@@ -119,7 +120,7 @@ async def clean_file_endpoint(
     platform_dict = get_platform(platform)
     timecoded_subtitles = parse_timecoded_subtitles(raw_text)
 
-    if timecoded_subtitles:
+    if timecoded_subtitles and "--- OCR SUBTITLES" not in raw_text:
         async def timecoded_event_generator():
             yield f"data: {json.dumps({'status': 'starting', 'progress': 0, 'message': 'Converting to SRT with original timecodes...'})}\n\n"
             await asyncio.sleep(0.05)
@@ -301,7 +302,8 @@ async def clean_file_endpoint(
 @app.post("/extract")
 async def extract_file_endpoint(
     file: UploadFile = File(...),
-    platform: str = Form(default="discovery_max")
+    platform: str = Form(default="discovery_max"),
+    force_ocr: bool = Form(False)
 ):
     ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",".pmw",
                ".rtf",".srt",".vtt",".webvtt",".xlsx",".xls",
@@ -318,7 +320,7 @@ async def extract_file_endpoint(
         raise HTTPException(400, "Uploaded file is empty")
 
     try:
-        file_data = read_file(file_bytes, filename)
+        file_data = read_file(file_bytes, filename, force_ocr=force_ocr)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     raw_text = file_data["raw_text"]
@@ -329,7 +331,7 @@ async def extract_file_endpoint(
 
     platform_dict = get_platform(platform)
     timecoded_subtitles = parse_timecoded_subtitles(raw_text)
-    if timecoded_subtitles:
+    if timecoded_subtitles and "--- OCR SUBTITLES" not in raw_text:
         return {
             "subtitles": timecoded_subtitles,
             "stats": {
@@ -341,7 +343,9 @@ async def extract_file_endpoint(
             }
         }
 
-    pre_extracted = pre_extract_dialogue(raw_text, structure, file_bytes, filename, platform_dict)
+    pre_extracted = []
+    if "--- OCR SUBTITLES" not in raw_text:
+        pre_extracted = pre_extract_dialogue(raw_text, structure, file_bytes, filename, platform_dict)
     if not pre_extracted:
         pre_extracted = raw_text.splitlines()
 
@@ -661,7 +665,7 @@ async def adjust_timecodes_endpoint(data: dict):
       fix_from_index    — fix one subtitle, ripple the same shift to EVERY subtitle after it (to the end of the file)
       fix_range         — fix one subtitle, ripple the same shift only up to a chosen end ID (a bounded section, not the whole rest of the file) — use this when drift only affects a stretch of the file that re-syncs correctly later on
     """
-    from timecode_adjuster import shift_timecodes, fix_from_index, fix_range_from_index, shift_only_this, parse_offset_input
+    from timecode_adjuster import shift_timecodes, fix_from_index, fix_range_from_index, shift_only_this, parse_offset_input, sync_target
 
     subtitles = data.get("subtitles", [])
     mode = data.get("mode", "offset")
@@ -704,6 +708,19 @@ async def adjust_timecodes_endpoint(data: dict):
             "subtitles": result["subtitles"],
             "touched_ids": result["touched_ids"],
             "warning": result["warning"],
+        }
+
+    elif mode == "sync_target":
+        target_id = data.get("target_id", 1)
+        new_start = data.get("new_start", "")
+        new_end = data.get("new_end", "")
+        shift_mode = data.get("shift_mode", "all")
+        result = sync_target(subtitles, target_id, new_start, new_end, shift_mode)
+        return {
+            "subtitles": result["subtitles"],
+            "collision": result["collision"],
+            "collision_detail": result["collision_detail"],
+            "warning": result["warning"]
         }
 
     else:
@@ -1406,6 +1423,54 @@ async def transcribe_and_align_endpoint(
         }
     )
 
+@app.post("/align-scripts")
+async def align_scripts_endpoint(
+    script_file: UploadFile = File(...),
+    timestamps_file: UploadFile = File(...)
+):
+    from file_reader import read_file
+    from extractor import pre_extract_dialogue
+    from timecoded_subtitles import parse_timecoded_subtitles
+    from transcript_aligner import align_transcription_to_script
+    import asyncio
+    
+    script_bytes = await script_file.read()
+    script_name = script_file.filename or "script.txt"
+    script_data = read_file(script_bytes, script_name)
+    script_raw = script_data["raw_text"]
+    script_structure = script_data["structure"]
+    
+    pre_extracted = pre_extract_dialogue(script_raw, script_structure, script_bytes, script_name, {})
+    if not pre_extracted:
+        pre_extracted = script_raw.splitlines()
+        
+    script_subs = []
+    for i, line in enumerate(pre_extracted, 1):
+        clean_line = line.strip()
+        if clean_line:
+            script_subs.append({"id": i, "text": clean_line, "flagged": False})
+
+    ts_bytes = await timestamps_file.read()
+    ts_name = timestamps_file.filename or "timestamps.srt"
+    ts_data = read_file(ts_bytes, ts_name)
+    ts_raw = ts_data["raw_text"]
+    
+    ts_subs = parse_timecoded_subtitles(ts_raw)
+    if not ts_subs:
+        raise HTTPException(400, "Could not extract timecodes from the timestamps file.")
+
+    final_subs = align_transcription_to_script(ts_subs, script_subs)
+
+    return {
+        "subtitles": final_subs,
+        "stats": {
+            "total_lines": len(final_subs),
+            "flagged_lines": sum(1 for s in final_subs if s.get("flagged")),
+            "platform": "generic",
+            "detected_structure": "aligned_scripts",
+            "original_format": script_name
+        }
+    }
 
 # ─── MOVIES ──────────────────────────────────────────────────────
 
