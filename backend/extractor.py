@@ -259,7 +259,20 @@ def extract_srt(text: str) -> list[str]:
     lines = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or line.isdigit() or '-->' in line:
+        if not line or line.isdigit():
+            continue
+        # TTML/XML reader emits: "HH:MM:SS.mmm --> HH:MM:SS.mmm | dialogue"
+        # Extract the dialogue part after the pipe
+        if '-->' in line and '|' in line:
+            parts = line.split('|', 1)
+            if len(parts) == 2:
+                dialogue = parts[1].strip()
+                cleaned = _clean_line(dialogue)
+                if _is_valid(cleaned):
+                    lines.append(cleaned)
+            continue
+        # Standard SRT: skip the timecode arrow line itself
+        if '-->' in line:
             continue
         cleaned = _clean_line(line)
         if _is_valid(cleaned):

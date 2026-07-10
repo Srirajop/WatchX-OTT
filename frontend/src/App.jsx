@@ -35,7 +35,9 @@ export default function App() {
 
   const [uniMsg, setUniMsg] = useState('')
   const [uniErr, setUniErr] = useState('')
-  const [platform, setPlatform] = useState('discovery_max')
+  const [uniVersionLabel, setUniVersionLabel] = useState('Current')
+  const [platform, setPlatform] = useState('')
+  const [qcPlatform, setQcPlatform] = useState('')
   const [managementView, setManagementView] = useState('platforms')
 
   // Clean tab
@@ -56,7 +58,6 @@ export default function App() {
   const [checking, setChecking] = useState(false)
   const [qcResult, setQcResult] = useState(null)
   const [qcError, setQcError] = useState('')
-  const [qcPlatform, setQcPlatform] = useState('discovery_max')
   const [qcSubtitles, setQcSubtitles] = useState([])
   const qcFileRef = useRef()
 
@@ -112,12 +113,69 @@ export default function App() {
   const [tcLoading, setTcLoading] = useState(false)
   const tcFileRef = useRef()
 
+  // Conversions tab
+  const [convertFile, setConvertFile] = useState(null)
+  const [convertSubs, setConvertSubs] = useState([])
+  const [convertLoading, setConvertLoading] = useState(false)
+  const [convertError, setConvertError] = useState('')
+  const [convertSuccess, setConvertSuccess] = useState('')
+  const convertFileRef = useRef()
+
+  async function handleConvertUpload(f) {
+    if (!f) return
+    setConvertFile(f)
+    setConvertLoading(true)
+    setConvertError('')
+    setConvertSuccess('')
+    setConvertSubs([])
+    try {
+      const fd = new FormData()
+      fd.append('file', f)
+      const r = await axios.post(`${API}/extract`, fd)
+      const extracted = r.data?.subtitles || []
+      if (!extracted.length) throw new Error('No readable text or timecodes found in this file.')
+      setConvertSubs(extracted)
+      setConvertSuccess(`Successfully parsed ${extracted.length} subtitles from ${f.name}. Ready to convert.`)
+    } catch (err) {
+      setConvertFile(null)
+      setConvertError(err.response?.data?.detail || err.message || 'Could not parse this file.')
+    } finally {
+      setConvertLoading(false)
+    }
+  }
+
+  async function handleConvertDownload(format) {
+    if (!convertSubs.length || !convertFile) return
+    try {
+      const resp = await axios.post(`${API}/export/${format}`, 
+        { subtitles: convertSubs, filename: convertFile.name, preserve_exact: true },
+        { responseType: 'blob' }
+      )
+      const url = URL.createObjectURL(resp.data)
+      const a = document.createElement('a')
+      a.href = url
+      const base = (convertFile.name || 'subtitles').replace(/\.[^/.]+$/, '')
+      a.download = `${base}_converted.${format}`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      setConvertError(`Failed to convert to ${format}`)
+    }
+  }
+
   useEffect(() => { loadPlatforms(); loadMovies(); }, [])
 
   async function loadPlatforms() {
     try {
       const r = await axios.get(`${API}/platforms`)
-      setPlatforms(r.data.platforms)
+      const loaded = r.data.platforms || {}
+      setPlatforms(loaded)
+      // Auto-select the first available platform if none is currently selected
+      const keys = Object.keys(loaded)
+      if (keys.length > 0) {
+        setPlatform(p => p || keys[0])
+        setQcPlatform(p => p || keys[0])
+      }
     } catch(e) { console.error('Failed to load platforms:', e) }
   }
 
@@ -315,10 +373,42 @@ export default function App() {
   }
 
   async function exportTrackChangesPDF() {
-    const r = await axios.post(`${API}/export/track-changes-pdf`, { subtitles, filename: file?.name, platform_key: platform }, { responseType: 'blob' })
-    const url = URL.createObjectURL(r.data)
-    const a = document.createElement('a'); a.href = url
-    a.download = `${file?.name || 'subtitles'}_track_changes.pdf`; a.click(); URL.revokeObjectURL(url)
+    try {
+      let changesPayload
+
+      if (trackChangesData) {
+        // Fast path: changes already computed — send them directly, skip recomputation
+        changesPayload = {
+          filename: file?.name,
+          platform_key: platform,
+          changes: trackChangesData.changes,
+          total_lines: trackChangesData.total_lines,
+          unchanged_lines: trackChangesData.unchanged_lines,
+        }
+      } else {
+        // Load changes first (no modal), then download
+        setTrackChangesLoading(true)
+        setTrackChangesErr('')
+        const r = await axios.post(`${API}/track-changes`, { subtitles, platform_key: platform })
+        setTrackChangesData(r.data)
+        setTrackChangesLoading(false)
+        changesPayload = {
+          filename: file?.name,
+          platform_key: platform,
+          changes: r.data.changes,
+          total_lines: r.data.total_lines,
+          unchanged_lines: r.data.unchanged_lines,
+        }
+      }
+
+      const r = await axios.post(`${API}/export/track-changes-pdf`, changesPayload, { responseType: 'blob' })
+      const url = URL.createObjectURL(r.data)
+      const a = document.createElement('a'); a.href = url
+      a.download = `${file?.name || 'subtitles'}_track_changes.pdf`; a.click(); URL.revokeObjectURL(url)
+    } catch (e) {
+      setTrackChangesErr('PDF download failed — ' + (e.response?.data?.detail || e.message))
+      setTrackChangesLoading(false)
+    }
   }
 
   async function loadTrackChanges() {
@@ -510,12 +600,13 @@ export default function App() {
     try {
       const fdRules = new FormData()
       fdRules.append('platform_name', uniPlatform)
+      fdRules.append('version_label', uniVersionLabel.trim() || 'Current')
       if (uniFile) fdRules.append('guidelines_file', uniFile)
       if (uniText.trim()) fdRules.append('guidelines_text', uniText.trim())
       const rRules = await axios.post(`/api/platforms/add`, fdRules)
       setUniMsg(rRules.data.message || 'Platform rules generated.')
       await loadPlatforms()
-      setUniFile(null); setUniText('')
+      setUniFile(null); setUniText(''); setUniVersionLabel('Current')
     } catch (e) {
       setUniErr(e.response?.data?.detail || 'Processing failed.')
     } finally {
@@ -806,7 +897,45 @@ async function handleDeletePlatform(key) {
 
   const flaggedCount = subtitles.filter(s => s.flagged).length
   const activeTcSubtitles = tcFile ? tcSubtitles : subtitles
-  const allPlatforms = Object.entries(platforms)
+
+  // Build flat platform list for dropdowns — show version in label if platform has multiple versions in same family
+  const allPlatforms = (() => {
+    const entries = Object.entries(platforms)
+    // Count versions per family
+    const familyCounts = {}
+    entries.forEach(([k, p]) => {
+      const fam = p.platform_family || k
+      familyCounts[fam] = (familyCounts[fam] || 0) + 1
+    })
+    return entries.map(([k, p]) => {
+      const fam = p.platform_family || k
+      const showVersion = familyCounts[fam] > 1
+      const label = showVersion
+        ? `${p.name || k}  (${p.version_label || 'Current'})`
+        : (p.name || k)
+      return [k, p, label]
+    })
+  })()
+
+  // Group platforms by family for the platforms tab display
+  const platformFamilies = (() => {
+    const families = {}
+    Object.entries(platforms).forEach(([k, p]) => {
+      const fam = p.platform_family || k
+      const displayFamily = (p.name || k).replace(/\s*(v\d+|version\s*\d+|current|\d{4})\s*$/i, '').trim()
+      if (!families[fam]) families[fam] = { displayName: displayFamily, versions: [] }
+      families[fam].versions.push({ key: k, ...p })
+    })
+    // Sort versions within each family: 'Current' first, then by version_label
+    Object.values(families).forEach(f => {
+      f.versions.sort((a, b) => {
+        if ((a.version_label || '').toLowerCase() === 'current') return -1
+        if ((b.version_label || '').toLowerCase() === 'current') return 1
+        return (b.version_label || '').localeCompare(a.version_label || '')
+      })
+    })
+    return families
+  })()
 
   return (
     <div style={S.root}>
@@ -820,7 +949,7 @@ async function handleDeletePlatform(key) {
           </div>
         </div>
         <div style={S.tabs}>
-          {[['clean','🧹 Clean'],['transcribe','🎙️ Transcribe'],['adjust','⏱️ Adjust TC'],['quality','✅ Quality Check'],['platforms','⚙️ Platforms'],['movie_hub','🌐 Movie Hub']].map(([id,label]) => (
+          {[['clean','🧹 Clean'],['transcribe','🎙️ Transcribe'],['adjust','⏱️ Adjust TC'],['convert','🔄 Conversions'],['quality','✅ Quality Check'],['platforms','⚙️ Platforms'],['movie_hub','🌐 Movie Hub']].map(([id,label]) => (
             <button key={id} style={{...S.tab,...(tab===id?S.tabActive:{})}} onClick={()=>setTab(id)}>{id === 'platforms' ? 'Rules & Guidelines' : label}</button>
           ))}
         </div>
@@ -837,9 +966,9 @@ async function handleDeletePlatform(key) {
                 <div style={S.label}>Step 1 — Select OTT Platform</div>
                 <select style={S.select} value={platform} onChange={e=>setPlatform(e.target.value)}>
                   {allPlatforms.length > 0 ? (
-                    allPlatforms.map(([k,p]) => <option key={k} value={k}>{p.name || k}</option>)
+                    allPlatforms.map(([k, p, label]) => <option key={k} value={k}>{label}</option>)
                   ) : (
-                    <option disabled>Loading platforms (or Backend Down)...</option>
+                    <option disabled value=''>— No platforms added yet. Go to Rules &amp; Guidelines tab →</option>
                   )}
                 </select>
                 {platforms[platform] && (
@@ -972,6 +1101,53 @@ async function handleDeletePlatform(key) {
                   <div style={{display:'flex',flexWrap:'wrap',gap:8,justifyContent:'center'}}>
                     {['Table with Timecodes (FBoy Island style)','Plain Paragraph Script (Everybody Loves Raymond)','SRT / VTT Subtitle Files','XML / TTML / DFXP','CCSL Spotting List (Juno style)','Excel Spotting Lists','Already Cleaned Scripts','Double Dialogue Scripts'].map(f=>(
                       <div key={f} style={{background:'#f8fafc',border:'1px solid #cbd5e1',borderRadius:6,padding:'5px 10px',fontSize:11,color:'#64748b'}}>{f}</div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ══ CONVERSIONS TAB ══ */}
+        {tab === 'convert' && (
+          <div style={{maxWidth:720, margin:'0 auto'}}>
+            <div className='card' style={S.card}>
+              <div style={{fontSize:18, fontWeight:700, marginBottom:4, textAlign:'center'}}>🔄 Format Conversions</div>
+              <div style={{fontSize:11, color:'#64748b', marginBottom:20, textAlign:'center'}}>
+                Convert subtitle and script files directly between formats without applying any AI cleaning rules.
+              </div>
+
+              {!convertFile ? (
+                <div className='uploadZone' style={{...S.uploadZone, padding:30}} onClick={()=>convertFileRef.current?.click()}>
+                  <div style={{fontSize:32, marginBottom:10}}>📁</div>
+                  <div style={S.uploadTitle}>{convertLoading ? 'Parsing file...' : 'Upload file to convert'}</div>
+                  <div style={S.uploadSub}>Supports SRT, VTT, TTML, XML, DOC, DOCX, PDF, RTF, CSV, TXT</div>
+                  <input ref={convertFileRef} type='file' hidden accept='.srt,.vtt,.doc,.docx,.pdf,.xml,.ttml,.dfxp,.rtf,.csv,.txt,.xlsx,.xls'
+                    onChange={e=>handleConvertUpload(e.target.files?.[0])}/>
+                </div>
+              ) : (
+                <div style={S.fileChip}>
+                  <span style={{fontSize:18}}>📄</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:13,color:'#334155'}}>{convertFile.name}</div>
+                    <div style={{fontSize:10,color:'#059669'}}>{convertSuccess || 'Ready to convert'}</div>
+                  </div>
+                  <button className='btn-x-hover icon-spin' style={S.btnX} onClick={()=>{setConvertFile(null);setConvertSubs([]);setConvertSuccess('');setConvertError('')}}>✕</button>
+                </div>
+              )}
+
+              {convertError && <div style={{...S.errBox, marginTop:14}}><div style={{fontSize:12,color:'#dc2626'}}>{convertError}</div></div>}
+
+              {convertSubs.length > 0 && (
+                <div style={{marginTop:20}}>
+                  <div style={{fontSize:11, fontWeight:700, color:'#334155', marginBottom:10}}>Export to Format:</div>
+                  <div style={{display:'flex', flexWrap:'wrap', gap:8}}>
+                    {['srt', 'vtt', 'ttml', 'csv', 'txt', 'rtf', 'docx', 'pdf'].map(fmt => (
+                      <button key={fmt} style={{...S.btnOutline, flex:'1 1 calc(25% - 8px)', minWidth:100, textTransform:'uppercase', fontWeight:700}}
+                        onClick={()=>handleConvertDownload(fmt)}>
+                        ⬇️ {fmt}
+                      </button>
                     ))}
                   </div>
                 </div>
@@ -1478,7 +1654,7 @@ async function handleDeletePlatform(key) {
                     <div style={{fontSize:11,color:'#64748b'}}>Use the form to add the first shared link.</div>
                   </div>
                 ) : movies.map(movie => (
-                  <a key={movie.id || `${movie.title}-${movie.url}`} href={/^https?:\/\//i.test(movie.url || '') ? movie.url : '#'} target='_blank' rel='noreferrer'
+                  <a key={movie.id || `${movie.title}-${movie.url}`} href={/^https?:\/\//i.test(movie.url || '') ? movie.url : (movie.url ? `https://${movie.url}` : '#')} target='_blank' rel='noreferrer'
                     style={{display:'block',textDecoration:'none',border:'1px solid #e2e8f0',borderRadius:10,padding:'12px 14px',marginBottom:9,background:'#f8fafc'}}>
                     <div style={{fontSize:13,fontWeight:700,color:'#0f172a',marginBottom:4}}>{movie.title}</div>
                     <div style={{fontSize:10,color:'#6366f1',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{movie.url}</div>
@@ -1496,7 +1672,7 @@ async function handleDeletePlatform(key) {
               <div className='card' style={S.card}>
                 <div style={S.label}>Platform to Check Against</div>
                 <select style={S.select} value={qcPlatform} onChange={e=>{setQcPlatform(e.target.value);setQcResult(null);setQcError('')}}>
-                  {allPlatforms.map(([k,p]) => <option key={k} value={k}>{p.name||k}</option>)}
+                  {allPlatforms.map(([k, p, label]) => <option key={k} value={k}>{label}</option>)}
                 </select>
               </div>
 
@@ -1669,8 +1845,14 @@ async function handleDeletePlatform(key) {
                   style={{...S.input, marginBottom:10}}
                 />
                 <select style={{...S.select, marginBottom:10}} value={searchPlatformFilter} onChange={e=>setSearchPlatformFilter(e.target.value)}>
-                  <option value=''>All Platforms</option>
-                  {Object.entries(platforms).map(([k,p]) => <option key={k} value={k}>{p.name||k}</option>)}
+                  <option value=''>All Platforms &amp; Versions</option>
+                  {Object.entries(platformFamilies).map(([fam, f]) => (
+                    <optgroup key={fam} label={f.displayName}>
+                      {f.versions.map(v => (
+                        <option key={v.key} value={v.key}>{f.displayName} — {v.version_label || 'Current'}</option>
+                      ))}
+                    </optgroup>
+                  ))}
                 </select>
                 <div style={{display:'flex',gap:8, marginBottom: 16}}>
                   <button style={S.btnOutline} onClick={() => { setSearchKeyword(''); setSearchPlatformFilter(''); }}>Clear Filters</button>
@@ -1683,6 +1865,13 @@ async function handleDeletePlatform(key) {
                   Upload a document to extract quality check rules automatically.
                 </div>
                 <input style={S.input} placeholder="Platform Name (e.g. Netflix)" value={uniPlatform} onChange={e=>setUniPlatform(e.target.value)}/>
+                <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:6}}>
+                  <div>
+                    <div style={{fontSize:10,color:'#64748b',marginBottom:4,fontWeight:600,textTransform:'uppercase',letterSpacing:0.5}}>Version / Year Label</div>
+                    <input style={{...S.input, marginBottom:0}} placeholder="e.g. Current, 2022, v10" value={uniVersionLabel} onChange={e=>setUniVersionLabel(e.target.value)}/>
+                    <div style={{fontSize:10,color:'#94a3b8',marginTop:3}}>Same platform + same version = overwrite existing</div>
+                  </div>
+                </div>
                 <div style={{fontSize:11,color:'#64748b',marginBottom:6}}>Upload guidelines document</div>
                 {!uniFile ? (
                   <div className='uploadZone' style={{...S.uploadZone,padding:14}} onClick={()=>document.getElementById('unified-gl-in').click()}>
@@ -1720,65 +1909,99 @@ async function handleDeletePlatform(key) {
 
             <div style={S.right}>
               <div className='card' style={S.card}>
-                <div style={S.label}>Platform Rules</div>
+                <div style={S.label}>Platform Rules Library</div>
                 <div style={{fontSize:12,color:'#64748b',marginBottom:14}}>
-                  Click any platform to edit its rules.
+                  Platforms are grouped by family. Click any version to view &amp; edit its rules.
                 </div>
-                
-                <div style={{display:'flex', flexDirection:'column', gap:10}}>
-                  {Object.entries(platforms)
-                    .filter(([k, p]) => {
-                      if (searchPlatformFilter && k !== searchPlatformFilter) return false;
-                      if (searchKeyword.trim()) {
-                        const kw = searchKeyword.toLowerCase();
-                        if ((p.name || k).toLowerCase().includes(kw)) return true;
-                        if ((p.rules || []).some(r => r.toLowerCase().includes(kw))) return true;
-                        return false;
+
+                <div style={{display:'flex', flexDirection:'column', gap:14}}>
+                  {Object.entries(platformFamilies)
+                    .filter(([fam, f]) => {
+                      if (searchPlatformFilter) {
+                        return f.versions.some(v => v.key === searchPlatformFilter)
                       }
-                      return true;
+                      if (searchKeyword.trim()) {
+                        const kw = searchKeyword.toLowerCase()
+                        if (f.displayName.toLowerCase().includes(kw)) return true
+                        return f.versions.some(v =>
+                          (v.version_label||'').toLowerCase().includes(kw) ||
+                          (v.rules||[]).some(r => r.toLowerCase().includes(kw)) ||
+                          (v.subtitler_rules||[]).some(r => r.toLowerCase().includes(kw))
+                        )
+                      }
+                      return true
                     })
-                    .map(([k,p]) => {
-                      const matchingScript = searchKeyword.trim() ? (p.rules||[]).filter(r => r.toLowerCase().includes(searchKeyword.toLowerCase())) : []
-                      const matchingSubtitler = searchKeyword.trim() ? (p.subtitler_rules||[]).filter(r => r.toLowerCase().includes(searchKeyword.toLowerCase())) : []
-                      const matchingRules = [...matchingScript, ...matchingSubtitler]
-                      
+                    .map(([fam, f]) => {
+                      // If filtered to a specific version, only show that version
+                      const versionsToShow = searchPlatformFilter
+                        ? f.versions.filter(v => v.key === searchPlatformFilter)
+                        : f.versions
+
                       return (
-                        <div key={k} style={{background:'#f8fafc',border:'1px solid #cbd5e1',borderRadius:8,padding:'12px 14px',display:'flex',flexDirection:'column',gap:10,cursor:'pointer'}} onClick={()=>{setEditingPlatform({...p, platform_key: k});setEditRulesText((p.rules||[]).join('\n'));setEditSubtitlerRulesText((p.subtitler_rules||[]).join('\n'));setEditRulesTab('script')}}>
-                          <div style={{display:'flex',alignItems:'flex-start',gap:10}}>
-                            <div style={{flex:1}}>
-                              <div style={{fontSize:13,fontWeight:700,color: '#0f172a',marginBottom:2}}>
-                                {p.name||k} 
-                                {p.created_at && <span style={{fontSize:10,fontWeight:400,color:'#94a3b8',marginLeft:6}}>{new Date(p.created_at).toLocaleDateString()}</span>}
-                              </div>
-                              <div style={{fontSize:11,color:'#64748b'}}>
-                                {p.max_chars_per_line} chars/line · {p.max_lines} lines
-                                <span style={{color:'#059669',fontWeight:600,marginLeft:8}}>{(p.rules||[]).length} Script Rules</span>
-                                <span style={{color:'#6366f1',fontWeight:600,marginLeft:8}}>{(p.subtitler_rules||[]).length} Subtitler Rules</span>
-                              </div>
+                        <div key={fam} style={{background:'#f8fafc', border:'1px solid #cbd5e1', borderRadius:10, overflow:'hidden'}}>
+                          {/* Family header */}
+                          <div style={{background:'linear-gradient(135deg,#1e293b,#334155)', padding:'10px 14px', display:'flex', alignItems:'center', justifyContent:'space-between'}}>
+                            <div style={{fontSize:13, fontWeight:700, color:'#f1f5f9'}}>{f.displayName}</div>
+                            <div style={{display:'flex', alignItems:'center', gap:8}}>
+                              <span style={{fontSize:10, color:'#94a3b8'}}>{f.versions.length} version{f.versions.length!==1?'s':''}</span>
+                              {f.versions[0]?.is_custom && (
+                                <button
+                                  style={{background:'#dc2626',color:'#fff',border:'none',borderRadius:4,fontSize:10,fontWeight:700,padding:'3px 8px',cursor:'pointer'}}
+                                  onClick={e => { e.stopPropagation(); if(confirm(`Delete ALL versions of ${f.displayName}?`)) { axios.delete(`${API}/platforms/family/${fam}`).then(loadPlatforms) } }}
+                                >🗑 Delete All</button>
+                              )}
                             </div>
-                            <button style={{background:'none',border:'none',cursor:'pointer',fontSize:16,color:'#64748b'}} onClick={(e)=>{e.stopPropagation();handleDeletePlatform(k)}}>🗑</button>
                           </div>
-                          {searchKeyword.trim() && matchingRules.length > 0 && (
-                            <div style={{background:'#ffffff', border:'1px solid #e2e8f0', borderRadius: 6, padding: '8px 10px'}}>
-                              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
-                                <div style={{fontSize: 10, fontWeight: 700, color: '#6366f1'}}>🔍 Matching Rules:</div>
-                                {p.guidelines_raw && (
-                                  <button 
-                                    style={{background:'#4f46e5',color:'#fff',border:'none',borderRadius:4,fontSize:10,fontWeight:700,padding:'3px 8px',cursor:'pointer'}}
-                                    onClick={(e) => { e.stopPropagation(); setViewSourceRaw({ text: p.guidelines_raw, keyword: searchKeyword, title: `${p.name||k}` }) }}
-                                  >
-                                    📄 View Source Doc
-                                  </button>
-                                )}
-                              </div>
-                              {matchingRules.slice(0, 3).map((r, i) => (
-                                <div key={i} style={{fontSize: 11, color: '#334155', marginBottom: 4, lineHeight:1.4}}>• {r}</div>
-                              ))}
-                              {matchingRules.length > 3 && <div style={{fontSize: 10, color: '#64748b', marginTop: 2}}>+ {matchingRules.length - 3} more...</div>}
-                            </div>
-                          )}
+
+                          {/* Version rows */}
+                          <div style={{padding:'8px 10px', display:'flex', flexDirection:'column', gap:6}}>
+                            {versionsToShow.map(v => {
+                              const matchingRules = searchKeyword.trim()
+                                ? [...(v.rules||[]), ...(v.subtitler_rules||[])].filter(r => r.toLowerCase().includes(searchKeyword.toLowerCase()))
+                                : []
+
+                              return (
+                                <div key={v.key}
+                                  style={{background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:8, padding:'10px 12px', cursor:'pointer', transition:'box-shadow 0.15s ease'}}
+                                  onClick={() => { setEditingPlatform({...v, platform_key: v.key}); setEditRulesText((v.rules||[]).join('\n')); setEditSubtitlerRulesText((v.subtitler_rules||[]).join('\n')); setEditRulesTab('script') }}
+                                >
+                                  <div style={{display:'flex', alignItems:'center', gap:8, flexWrap:'wrap'}}>
+                                    {/* Version badge */}
+                                    <span style={{background: (v.version_label||'').toLowerCase()==='current' ? '#059669' : '#6366f1', color:'#fff', fontSize:10, fontWeight:700, padding:'2px 8px', borderRadius:20}}>
+                                      {v.version_label || 'Current'}
+                                    </span>
+                                    <div style={{flex:1, fontSize:12, color:'#334155'}}>
+                                      {v.max_chars_per_line} chars/line · {v.max_lines} lines
+                                      <span style={{color:'#059669',fontWeight:600,marginLeft:8}}>{(v.rules||[]).length} Script Rules</span>
+                                      <span style={{color:'#6366f1',fontWeight:600,marginLeft:8}}>{(v.subtitler_rules||[]).length} Subtitler Rules</span>
+                                    </div>
+                                    {v.created_at && <span style={{fontSize:10,color:'#94a3b8'}}>{new Date(v.created_at).toLocaleDateString()}</span>}
+                                    <button style={{background:'none',border:'none',cursor:'pointer',fontSize:14,color:'#94a3b8',padding:'2px 4px'}} onClick={e => { e.stopPropagation(); handleDeletePlatform(v.key) }}>🗑</button>
+                                  </div>
+
+                                  {searchKeyword.trim() && matchingRules.length > 0 && (
+                                    <div style={{marginTop:8, background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:6, padding:'7px 10px'}}>
+                                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:5}}>
+                                        <div style={{fontSize:10,fontWeight:700,color:'#6366f1'}}>🔍 Matching Rules:</div>
+                                        {v.guidelines_raw && (
+                                          <button
+                                            style={{background:'#4f46e5',color:'#fff',border:'none',borderRadius:4,fontSize:10,fontWeight:700,padding:'3px 8px',cursor:'pointer'}}
+                                            onClick={e => { e.stopPropagation(); setViewSourceRaw({ text: v.guidelines_raw, keyword: searchKeyword, title: `${f.displayName} — ${v.version_label}` }) }}
+                                          >📄 View Source</button>
+                                        )}
+                                      </div>
+                                      {matchingRules.slice(0, 3).map((r, i) => (
+                                        <div key={i} style={{fontSize:11, color:'#334155', marginBottom:3, lineHeight:1.4}}>• {r}</div>
+                                      ))}
+                                      {matchingRules.length > 3 && <div style={{fontSize:10,color:'#64748b',marginTop:2}}>+ {matchingRules.length - 3} more...</div>}
+                                    </div>
+                                  )}
+                                </div>
+                              )
+                            })}
+                          </div>
                         </div>
-                      );
+                      )
                     })}
                 </div>
               </div>
@@ -1851,10 +2074,11 @@ async function handleDeletePlatform(key) {
             <div style={{display:'flex',alignItems:'center',gap:12,marginTop:16}}>
               <button style={{...S.btnPrimary, flex:1}} onClick={async () => {
                 try {
-                  const fd = new FormData()
-                  fd.append('rules', editRulesText)
-                  fd.append('subtitler_rules', editSubtitlerRulesText)
-                  await axios.patch(`/api/platforms/${editingPlatform.platform_key}/meta`, fd)
+                  const payload = {
+                    rules: editRulesText.split('\n').map(r => r.trim()).filter(Boolean),
+                    subtitler_rules: editSubtitlerRulesText.split('\n').map(r => r.trim()).filter(Boolean)
+                  }
+                  await axios.patch(`/api/platforms/${editingPlatform.platform_key}/meta`, payload)
                   setEditPlatformMsg('Rules updated successfully.')
                   setEditPlatformErr('')
                   loadPlatforms()
@@ -2012,53 +2236,160 @@ async function handleDeletePlatform(key) {
         </div>
       )}
 
-      {/* ══ TRACK CHANGES MODAL — on-screen view, see before you download ══ */}
-      {trackChangesOpen && trackChangesData && (
-        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,0.8)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:999}}
-          onClick={(e)=>{if(e.target===e.currentTarget) setTrackChangesOpen(false)}}>
-          <div style={{background:'#ffffff',border:'1px solid #4338ca',borderRadius:12,padding:24,width:760,maxWidth:'92%',maxHeight:'88vh',display:'flex',flexDirection:'column'}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
-              <div style={{fontSize:18,fontWeight:700}}>📝 Track Changes — {trackChangesData.platform}</div>
-              <button style={{background:'none',border:'none',color:'#64748b',fontSize:20,cursor:'pointer'}} onClick={()=>setTrackChangesOpen(false)}>✕</button>
-            </div>
-            <div style={{fontSize:12,color:'#64748b',marginBottom:16}}>
-              {trackChangesData.changed_lines} of {trackChangesData.total_lines} lines were changed during cleaning · {trackChangesData.unchanged_lines} needed no changes
-            </div>
+      {/* ══ TRACK CHANGES MODAL ══ */}
+      {trackChangesOpen && trackChangesData && (() => {
+        // ── Word-level diff: returns JSX spans with removed/added highlighting ──
+        const wordDiff = (original, cleaned) => {
+          const ow = (original || '').split(/\s+/).filter(Boolean)
+          const cw = (cleaned  || '').split(/\s+/).filter(Boolean)
+          // Simple LCS-based diff
+          const n = ow.length, m = cw.length
+          const dp = Array.from({length:n+1}, ()=>new Array(m+1).fill(0))
+          for (let i=1;i<=n;i++) for (let j=1;j<=m;j++)
+            dp[i][j] = ow[i-1]===cw[j-1] ? dp[i-1][j-1]+1 : Math.max(dp[i-1][j],dp[i][j-1])
+          let i=n, j=m
+          const ops=[]
+          while(i>0||j>0){
+            if(i>0&&j>0&&ow[i-1]===cw[j-1]){ops.push({t:'eq',w:ow[i-1]});i--;j--}
+            else if(j>0&&(i===0||dp[i][j-1]>=dp[i-1][j])){ops.push({t:'ins',w:cw[j-1]});j--}
+            else{ops.push({t:'del',w:ow[i-1]});i--}
+          }
+          ops.reverse()
+          return ops.map((op,k) => {
+            if(op.t==='eq') return <span key={k}>{op.w} </span>
+            if(op.t==='del') return <span key={k} style={{background:'#fecaca',color:'#991b1b',textDecoration:'line-through',borderRadius:3,padding:'1px 3px',marginRight:3}}>{op.w} </span>
+            return <span key={k} style={{background:'#bbf7d0',color:'#065f46',borderRadius:3,padding:'1px 3px',marginRight:3,fontWeight:600}}>{op.w} </span>
+          })
+        }
 
-            <div style={{overflowY:'auto',flex:1,paddingRight:6}}>
-              {trackChangesData.changes.length === 0 ? (
-                <div style={{textAlign:'center',color:'#64748b',padding:40}}>
-                  No changes were made — every line was already clean.
-                </div>
-              ) : (
-                trackChangesData.changes.map(c => (
-                  <div key={c.id} style={{border:'1px solid #e2e8f0',borderRadius:10,padding:14,marginBottom:10,
-                    background: c.flagged ? '#fff1f2' : '#f8fafc'}}>
-                    <div style={{fontSize:11,color:'#94a3b8',marginBottom:6,fontWeight:600}}>Line {c.id}</div>
-                    <div style={{fontSize:13,color:'#d97706',marginBottom:4}}>
-                      <b>Previously:</b> {c.original_text}
-                    </div>
-                    <div style={{fontSize:14,color:'#059669',marginBottom:8}}>
-                      <b>Cleaned:</b> {c.new_text}
-                    </div>
-                    <div style={{fontSize:11,color:'#64748b'}}>
-                      {c.rules_applied.map((r,i) => <div key={i}>• {r}</div>)}
-                    </div>
-                    {c.flagged && (
-                      <div style={{fontSize:11,color:'#dc2626',marginTop:6,fontWeight:600}}>⚠ {c.flag_reason}</div>
-                    )}
+        return (
+          <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(15,23,42,0.75)',backdropFilter:'blur(4px)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:999}}
+            onClick={(e)=>{if(e.target===e.currentTarget) setTrackChangesOpen(false)}}>
+            <div style={{background:'#ffffff',borderRadius:16,boxShadow:'0 25px 60px rgba(0,0,0,0.25)',width:900,maxWidth:'95vw',maxHeight:'92vh',display:'flex',flexDirection:'column',overflow:'hidden'}}>
+
+              {/* Header */}
+              <div style={{padding:'20px 24px',borderBottom:'1px solid #e2e8f0',display:'flex',justifyContent:'space-between',alignItems:'flex-start',background:'linear-gradient(135deg,#f8faff 0%,#eef2ff 100%)'}}>
+                <div>
+                  <div style={{fontSize:19,fontWeight:800,color:'#1e293b',marginBottom:4}}>📝 Track Changes Report</div>
+                  <div style={{fontSize:13,color:'#64748b',fontWeight:500}}>
+                    Platform: <strong style={{color:'#4f46e5'}}>{trackChangesData.platform}</strong>
+                    <span style={{margin:'0 10px',color:'#cbd5e1'}}>·</span>
+                    <span style={{color:'#dc2626',fontWeight:700}}>{trackChangesData.changed_lines} changed</span>
+                    <span style={{margin:'0 10px',color:'#cbd5e1'}}>·</span>
+                    <span style={{color:'#059669',fontWeight:700}}>{trackChangesData.unchanged_lines} unchanged</span>
+                    <span style={{margin:'0 10px',color:'#cbd5e1'}}>·</span>
+                    {trackChangesData.total_lines} total lines
                   </div>
-                ))
-              )}
-            </div>
+                </div>
+                <button style={{background:'none',border:'none',color:'#64748b',fontSize:22,cursor:'pointer',lineHeight:1}} onClick={()=>setTrackChangesOpen(false)}>✕</button>
+              </div>
 
-            <div style={{display:'flex',gap:10,marginTop:16}}>
-              <button style={{...S.btnPrimary, flex:1}} onClick={exportTrackChangesPDF}>⬇️ Download Full Report (PDF)</button>
-              <button style={{...S.btnOutline}} onClick={()=>setTrackChangesOpen(false)}>Close</button>
+              {/* Legend */}
+              <div style={{padding:'10px 24px',background:'#f8fafc',borderBottom:'1px solid #f1f5f9',display:'flex',gap:20,fontSize:11,color:'#64748b',alignItems:'center',flexWrap:'wrap'}}>
+                <span style={{fontWeight:700,color:'#475569'}}>Legend:</span>
+                <span><span style={{background:'#fecaca',color:'#991b1b',borderRadius:3,padding:'1px 5px',textDecoration:'line-through'}}>word</span> = removed</span>
+                <span><span style={{background:'#bbf7d0',color:'#065f46',borderRadius:3,padding:'1px 5px',fontWeight:700}}>word</span> = added</span>
+                <span><span style={{background:'#dbeafe',color:'#1e40af',borderRadius:3,padding:'1px 5px'}}>1→3</span> = split into multiple lines</span>
+              </div>
+
+              {/* Change cards */}
+              <div style={{overflowY:'auto',flex:1,padding:'16px 24px'}}>
+                {trackChangesData.changes.length === 0 ? (
+                  <div style={{textAlign:'center',color:'#64748b',padding:60,fontSize:15}}>
+                    ✅ No changes were made — every line was already clean.
+                  </div>
+                ) : (
+                  trackChangesData.changes.map(c => {
+                    const cleanedLines = (c.new_text || '').split('\n').filter(l => l.trim())
+                    const isSplit = cleanedLines.length > 1
+                    const ids = c.ids || [c.id]
+                    const idLabel = ids.length === 1
+                      ? `Line #${ids[0]}`
+                      : `Lines #${ids[0]}–#${ids[ids.length-1]}`
+
+                    return (
+                      <div key={c.id} style={{
+                        border: c.flagged ? '1.5px solid #fca5a5' : '1px solid #e2e8f0',
+                        borderRadius: 12, marginBottom: 12, overflow:'hidden',
+                        boxShadow: '0 2px 8px rgba(0,0,0,0.04)'
+                      }}>
+                        {/* Card header — line ID + badges only, no rules */}
+                        <div style={{display:'flex',alignItems:'center',gap:8,padding:'8px 14px',background: c.flagged ? '#fff1f2' : '#f8fafc',borderBottom:'1px solid #e2e8f0',flexWrap:'wrap'}}>
+                          <span style={{fontSize:11,fontWeight:700,color:'#94a3b8',letterSpacing:0.5}}>{idLabel}</span>
+                          {isSplit && (
+                            <span style={{fontSize:10,fontWeight:700,background:'#dbeafe',color:'#1e40af',borderRadius:4,padding:'2px 7px'}}>
+                              Split 1 → {cleanedLines.length} lines
+                            </span>
+                          )}
+                          {c.flagged && (
+                            <span style={{fontSize:10,fontWeight:700,background:'#fef2f2',color:'#dc2626',borderRadius:4,padding:'2px 7px'}}>
+                              ⚠ {c.flag_reason}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Before / After columns */}
+                        <div style={{display:'grid', gridTemplateColumns:'1fr 1fr'}}>
+                          {/* BEFORE */}
+                          <div style={{padding:'12px 14px',borderRight:'2px solid #e2e8f0',background:'#fffbeb'}}>
+                            <div style={{fontSize:10,fontWeight:800,color:'#d97706',marginBottom:6,textTransform:'uppercase',letterSpacing:0.8}}>❌ Before</div>
+                            <div style={{fontSize:13,color:'#92400e',lineHeight:1.6,whiteSpace:'pre-wrap',fontFamily:"'JetBrains Mono',Consolas,monospace"}}>
+                              {c.original_text}
+                            </div>
+                          </div>
+                          {/* AFTER */}
+                          <div style={{padding:'12px 14px',background:'#f0fdf4'}}>
+                            <div style={{fontSize:10,fontWeight:800,color:'#059669',marginBottom:6,textTransform:'uppercase',letterSpacing:0.8}}>✅ After</div>
+                            {isSplit ? (
+                              /* Split: show numbered lines */
+                              cleanedLines.map((line, idx) => (
+                                <div key={idx} style={{display:'flex',gap:6,alignItems:'flex-start',marginBottom:4}}>
+                                  <span style={{fontSize:9,fontWeight:800,color:'#6ee7b7',minWidth:14,marginTop:3}}>{idx+1}.</span>
+                                  <div style={{fontSize:13,color:'#065f46',lineHeight:1.6,fontFamily:"'JetBrains Mono',Consolas,monospace",flex:1}}>
+                                    {line}
+                                  </div>
+                                </div>
+                              ))
+                            ) : (
+                              /* Single line: show word-diff */
+                              <div style={{fontSize:13,lineHeight:1.6,fontFamily:"'JetBrains Mono',Consolas,monospace"}}>
+                                {wordDiff(c.original_text, cleanedLines[0] || '')}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Rules footer — full width, full text, no truncation */}
+                        {c.rules_applied && c.rules_applied.length > 0 && (
+                          <div style={{padding:'8px 14px',background:'#f8fafc',borderTop:'1px solid #e2e8f0'}}>
+                            <div style={{fontSize:10,fontWeight:700,color:'#64748b',marginBottom:5,textTransform:'uppercase',letterSpacing:0.6}}>
+                              📋 Rules Applied ({c.rules_applied.length})
+                            </div>
+                            <div style={{display:'flex',flexWrap:'wrap',gap:'4px 12px'}}>
+                              {c.rules_applied.map((r,i) => (
+                                <span key={i} style={{fontSize:11,color:'#475569',lineHeight:1.6}}>
+                                  <span style={{color:'#94a3b8',marginRight:3}}>•</span>{r}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })
+                )}
+              </div>
+
+              {/* Footer */}
+              <div style={{padding:'16px 24px',borderTop:'1px solid #e2e8f0',display:'flex',gap:10,background:'#f8fafc'}}>
+                <button style={{...S.btnPrimary, flex:1}} onClick={exportTrackChangesPDF}>⬇️ Download Full Report (PDF)</button>
+                <button style={{...S.btnOutline}} onClick={()=>setTrackChangesOpen(false)}>Close</button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )
+      })()}
+
 
     </div>
   )

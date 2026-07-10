@@ -304,104 +304,117 @@ def read_docx(file_bytes: bytes) -> str:
         # destroys their alignment. Keep the last recognised column layout so
         # continuation tables without a repeated header also work.
         stacked_layout = None
-        tc_re = re.compile(r"^\d{1,2}[:.]\d{2}[:.]\d{2}(?:[,.:;]\d{1,3})?$")
+        # Matches both colon-separated (01:00:00:01) and dot-separated (01.00.00) timecodes
+        tc_re = re.compile(r"^\d{1,2}[:.][\d]{2}[:.][\d]{2}(?:[,.:;]\d{1,3})?$")
 
         def header_role(value: str):
             key = re.sub(r"[^a-z]", "", value.lower())
-            if key in {"timecode", "time", "tc", "timein"}:
+            if key in {"timecode", "timecodes", "time", "tc", "timein", "timecode", "starttime"} or key.startswith("timecode"):
                 return "time"
+            # "audio" and "narration" columns contain the actual spoken content (Food Factory, documentary style)
             if key in {"audio", "dialogue", "dialog", "narration", "speech", "subtitle", "subtitles", "text"}:
                 return "dialogue"
+            # "visuals", "graphics", "scene", "description" — NOT dialogue, skip
+            if key in {"visuals", "visual", "graphicsonscreen", "graphics", "scene", "description", "scenedescrip"}:
+                return "skip"
+            # "character" column — speaker label, not dialogue itself
+            if key in {"character", "speaker"}:
+                return "speaker"
             return None
 
         for i, table in enumerate(doc.tables):
             sections.append(f"\n=== TABLE {i+1} ({len(table.rows)} rows x {len(table.columns)} cols) ===")
             first_values = [c.text.strip() for c in table.rows[0].cells] if table.rows else []
-            roles = {header_role(value): idx for idx, value in enumerate(first_values) if header_role(value)}
+            roles = {}
+            for idx, value in enumerate(first_values):
+                role = header_role(value)
+                if role and role not in roles:  # first match wins per role type
+                    roles[role] = idx
+
             first_is_header = "time" in roles and "dialogue" in roles
+
+            # FBoyIsland-style: no header row — first row is already data.
+            # Detect by checking if any cell in row 0 looks like a bare timecode.
+            if not first_is_header and table.rows:
+                for ci, val in enumerate(first_values):
+                    stripped = val.strip()
+                    if tc_re.match(stripped):
+                        # Infer layout: first timecode col = time, last non-timecode col = dialogue
+                        roles["time"] = ci
+                        # Dialogue is the last column that is NOT a timecode
+                        for di in range(len(first_values) - 1, -1, -1):
+                            if di != ci and not tc_re.match(first_values[di]):
+                                roles["dialogue"] = di
+                                break
+                        if "dialogue" in roles:
+                            first_is_header = True   # treat row 0 as a data row (no header to skip)
+                            roles["no_header"] = True
+                        break
+
             if first_is_header:
-                stacked_layout = (roles["time"], roles["dialogue"], len(first_values))
+                # Timecoded table. Collapse each cue into ONE pipe-delimited
+                # line ("TIMECODE | DIALOGUE") so the downstream timecoded
+                # parser sees a clean, parseable table.
+                #
+                # Handles the real-world layouts seen in client scripts:
+                #   * Interleaved (CAR SOS / Food Factory): the timecode sits in
+                #     its own row and the dialogue paragraphs follow in separate
+                #     rows (the timecode row's dialogue cell is empty).
+                #   * Single-row cue: the timecode and its dialogue share one row.
+                #   * Multiple timecodes + dialogue in one row: mapped by nearest
+                #     index.
+                time_col = roles["time"]
+                dlg_col = roles["dialogue"]
+                sections.append("TIMECODE | DIALOGUE")
+                cur_tc = [None]
+                cur_dlg = [[]]
 
-            for row_idx, row in enumerate(table.rows):
-                if first_is_header and row_idx == 0:
-                    sections.append(" | ".join(first_values))
-                    continue
+                def _flush_cue():
+                    if cur_tc[0] and cur_dlg[0]:
+                        sections.append(f"{cur_tc[0]} | {'\n'.join(cur_dlg[0])}")
 
-                # Rebuild vertically stacked TIME CODE / AUDIO cells into
-                # actual cue rows. Each audio paragraph is assigned to the
-                # nearest timecode paragraph; deliberate blank-paragraph
-                # positioning is therefore retained.
-                if stacked_layout and len(row.cells) == stacked_layout[2]:
-                    tc_idx, dialogue_idx, column_count = stacked_layout
-                    tc_points = [
-                        (pi, p.text.strip())
-                        for pi, p in enumerate(row.cells[tc_idx].paragraphs)
-                        if tc_re.match(p.text.strip())
-                    ]
-                    dialogue_points = [
-                        (pi, p.text.strip())
-                        for pi, p in enumerate(row.cells[dialogue_idx].paragraphs)
-                        if p.text.strip()
-                    ]
-                    if tc_points and dialogue_points:
-                        grouped = {tc: [] for _, tc in tc_points}
-                        if len(tc_points) >= len(dialogue_points):
-                            # Usually there is one cue per dialogue, with an
-                            # occasional silent/title timecode. Choose the
-                            # minimum-distance monotonic one-to-one mapping so
-                            # paragraph-count drift cannot merge adjacent cues.
-                            n, m = len(tc_points), len(dialogue_points)
-                            costs = [[float("inf")] * (m + 1) for _ in range(n + 1)]
-                            took = [[False] * (m + 1) for _ in range(n + 1)]
-                            for i in range(n + 1):
-                                costs[i][0] = 0
-                            for i in range(1, n + 1):
-                                for j in range(1, min(i, m) + 1):
-                                    skip_cost = costs[i - 1][j]
-                                    take_cost = costs[i - 1][j - 1] + abs(
-                                        tc_points[i - 1][0] - dialogue_points[j - 1][0]
-                                    )
-                                    if take_cost < skip_cost:
-                                        costs[i][j] = take_cost
-                                        took[i][j] = True
-                                    else:
-                                        costs[i][j] = skip_cost
-                            choices = []
-                            i, j = n, m
-                            while j:
-                                if took[i][j]:
-                                    choices.append(tc_points[i - 1])
-                                    i -= 1
-                                    j -= 1
-                                else:
-                                    i -= 1
-                            choices.reverse()
-                            for (_, tc), (_, dialogue) in zip(choices, dialogue_points):
-                                grouped[tc].append(dialogue)
-                        else:
-                            # More dialogue paragraphs than timecodes means a
-                            # cue intentionally contains multiple fragments.
-                            for para_idx, dialogue in dialogue_points:
-                                _, nearest_tc = min(tc_points, key=lambda point: (abs(point[0] - para_idx), point[0]))
-                                grouped[nearest_tc].append(dialogue)
-                        for _, tc in tc_points:
-                            if not grouped[tc]:
-                                continue
-                            cells = [""] * column_count
-                            cells[tc_idx] = tc
-                            cells[dialogue_idx] = " ".join(grouped[tc])
-                            sections.append(" | ".join(cells))
+                NL = chr(10)
+                start_row = 0 if roles.get('no_header') else 1
+                for row in table.rows[start_row:]:
+                    cells = [c.text.strip() for c in row.cells]
+                    if time_col >= len(cells) or dlg_col >= len(cells):
+                        continue
+                    tc_cell = cells[time_col]
+                    dlg_lines = [ln.strip() for ln in cells[dlg_col].split("\n") if ln.strip()]
+                    row_tcs = [t.strip() for t in tc_cell.split("\n") if tc_re.match(t.strip())]
+
+                    if len(row_tcs) >= 2 and dlg_lines:
+                        # Multiple timecodes + dialogue in ONE row.
+                        grouped = {tc: [] for tc in row_tcs}
+                        n = len(row_tcs)
+                        for di, d in enumerate(dlg_lines):
+                            gi = (round(di * (n - 1) / max(1, len(dlg_lines) - 1))
+                                  if len(dlg_lines) > 1 else 0)
+                            gi = max(0, min(n - 1, gi))
+                            grouped[row_tcs[gi]].append(d)
+                        for tc in row_tcs:
+                            if grouped[tc]:
+                                sections.append(f"{tc} | {'\n'.join(grouped[tc])}")
                         continue
 
-                cells = []
-                seen = set()
-                for cell in row.cells:
-                    t = cell.text.strip()
-                    if t and t not in seen:
-                        cells.append(t)
-                        seen.add(t)
-                if cells:
-                    sections.append(" | ".join(cells))
+                    if len(row_tcs) == 1:
+                        _flush_cue()
+                        cur_tc[0] = row_tcs[0]
+                        cur_dlg[0] = list(dlg_lines)
+                    elif dlg_lines:
+                        cur_dlg[0].extend(dlg_lines)
+                _flush_cue()
+            else:
+                for row in table.rows:
+                    cells = []
+                    seen = set()
+                    for cell in row.cells:
+                        t = cell.text.strip()
+                        if t and t not in seen:
+                            cells.append(t)
+                            seen.add(t)
+                    if cells:
+                        sections.append(" | ".join(cells))
         extracted_text = "\n".join(sections)
     except Exception as e:
         # Fallback for poorly formed DOCX files (like missing app.xml)

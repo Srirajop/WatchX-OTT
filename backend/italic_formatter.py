@@ -142,7 +142,17 @@ def apply_italics_rules(subtitles: list[dict], platform_key: str) -> list[dict]:
 
     # If platform explicitly forbids ALL italics, strip any existing italic tags
     if rules.get("no_italics"):
-        return [_strip_italics(sub) for sub in subtitles]
+        out = []
+        for sub in subtitles:
+            before = sub.get("text", "")
+            item = _strip_italics(sub)
+            hints = list(sub.get("rule_hints", []))
+            if "<i>" in before and "<i>" not in item.get("text", ""):
+                if "italics_removed" not in hints:
+                    hints.append("italics_removed")
+                item["rule_hints"] = hints
+            out.append(item)
+        return out
 
     result = []
     for sub in subtitles:
@@ -171,6 +181,18 @@ def apply_italics_rules(subtitles: list[dict], platform_key: str) -> list[dict]:
             processed_lines.append(line_result)
 
         item["text"] = "\n".join(processed_lines)
+
+        # Record exactly which italics operation actually happened, so the
+        # track-changes audit trail is truthful.
+        hints = list(sub.get("rule_hints", []))
+        if "<i>" in item["text"] and "<i>" not in text:
+            if "italics_added" not in hints:
+                hints.append("italics_added")
+        if "<i>" in text and "<i>" not in item["text"]:
+            if "italics_removed" not in hints:
+                hints.append("italics_removed")
+        item["rule_hints"] = hints
+
         result.append(item)
 
     return result

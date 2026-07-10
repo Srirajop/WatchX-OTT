@@ -15,7 +15,7 @@ chardet==5.2.0
 mysql-connector-python==8.4.0
 aiofiles==23.2.1
 
-faster-whisper>=1.0.0
+git+https://github.com/m-bain/whisperx.git
 
 # OCR Dependencies (from Claude update)
 pytesseract>=0.3.10

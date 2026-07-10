@@ -2,6 +2,14 @@
 # FastAPI + Groq (LLaMA 3.1 8B Instant) + MySQL
 
 import sys
+import os
+import warnings
+
+# Suppress Hugging Face Symlink warning on Windows and other deprecation/user warnings
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
@@ -11,7 +19,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
-import os, json, io, re
+import json, io, re
 
 from database import init_db, get_all_platforms, save_custom_platform, log_job
 from file_reader import read_file
@@ -19,7 +27,7 @@ from extractor import pre_extract_dialogue
 from cleaner import clean_subtitle_chunk, extract_platform_rules_with_ai
 from quality_checker import check_quality
 from platform_rules import get_platform, get_platform_list
-from timecoded_subtitles import ensure_srt_timings, parse_timecoded_subtitles, prepare_for_platform, subtitles_to_srt
+from timecoded_subtitles import ensure_srt_timings, parse_timecoded_subtitles, prepare_for_platform, subtitles_to_srt, normalize_timecode
 
 load_dotenv()
 
@@ -86,7 +94,7 @@ def chunk_text(text: str, max_chunk_size: int = 7000) -> list[str]:
 @app.post("/clean")
 async def clean_file_endpoint(
     file: UploadFile = File(...),
-    platform: str = Form(default="discovery_max"),
+    platform: str = Form(default="generic"),
     force_ocr: bool = Form(False)
 ):
     import asyncio
@@ -134,8 +142,8 @@ async def clean_file_endpoint(
             fixed_subtitles = prepare_for_platform(fixed_subtitles, platform, filename)
             for s_idx, sub in enumerate(fixed_subtitles, start=1):
                 sub["id"] = s_idx
-                sub["start_time"] = normalize_tc(sub.get("start_time", ""))
-                sub["end_time"] = normalize_tc(sub.get("end_time", ""))
+                sub["start_time"] = normalize_timecode(sub.get("start_time", ""))
+                sub["end_time"] = normalize_timecode(sub.get("end_time", ""))
 
             total_lines = len(fixed_subtitles)
             flagged_lines = sum(1 for s in fixed_subtitles if s.get("flagged"))
@@ -302,7 +310,7 @@ async def clean_file_endpoint(
 @app.post("/extract")
 async def extract_file_endpoint(
     file: UploadFile = File(...),
-    platform: str = Form(default="discovery_max"),
+    platform: str = Form(default="generic"),
     force_ocr: bool = Form(False)
 ):
     ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",".pmw",
@@ -511,12 +519,115 @@ async def export_pdf(data: dict):
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.pdf"})
 
+
+@app.post("/export/vtt")
+async def export_vtt(data: dict):
+    subtitles = data.get("subtitles", [])
+    filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
+    
+    blocks = ["WEBVTT\n"]
+    for i, sub in enumerate(subtitles, start=1):
+        text = (sub.get("text") or "").strip()
+        if not text: continue
+        start = sub.get("start_time", "").replace(",", ".")
+        end = sub.get("end_time", "").replace(",", ".")
+        if not start or not end: continue
+        blocks.append(f"{i}\n{start} --> {end}\n{text}")
+        
+    content = "\n\n".join(blocks)
+    buf = io.BytesIO(content.encode("utf-8"))
+    return StreamingResponse(buf, media_type="text/vtt",
+        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.vtt"})
+
+
+@app.post("/export/ttml")
+async def export_ttml(data: dict):
+    subtitles = data.get("subtitles", [])
+    filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
+    import xml.sax.saxutils as saxutils
+    
+    lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<tt xmlns="http://www.w3.org/ns/ttml" xmlns:tts="http://www.w3.org/ns/ttml#styling" xml:lang="en">',
+        '  <head>',
+        '    <styling>',
+        '      <style xml:id="defaultStyle" tts:fontFamily="sansSerif" tts:fontSize="12px" tts:textAlign="center" tts:color="white" tts:backgroundColor="transparent"/>',
+        '    </styling>',
+        '    <layout>',
+        '      <region xml:id="bottom" tts:origin="10% 80%" tts:extent="80% 15%"/>',
+        '    </layout>',
+        '  </head>',
+        '  <body>',
+        '    <div style="defaultStyle">'
+    ]
+    
+    for i, sub in enumerate(subtitles, start=1):
+        text = (sub.get("text") or "").strip()
+        if not text: continue
+        start = sub.get("start_time", "").replace(",", ".")
+        end = sub.get("end_time", "").replace(",", ".")
+        if not start or not end: continue
+        
+        safe_text = saxutils.escape(text).replace("\n", "<br/>")
+        lines.append(f'      <p xml:id="subtitle{i}" begin="{start}" end="{end}" region="bottom">{safe_text}</p>')
+        
+    lines.extend([
+        '    </div>',
+        '  </body>',
+        '</tt>'
+    ])
+    
+    content = "\n".join(lines)
+    buf = io.BytesIO(content.encode("utf-8"))
+    return StreamingResponse(buf, media_type="application/ttml+xml",
+        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.ttml"})
+
+
+@app.post("/export/csv")
+async def export_csv(data: dict):
+    import csv, io
+    subtitles = data.get("subtitles", [])
+    filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Start Time", "End Time", "Text"])
+    
+    for i, sub in enumerate(subtitles, start=1):
+        writer.writerow([i, sub.get("start_time", ""), sub.get("end_time", ""), sub.get("text", "")])
+        
+    buf = io.BytesIO(output.getvalue().encode("utf-8"))
+    return StreamingResponse(buf, media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.csv"})
+
+
+@app.post("/export/rtf")
+async def export_rtf(data: dict):
+    subtitles = data.get("subtitles", [])
+    filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
+    
+    lines = [r"{\rtf1\ansi\ansicpg1252\deff0\nouicompat\deflang1033{\fonttbl{\f0\fnil\fcharset0 Calibri;}}"]
+    for sub in subtitles:
+        text = (sub.get("text") or "").strip()
+        if not text: continue
+        safe_text = text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\line ")
+        lines.append(f"{safe_text}\\par\\par")
+    lines.append("}")
+    
+    content = "\n".join(lines)
+    buf = io.BytesIO(content.encode("utf-8"))
+    return StreamingResponse(buf, media_type="application/rtf",
+        headers={"Content-Disposition": f"attachment; filename={filename}_cleaned.rtf"})
+
+
+
 @app.post("/track-changes")
 async def get_track_changes(data: dict):
     """
-    Returns track-changes data as JSON for on-screen rendering —
-    same comparison logic the PDF export uses, but for display in the UI first.
-    The user can review this on screen, then download the PDF report separately.
+    Returns track-changes data as JSON for on-screen rendering.
+    Groups subtitle lines that share the same original_text (i.e. lines produced
+    by splitting one long paragraph) so each unique source paragraph is shown
+    only once, with all its cleaned output lines merged together.
     """
     from quality_checker import deduce_change_rules
 
@@ -525,34 +636,63 @@ async def get_track_changes(data: dict):
     platform_dict = get_platform(platform_key)
     plat_rules = platform_dict.get("rules", [])
 
-    changes = []
-    unchanged_count = 0
+    # ── Group by original_text to avoid showing the same paragraph N times ──
+    # Key = original_text, value = { ids, cleaned_lines, rule_hints merged }
+    seen_originals: dict = {}   # orig_text -> group dict
+    group_order = []            # insertion order
+    total_lines = 0
 
     for sub in subtitles:
         text = sub.get("text", "").strip()
         orig_text = sub.get("original_text", "").strip()
-
         if not text and not orig_text:
             continue
+        total_lines += 1
+        if orig_text not in seen_originals:
+            seen_originals[orig_text] = {
+                "ids": [],
+                "original_text": orig_text,
+                "cleaned_lines": [],
+                "rule_hints": list(sub.get("rule_hints", [])),
+                "flagged": sub.get("flagged", False),
+                "flag_reason": sub.get("flag_reason", ""),
+            }
+            group_order.append(orig_text)
+        g = seen_originals[orig_text]
+        g["ids"].append(sub.get("id"))
+        if text and text not in g["cleaned_lines"]:
+            g["cleaned_lines"].append(text)
+        for h in sub.get("rule_hints", []):
+            if h not in g["rule_hints"]:
+                g["rule_hints"].append(h)
+        if sub.get("flagged"):
+            g["flagged"] = True
 
-        applied_rules = deduce_change_rules(orig_text, text, plat_rules, sub.get("rule_hints", []))
+    changes = []
+    unchanged_count = 0
+
+    for orig_text in group_order:
+        g = seen_originals[orig_text]
+        new_text = "\n".join(g["cleaned_lines"])
+        applied_rules = deduce_change_rules(orig_text, new_text, plat_rules, g["rule_hints"])
 
         if not applied_rules:
-            unchanged_count += 1
+            unchanged_count += len(g["ids"])
             continue
 
         changes.append({
-            "id": sub.get("id"),
+            "id": g["ids"][0],
+            "ids": g["ids"],
             "original_text": orig_text,
-            "new_text": text,
+            "new_text": new_text,
             "rules_applied": applied_rules,
-            "flagged": sub.get("flagged", False),
-            "flag_reason": sub.get("flag_reason", "")
+            "flagged": g["flagged"],
+            "flag_reason": g["flag_reason"],
         })
 
     return {
         "changes": changes,
-        "total_lines": len(subtitles),
+        "total_lines": total_lines,
         "changed_lines": len(changes),
         "unchanged_lines": unchanged_count,
         "platform": platform_dict.get("name", platform_key)
@@ -561,92 +701,137 @@ async def get_track_changes(data: dict):
 
 @app.post("/export/track-changes-pdf")
 async def export_track_changes_pdf(data: dict):
-    """Export track changes as a PDF, showing original and new text side by side or top to bottom."""
+    """
+    Export track changes as a compact PDF.
+    FAST PATH: if the caller sends a pre-computed 'changes' list (already built
+    by /track-changes), we skip all regex recomputation and go straight to PDF.
+    SLOW PATH (fallback): build changes from raw subtitles (old behaviour).
+    """
     from reportlab.lib.pagesizes import letter
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.platypus import SimpleDocTemplate, Paragraph
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.enums import TA_LEFT
     from reportlab.lib.units import inch
     from reportlab.lib import colors
-    from platform_rules import get_platform
-    from quality_checker import deduce_change_rules
     import html
     import re
 
-    subtitles = data.get("subtitles", [])
     filename = data.get("filename", "cleaned").rsplit(".", 1)[0]
     platform_key = data.get("platform_key", "generic")
-    
     platform_dict = get_platform(platform_key)
-    plat_rules = platform_dict.get("rules", [])
 
+    # ── Determine source of changes ──────────────────────────────────────────
+    precomputed = data.get("changes")          # list of change dicts from /track-changes
+    total_lines = data.get("total_lines", 0)
+    unchanged_count = data.get("unchanged_lines", 0)
+
+    if precomputed is None:
+        # Slow-path fallback: recompute from raw subtitles
+        from quality_checker import deduce_change_rules
+        subtitles = data.get("subtitles", [])
+        plat_rules = platform_dict.get("rules", [])
+        seen_originals: dict = {}
+        group_order = []
+        total_lines = 0
+        for sub in subtitles:
+            text = sub.get("text", "").strip()
+            orig_text = sub.get("original_text", "").strip()
+            if not text and not orig_text:
+                continue
+            total_lines += 1
+            if orig_text not in seen_originals:
+                seen_originals[orig_text] = {
+                    "ids": [], "original_text": orig_text,
+                    "cleaned_lines": [], "rule_hints": list(sub.get("rule_hints", [])),
+                }
+                group_order.append(orig_text)
+            g = seen_originals[orig_text]
+            g["ids"].append(sub.get("id"))
+            if text and text not in g["cleaned_lines"]:
+                g["cleaned_lines"].append(text)
+            for h in sub.get("rule_hints", []):
+                if h not in g["rule_hints"]:
+                    g["rule_hints"].append(h)
+        precomputed = []
+        for orig_text in group_order:
+            g = seen_originals[orig_text]
+            new_text = "\n".join(g["cleaned_lines"])
+            rules = deduce_change_rules(orig_text, new_text, plat_rules, g["rule_hints"])
+            if rules:
+                precomputed.append({
+                    "id": g["ids"][0], "ids": g["ids"],
+                    "original_text": orig_text, "new_text": new_text,
+                    "rules_applied": rules,
+                })
+        unchanged_count = total_lines - len(precomputed)
+
+    # ── Build PDF ─────────────────────────────────────────────────────────────
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=letter,
         leftMargin=1 * inch, rightMargin=1 * inch,
-        topMargin=1 * inch, bottomMargin=1 * inch
+        topMargin=0.75 * inch, bottomMargin=0.75 * inch
     )
     styles = getSampleStyleSheet()
-    
-    # Custom styles
+
     original_style = ParagraphStyle(
-        "OriginalText",
-        parent=styles["Normal"],
-        alignment=TA_LEFT,
-        fontSize=10,
-        textColor=colors.HexColor("#d97706"),  # orange-ish
-        spaceAfter=4,
+        "OriginalText", parent=styles["Normal"],
+        alignment=TA_LEFT, fontSize=10,
+        textColor=colors.HexColor("#d97706"), spaceAfter=3,
     )
     new_style = ParagraphStyle(
-        "NewText",
-        parent=styles["Normal"],
-        alignment=TA_LEFT,
-        fontSize=11,
-        textColor=colors.HexColor("#059669"),  # green-ish
-        spaceAfter=4,
+        "NewText", parent=styles["Normal"],
+        alignment=TA_LEFT, fontSize=10,
+        textColor=colors.HexColor("#059669"), spaceAfter=3,
     )
     rule_style = ParagraphStyle(
-        "RuleText",
-        parent=styles["Normal"],
-        alignment=TA_LEFT,
-        fontSize=9,
-        textColor=colors.HexColor("#64748b"),  # slate gray
-        spaceAfter=12,
-        leftIndent=10,
+        "RuleText", parent=styles["Normal"],
+        alignment=TA_LEFT, fontSize=8.5,
+        textColor=colors.HexColor("#64748b"),
+        spaceAfter=10, leftIndent=10,
+    )
+    title_style = ParagraphStyle(
+        "TitleStyle", parent=styles["Heading1"],
+        alignment=TA_LEFT, spaceAfter=4, fontSize=14,
+    )
+    summary_style = ParagraphStyle(
+        "SummaryStyle", parent=styles["Normal"],
+        alignment=TA_LEFT, fontSize=10,
+        textColor=colors.HexColor("#374151"), spaceAfter=14,
     )
 
     Story = []
-    
-    # Title
-    title_style = ParagraphStyle("TitleStyle", parent=styles["Heading1"], alignment=TA_LEFT, spaceAfter=16)
     Story.append(Paragraph(f"Track Changes: {filename}", title_style))
-    Story.append(Spacer(1, 12))
+    Story.append(Paragraph(
+        f"Platform: <b>{platform_dict.get('name', platform_key)}</b> &nbsp;|&nbsp; "
+        f"Total lines: <b>{total_lines}</b> &nbsp;|&nbsp; "
+        f"Changed: <b>{len(precomputed)}</b> &nbsp;|&nbsp; "
+        f"Unchanged: <b>{unchanged_count}</b>",
+        summary_style
+    ))
 
-    for sub in subtitles:
-        text = sub.get("text", "").strip()
-        orig_text = sub.get("original_text", "").strip()
-        
-        if not text and not orig_text:
-            continue
-            
-        # Same logic the on-screen Track Changes view uses — kept identical on purpose
-        applied_rules = deduce_change_rules(orig_text, text, plat_rules, sub.get("rule_hints", []))
-            
-        # Remove control characters
-        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
-        orig_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', orig_text)
-        
-        text_safe = html.escape(text).replace("\n", "<br/>")
-        orig_safe = html.escape(orig_text).replace("\n", "<br/>")
+    if not precomputed:
+        Story.append(Paragraph(
+            "&#10003; No changes were applied — the script was already clean.",
+            summary_style
+        ))
+    else:
+        ctrl = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+        for entry in precomputed:
+            orig_text = ctrl.sub('', entry.get("original_text", ""))
+            new_text  = ctrl.sub('', entry.get("new_text", ""))
+            applied_rules = entry.get("rules_applied", [])
+            sub_id = entry.get("id", "")
+            ids = entry.get("ids", [sub_id])
+            id_label = f"#{ids[0]}" if len(ids) == 1 else f"#{ids[0]}–#{ids[-1]}"
 
-        Story.append(Paragraph(f"<b>Previously:</b> {orig_safe}", original_style))
-        Story.append(Paragraph(f"<b>Cleaned:</b> {text_safe}", new_style))
-        
-        if applied_rules:
+            orig_safe = html.escape(orig_text).replace("\n", "<br/>")
+            new_safe  = html.escape(new_text).replace("\n", "<br/>")
+
+            Story.append(Paragraph(f"<b>{id_label} Previously:</b> {orig_safe}", original_style))
+            Story.append(Paragraph(f"<b>Cleaned:</b> {new_safe}", new_style))
             rules_html = "<b>Rules Applied:</b><br/>" + "<br/>".join(f"• {r}" for r in applied_rules)
             Story.append(Paragraph(rules_html, rule_style))
-        else:
-            Story.append(Spacer(1, 8))
 
     doc.build(Story)
     buf.seek(0)
@@ -733,11 +918,12 @@ async def adjust_timecodes_endpoint(data: dict):
 @app.get("/platforms")
 def get_platforms():
     try:
-        platforms = get_all_platforms()
-        return {"platforms": platforms}
-    except:
-        # Fallback to static list if DB not ready
-        return {"platforms": {p["key"]: p for p in get_platform_list()}}
+        # Serve only custom DB platforms — no built-in hardcoded OTTs
+        db_platforms = get_all_platforms()
+        return {"platforms": db_platforms}
+    except Exception:
+        # DB not ready — return empty so UI prompts user to add guidelines
+        return {"platforms": {}}
 
 
 
@@ -1204,7 +1390,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     filename = file.filename or "audio.webm"
     
-    # Save the uploaded file to a temporary location for faster-whisper
+    # Save the uploaded file to a temporary location for whisperX
     with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
         content = await file.read()
         tmp.write(content)
@@ -1218,33 +1404,57 @@ async def transcribe_audio(file: UploadFile = File(...)):
         
         def worker():
             try:
-                from faster_whisper import WhisperModel
-                q.put({"type": "status", "message": "Loading AI model into memory (might download on first run)...", "progress": 5})
-                # "base" provides a great balance of speed and accuracy for local CPUs.
-                model = WhisperModel("base", device="cpu", compute_type="int8")
-                
-                q.put({"type": "status", "message": "Analyzing audio stream...", "progress": 10})
-                segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False)
-                
-                duration = info.duration
+                import whisperx
+                q.put({"type": "status", "message": "Loading WhisperX model (small)...", "progress": 5})
+                device = "cpu"
+                compute_type = "int8"
+                # Use 'small' model — significantly better accuracy than 'base' with acceptable CPU speed
+                model = whisperx.load_model("small", device, compute_type=compute_type)
+
+                q.put({"type": "status", "message": "Analyzing audio...", "progress": 10})
+                audio = whisperx.load_audio(tmp_path)
+                # WhisperX does VAD internally via load_model (no vad_filter argument in transcribe)
+                result = model.transcribe(audio, batch_size=4)
+
+                q.put({"type": "status", "message": "Running forced alignment for frame-accurate timecodes...", "progress": 55})
+                try:
+                    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
+                    result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
+                except Exception as align_err:
+                    print(f"[WhisperX] Alignment step failed ({align_err}), using raw Whisper timestamps")
+
+                duration = len(audio) / 16000.0
                 if duration <= 0: duration = 1.0
-                
-                q.put({"type": "status", "message": "Transcribing audio...", "progress": 15})
-                
+
+                q.put({"type": "status", "message": "Finalizing transcripts...", "progress": 92})
                 subs = []
-                for i, segment in enumerate(segments, start=1):
+                for i, segment in enumerate(result["segments"], start=1):
                     subs.append({
                         "id": i,
-                        "start_time": _from_seconds(segment.start),
-                        "end_time": _from_seconds(segment.end),
-                        "text": segment.text.strip(),
+                        "start_time": _from_seconds(float(segment.get("start", 0.0))),
+                        "end_time": _from_seconds(float(segment.get("end", 0.0))),
+                        "text": segment.get("text", "").strip(),
                         "flagged": False,
                         "flag_reason": ""
                     })
-                    pct = min(95, int(15 + (segment.end / duration) * 80))
-                    q.put({"type": "status", "message": f"Transcribing... ({int(segment.end)}s / {int(duration)}s)", "progress": pct})
-                    
                 q.put({"type": "done", "subtitles": subs})
+
+            except ImportError:
+                # Fallback to faster-whisper if whisperx is unavailable
+                try:
+                    from faster_whisper import WhisperModel
+                    q.put({"type": "status", "message": "Loading fallback Whisper model...", "progress": 5})
+                    model = WhisperModel("small", device="cpu", compute_type="int8")
+                    q.put({"type": "status", "message": "Transcribing...", "progress": 15})
+                    segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False, vad_filter=True)
+                    subs = []
+                    for i, seg in enumerate(segments, start=1):
+                        subs.append({"id": i, "start_time": _from_seconds(seg.start),
+                                     "end_time": _from_seconds(seg.end),
+                                     "text": seg.text.strip(), "flagged": False, "flag_reason": ""})
+                    q.put({"type": "done", "subtitles": subs})
+                except Exception as fb_err:
+                    q.put({"type": "error", "error": str(fb_err)})
             except Exception as e:
                 q.put({"type": "error", "error": str(e)})
 
@@ -1343,43 +1553,67 @@ async def transcribe_and_align_endpoint(
         
         def worker():
             try:
-                from faster_whisper import WhisperModel
-                q.put({"type": "status", "message": "Loading AI model into memory...", "progress": 5})
-                model = WhisperModel("base", device="cpu", compute_type="int8")
-                
-                q.put({"type": "status", "message": "Analyzing audio stream...", "progress": 10})
-                segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False)
-                
-                duration = info.duration
+                import whisperx
+                q.put({"type": "status", "message": "Loading WhisperX model (small)...", "progress": 5})
+                device = "cpu"
+                compute_type = "int8"
+                model = whisperx.load_model("small", device, compute_type=compute_type)
+
+                q.put({"type": "status", "message": "Analyzing audio...", "progress": 10})
+                audio = whisperx.load_audio(tmp_path)
+                result = model.transcribe(audio, batch_size=4)
+
+                q.put({"type": "status", "message": "Running forced alignment for frame-accurate timecodes...", "progress": 55})
+                try:
+                    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
+                    result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
+                except Exception as align_err:
+                    print(f"[WhisperX] Alignment step failed ({align_err}), using raw Whisper timestamps")
+
+                duration = len(audio) / 16000.0
                 if duration <= 0: duration = 1.0
-                
-                q.put({"type": "status", "message": "Transcribing audio...", "progress": 15})
-                
+
+                q.put({"type": "status", "message": "Finalizing transcripts...", "progress": 92})
                 whisper_subs = []
-                for i, segment in enumerate(segments, start=1):
+                for i, segment in enumerate(result["segments"], start=1):
                     whisper_subs.append({
                         "id": i,
-                        "start_time": _from_seconds(segment.start),
-                        "end_time": _from_seconds(segment.end),
-                        "text": segment.text.strip(),
+                        "start_time": _from_seconds(float(segment.get("start", 0.0))),
+                        "end_time": _from_seconds(float(segment.get("end", 0.0))),
+                        "text": segment.get("text", "").strip(),
                         "flagged": False,
                         "flag_reason": ""
                     })
-                    pct = min(90, int(15 + (segment.end / duration) * 75))
-                    q.put({"type": "status", "message": f"Transcribing... ({int(segment.end)}s / {int(duration)}s)", "progress": pct})
-                    
-                if script_subs:
-                    q.put({"type": "status", "message": "Aligning timecodes to script...", "progress": 95})
-                    final_subs = align_transcription_to_script(whisper_subs, script_subs)
-                else:
-                    final_subs = whisper_subs
-                    
-                q.put({"type": "done", "subtitles": final_subs})
+
+            except ImportError:
+                # Fallback to faster-whisper if whisperx is unavailable
+                try:
+                    from faster_whisper import WhisperModel
+                    q.put({"type": "status", "message": "Loading fallback Whisper model...", "progress": 5})
+                    model = WhisperModel("small", device="cpu", compute_type="int8")
+                    q.put({"type": "status", "message": "Transcribing (fallback)...", "progress": 15})
+                    segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False, vad_filter=True)
+                    duration = info.duration or 1.0
+                    whisper_subs = []
+                    for i, seg in enumerate(segments, start=1):
+                        whisper_subs.append({"id": i, "start_time": _from_seconds(seg.start),
+                                             "end_time": _from_seconds(seg.end),
+                                             "text": seg.text.strip(), "flagged": False, "flag_reason": ""})
+                except Exception as fb_err:
+                    q.put({"type": "error", "error": str(fb_err)})
+                    return
             except Exception as e:
-                err_msg = str(e)
-                if "tuple index out of range" in err_msg:
-                    err_msg = "Could not extract audio from the uploaded file. It might be a video with no audio track, or an unsupported codec."
-                q.put({"type": "error", "error": err_msg})
+                q.put({"type": "error", "error": str(e)})
+                return
+
+            # Reached only if transcription succeeded
+            if script_subs:
+                q.put({"type": "status", "message": "Aligning timecodes to script...", "progress": 95})
+                final_subs = align_transcription_to_script(whisper_subs, script_subs)
+            else:
+                final_subs = whisper_subs
+
+            q.put({"type": "done", "subtitles": final_subs})
 
         thread = threading.Thread(target=worker)
         thread.start()

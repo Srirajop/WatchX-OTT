@@ -136,7 +136,7 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
     # word to a set below, not writing a new parser branch.
     _COL_SYNONYMS = {
         "time_single": {
-            "timecode", "time", "tc", "timein", "time(hh:mm:ss:ff)",
+            "timecode", "timecodes", "time", "tc", "timein", "time(hh:mm:ss:ff)",
         },
         "time_start": {
             "timein", "time in", "in", "shtimein", "startcode", "start",
@@ -216,53 +216,70 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
 
         if "start" in col_map and "dialogue" in col_map:
             has_end_col = "end" in col_map
+
+            # Accumulate each cue's dialogue across its pipe-line AND any
+            # continuation lines, then clean + flush when the next
+            # timecode appears.  (Defering avoids the bug where a
+            # cue whose pipe-line is only a speaker label gets
+            # dropped, orphaning the rest of its dialogue.)
+            def _flush_cue(cur):
+                if not cur:
+                    return
+                start_raw = cur["start"]
+                if not _ANY_TC.match(start_raw.strip()):
+                    return
+                end_raw = cur.get("end", "")
+                has_end_this = cur.get("has_end", has_end_col)
+                dialogue_raw = cur["text"].strip()
+                if not dialogue_raw:
+                    return
+                dialogue_text = _strip_speaker_label(dialogue_raw)
+                dialogue_text = _clean_text(dialogue_text)
+                if not dialogue_text:
+                    return
+                start_tc = normalize_timecode(start_raw.strip())
+                end_tc = normalize_timecode(end_raw) if has_end_this else None
+                if has_end_col:
+                    table_entries_found.append(_entry(start_tc, end_tc or start_tc, dialogue_text))
+                else:
+                    table_entries_found.append({"start_time": start_tc, "text": dialogue_text})
+
+            cur = None
             for line in all_lines_list[header_idx + 1:]:
                 if not line or line.startswith('===') or '|' not in line:
+                    # Continuation of the current cue's dialogue.
+                    if cur is not None:
+                        cur["text"] += "\n" + line.strip()
                     continue
                 cells = [c.strip() for c in line.split('|')]
                 needed_idx = [col_map['start'], col_map['dialogue']] + ([col_map['end']] if has_end_col else [])
                 if len(cells) <= max(needed_idx):
+                    # Not a usable timecode row — treat as continuation.
+                    if cur is not None:
+                        cur["text"] += "\n" + line.strip()
                     continue
-
+                # New timecode row: flush the previous cue first.
+                _flush_cue(cur)
                 start_raw = cells[col_map['start']]
                 if not _ANY_TC.match(start_raw.strip()):
-                    continue  # row has no timecode of its own — skip rather than guess
-
-                # Dialogue comes ONLY from the classified dialogue column —
-                # this is the actual bug fix: never fall back to a
-                # non_dialogue (VISUALS/SCENE) column just because dialogue
-                # is empty on this particular row. An empty dialogue cell
-                # correctly means "no subtitle for this row", not "borrow
-                # the visual description instead".
-                dialogue_raw = cells[col_map['dialogue']].strip()
-                if not dialogue_raw:
+                    cur = None
                     continue
-
                 end_raw = cells[col_map['end']].strip() if has_end_col else ""
+                has_end_this = has_end_col
                 if has_end_col and not _ANY_TC.match(end_raw):
-                    has_end_col_this_row = False
-                else:
-                    has_end_col_this_row = has_end_col
-
-                # Convert **text** bold markers to <b>text</b>
+                    has_end_this = False
+                # Convert **text** / *text* markers now so later
+                # continuation lines also keep them intact.
+                dialogue_raw = cells[col_map['dialogue']].strip()
                 dialogue_raw = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', dialogue_raw)
-                # Convert *text* italic markers to <i>text</i>
                 dialogue_raw = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', dialogue_raw)
-
-                start_tc = normalize_timecode(start_raw.strip())
-                end_tc = normalize_timecode(end_raw) if has_end_col_this_row else None
-                dialogue_text = _strip_speaker_label(dialogue_raw.strip())
-                dialogue_text = _clean_text(dialogue_text)
-                if dialogue_text:
-                    # No end column in this format (single-timecode-per-row
-                    # tables like TIME CODE | VISUALS | AUDIO) — end gets
-                    # filled in by ensure_srt_timings()/prepare_for_platform()
-                    # from the next row's start time, same pattern already
-                    # used for the no-table single-timecode case below.
-                    if has_end_col:
-                        table_entries_found.append(_entry(start_tc, end_tc or start_tc, dialogue_text))
-                    else:
-                        table_entries_found.append({"start_time": start_tc, "text": dialogue_text})
+                cur = {
+                    "start": start_raw,
+                    "end": end_raw,
+                    "has_end": has_end_this,
+                    "text": dialogue_raw,
+                }
+            _flush_cue(cur)
 
         if table_entries_found:
             if "end" not in col_map:
@@ -352,7 +369,80 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
 
     if entries:
         return _renumber(entries)
-    
+
+    # ── Flat-Column Script Parser ───────────────────────────────────────────
+    # Handles PDFs like Tiny Toons (Deluxe As-Broadcast) where TIMECODE,
+    # CHARACTER NAME, and DIALOGUE are on SEPARATE consecutive lines:
+    #   01:00:07:06
+    #   BUSTER
+    #   (singing) We're tiny
+    #   01:00:08:01
+    #   BABS
+    #   We're toony
+    # The parser walks forward, identifies standalone timecode lines, skips
+    # ALL-CAPS speaker-label lines & page-header noise, then accumulates
+    # dialogue lines until the next timecode or page break appears.
+    _STANDALONE_TC = re.compile(
+        r"^\d{1,2}[:.]?\d{2}[:.]?\d{2}(?:[:.,;]\d{1,3})?\s*$"
+    )
+    _ALLCAPS_LABEL = re.compile(
+        r"^[A-Z][A-Z0-9 .,\-'/()\[\]&]{0,60}$"
+    )
+    _PAGE_HEADER = re.compile(
+        r"^(Page\s+\d+|=== PAGE|\d{1,3}/\d{1,3}|Prepared\s+by:|Deluxe|As-Broadcast\s+Script)",
+        re.IGNORECASE
+    )
+    # Parenthetical content that should be skipped entirely (slang notes, translators' annotations)
+    _ANNOTATION = re.compile(
+        r"^\((?:[^)]{0,120}=\s*[^)]{0,120}|reference to|note\s+(?:slant|rhyme)|a fictional|blend of|short for|crazy or)\)",
+        re.IGNORECASE
+    )
+    # Must have at least N timecodes that look frame-accurate (HH:MM:SS:FF) to
+    # apply this parser — prevents false-positive on ordinary plain scripts.
+    _FRAME_TC_LINE = re.compile(r"^\d{1,2}:\d{2}:\d{2}[:;]\d{1,2}\s*$")
+    frame_tc_count = sum(1 for l in text.splitlines() if _FRAME_TC_LINE.match(l.strip()))
+
+    if frame_tc_count >= 5:
+        flat_rows = []
+        current_tc = None
+        dialogue_buf = []
+
+        def _flush_flat():
+            if current_tc and dialogue_buf:
+                txt = " ".join(dialogue_buf).strip()
+                txt = _clean_text(txt)
+                if txt:
+                    flat_rows.append({"start_time": normalize_timecode(current_tc), "text": txt})
+
+        all_lines = text.splitlines()
+        i = 0
+        while i < len(all_lines):
+            line = all_lines[i].strip()
+            i += 1
+            if not line or _PAGE_HEADER.match(line):
+                continue
+            if _STANDALONE_TC.match(line):
+                _flush_flat()
+                current_tc = line.strip()
+                dialogue_buf = []
+                continue
+            # Skip ALL-CAPS character labels (speaker names, scene headers, etc.)
+            if current_tc and _ALLCAPS_LABEL.match(line) and line.upper() == line:
+                continue
+            # Skip translator annotations and slang notes
+            if _ANNOTATION.match(line):
+                continue
+            # Skip bare parentheticals that are stage directions or notes
+            if re.match(r"^\([^)]{3,120}\)$", line):
+                continue
+            if current_tc:
+                dialogue_buf.append(line)
+
+        _flush_flat()
+
+        if flat_rows:
+            return _entries_from_start_times(flat_rows)
+
     return []
 
 
