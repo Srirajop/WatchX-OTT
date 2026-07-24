@@ -16,6 +16,19 @@ _LEADING_TIMECODE = re.compile(r"^(?P<start>\d{1,2}[:.]\d{2}[:.]\d{2}[,.:;]?\d{0
 _FPS = 25
 
 
+def _format_hms_ms(h: int, m: int, s: int, ms: int) -> str:
+    if ms >= 1000:
+        extra_s, ms = divmod(ms, 1000)
+        s += extra_s
+    if s >= 60:
+        extra_m, s = divmod(s, 60)
+        m += extra_m
+    if m >= 60:
+        extra_h, m = divmod(m, 60)
+        h += extra_h
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 def normalize_timecode(value: str) -> str:
     """Normalize common subtitle timecodes to SRT HH:MM:SS,mmm."""
     if not value:
@@ -27,38 +40,38 @@ def normalize_timecode(value: str) -> str:
     if _SRT_TC.match(tc):
         h, m, rest = tc.replace(".", ",").split(":")
         s, ms = rest.split(",")
-        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{ms[:3].ljust(3, '0')}"
+        return _format_hms_ms(int(h), int(m), int(s), int(ms[:3].ljust(3, '0')))
 
     if _FRAME_TC.match(tc):
         h, m, s, frames = re.split(r"[:;]", tc)
         ms = round(int(frames) * 1000 / 25)
-        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{ms:03d}"
+        return _format_hms_ms(int(h), int(m), int(s), ms)
 
     # Permissive frame TC: handles single-digit MM/SS (e.g. 1:1:48:5)
     lm = _FRAME_TC_LOOSE.match(tc)
     if lm:
         h, m, s, frames = lm.groups()
         ms = round(int(frames) * 1000 / 25)
-        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{ms:03d}"
+        return _format_hms_ms(int(h), int(m), int(s), ms)
 
     # Handle HH.MM.SS.FF or HH.MM.SS format (dot-separated)
     if re.match(r"^\d{1,2}\.\d{1,2}\.\d{1,2}$", tc):
         parts = tc.split(".")
         h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-        return f"{h:02d}:{m:02d}:{s:02d},000"
+        return _format_hms_ms(h, m, s, 0)
     elif re.match(r"^\d{1,2}\.\d{1,2}\.\d{1,2}[,.:;]\d{1,3}$", tc):
         parts = re.split(r"[,.:;]", tc)
         h, m, s, frames_or_ms = int(parts[0]), int(parts[1]), int(parts[2]), parts[3]
         if len(frames_or_ms) <= 2:  # likely frames
             ms = round(int(frames_or_ms) * 1000 / 25)
-            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+            return _format_hms_ms(h, m, s, ms)
         else:
-            return f"{h:02d}:{m:02d}:{s:02d},{frames_or_ms[:3].ljust(3, '0')}"
+            return _format_hms_ms(h, m, s, int(frames_or_ms[:3].ljust(3, '0')))
 
     basic = re.match(r"^(\d{1,2}):(\d{1,2}):(\d{1,2})$", tc)
     if basic:
         h, m, s = basic.groups()
-        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},000"
+        return _format_hms_ms(int(h), int(m), int(s), 0)
 
     return tc
 
@@ -78,26 +91,29 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
         lines = [line.strip() for line in block.splitlines() if line.strip()]
         if not lines:
             continue
-        if lines[0].isdigit():
-            lines = lines[1:]
         if lines and lines[0].upper().startswith("WEBVTT"):
             lines = lines[1:]
         if not lines:
             continue
 
-        # Check if this block actually contains multiple timing lines
-        arrow_count = sum(1 for line in lines if "-->" in line)
-        if arrow_count > 1:
-            entries = []
-            break
+        cur_start, cur_end = None, None
+        cur_text_lines = []
 
-        timing_idx = next((i for i, line in enumerate(lines) if "-->" in line), None)
-        if timing_idx is not None:
-            timing = _ARROW.split(lines[timing_idx], maxsplit=1)
-            if len(timing) == 2:
-                text_lines = lines[timing_idx + 1:]
-                if text_lines:
-                    entries.append(_entry(timing[0], timing[1], "\n".join(text_lines)))
+        for line in lines:
+            if line.isdigit() and not cur_start:
+                continue
+            if "-->" in line:
+                if cur_start and cur_text_lines:
+                    entries.append(_entry(cur_start, cur_end, "\n".join(cur_text_lines)))
+                    cur_text_lines = []
+                timing = _ARROW.split(line, maxsplit=1)
+                if len(timing) == 2:
+                    cur_start, cur_end = timing[0].strip(), timing[1].strip()
+            elif cur_start:
+                cur_text_lines.append(line)
+
+        if cur_start and cur_text_lines:
+            entries.append(_entry(cur_start, cur_end, "\n".join(cur_text_lines)))
 
     if entries:
         return _renumber(entries)
@@ -151,7 +167,7 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
         "dialogue": {
             "titles", "title", "subtitle", "subtitles", "dialogue", "dialog",
             "audio", "narration", "narrator", "voiceover", "vo", "speech",
-            "text",
+            "text", "spoken", "english", "transcript", "translation",
         },
         # Columns whose text is NEVER spoken dialogue, even when the
         # dialogue/audio column is empty for that row. This is the exact
@@ -162,6 +178,7 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
             "visuals", "visual", "video", "scenedescription", "scene",
             "shotdescription", "shot", "graphics", "screenshot", "image",
             "notes", "comment", "comments", "sh#", "sh", "shot#",
+            "actuality", "action", "onscreen", "on screen",
         },
     }
 
@@ -461,9 +478,13 @@ def subtitles_to_srt(subtitles: list[dict]) -> str:
     return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
-def prepare_for_platform(subtitles: list[dict], platform_key: str, filename: str = "") -> list[dict]:
+def prepare_for_platform(subtitles: list[dict], platform_key: str | dict, filename: str = "") -> list[dict]:
     """Apply deterministic platform delivery rules that do not require rewriting timings by AI."""
-    platform = get_platform(platform_key)
+    if isinstance(platform_key, dict):
+        platform = platform_key
+    else:
+        platform = get_platform(platform_key)
+        
     min_duration = float(platform.get("min_duration_seconds", 1.0))
     max_duration = float(platform.get("max_duration_seconds", 7.0))
     min_gap = float(platform.get("min_interval_seconds", 0.02))
@@ -554,6 +575,10 @@ def clean_delivery_text(text: str) -> str:
     text = text.replace('__BOLD_OPEN__', '<b>')
     text = text.replace('__BOLD_CLOSE__', '</b>')
 
+    # ── 5. Strip speaker prefix WITH colon/dash across the whole text block first ──
+    # Handles cells where the label is on line 1 and dialogue on line 2
+    text = re.sub(r"^[A-Z][A-Z0-9 .'\-/()#&,]{0,60}[:\-]\s*", "", text.lstrip())
+
     # Split text into lines for per-line processing
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     cleaned_lines = []
@@ -590,12 +615,6 @@ def clean_delivery_text(text: str) -> str:
         if not has_music and stripped_for_check.isupper() and 0 < len(stripped_for_check) <= 40:
             if not re.search(r"[!?]", line) and not re.search(r'[a-z]', line):
                 continue  # pure speaker label — drop it
-
-        # Strip speaker prefix WITH colon or dash separator (e.g. "DAVID: Hello" / "DAVID - Hello")
-        # Only strip if the RESULT is not empty
-        stripped_speaker = re.sub(r"^[A-Z][A-Z0-9 .'\-/()#&,]{0,60}[:\-]\s*", "", line)
-        if stripped_speaker.strip():   # don't blank out the whole line
-            line = stripped_speaker
 
         # Strip speaker prefix WITHOUT colon/dash — ALL-CAPS word(s) followed by mixed-case dialogue
         # e.g. "LILA I thought he seemed sad." → "I thought he seemed sad."
@@ -797,10 +816,60 @@ def _looks_like_zero_subtitle(text: str) -> bool:
 
 
 def _show_name_from_filename(filename: str) -> str:
+    """
+    Produce a clean human-readable show title from a delivery filename.
+
+    Real-world filenames contain internal job numbers, vendor codes, dates,
+    and episode identifiers that must be stripped:
+      FoodFactoryS2_EpTheNamesBoondi_NGCP_YA90027775_1159556_111620_BMSub (2).docx
+      COYOTE_102_TV_As-Broadcast_Dialogue_List.docx
+      EVIL_0405_FINAL_TC_IYUNO SDI.srt
+      DrPimplePopperPopUPS_EpPopUPSAnAmericanTail_DCP_DFA316439_1153011_102920.doc
+      FBoyIsland_S3EP06_InternationalScript.docx
+      CAR SOS 2023 COMPS - UNSEEN - FINAL SCRIPT RD503340.docx
+      HouseHuntersInternationalS120_EpLiving...
+    """
+    # Remove file extension
     name = (filename or "PROGRAM").rsplit(".", 1)[0]
+
+    # ── Pass 1: strip while underscores still act as word boundaries ──────
+    # Season/episode codes glued directly to show name: HouseHuntersS120, FoodFactoryS2
+    name = re.sub(r'S\d{1,3}(?:EP\d+|E\d+)?(?=[A-Z_\-]|$)', ' ', name)
+    # Episode tags: _Ep... or -Ep...
+    name = re.sub(r'[_\-]Ep[A-Za-z0-9]+', ' ', name)
+    # Trailing parenthetical copy numbers: (2), (1)
+    name = re.sub(r'\(\s*\d+\s*\)', ' ', name)
+    # Internal job IDs glued to show name: DFA316439, YA90027775, RD503340
+    name = re.sub(r'[_\-](?:DFA|YA|RD|NGCP|DCP|HGTVP|HGTV|SDI|PAC|IYUNO|BMSUB)\d*', ' ', name, flags=re.IGNORECASE)
+    name = re.sub(r'[_\-]\d{6,}', ' ', name)   # _1159556 _111620
+
+    # ── Pass 2: replace underscores/dashes with spaces ────────────────────
     name = re.sub(r"[_\-]+", " ", name)
+
+    # ── Pass 3: strip vendor/delivery keyword tokens ──────────────────────
+    _VENDOR_TOKENS = re.compile(
+        r'\b(?:BMSUB|CCSL|CDSL|NGCP|DCP|DFA|SDI|PAC|IYUNO|FINAL|UNSEEN|COMPS|'
+        r'HGTVP|HGTV|SU|ENG|CONVERTED|'
+        r'AS\s*BROADCAST|DIALOGUE\s*LIST|INTERNATIONAL\s*SCRIPT|'
+        r'TV|UHD|HD|SD|RD|YA|TC|EP\s*\w+|S\d+E\d+|S\d+EP\d+)\b',
+        re.IGNORECASE
+    )
+    name = _VENDOR_TOKENS.sub(" ", name)
+
+    # ── Pass 4: strip remaining numeric junk ──────────────────────────────
+    # Long numeric job IDs (6+ digits)
+    name = re.sub(r'\b\d{6,}\b', " ", name)
+    # Leftover season codes: standalone S1, S2 etc. after spaces
+    name = re.sub(r'\bS\d{1,3}\b', " ", name)
+    # Internal job IDs: 2-4 uppercase letters followed by 4+ digits
+    name = re.sub(r'\b[A-Z]{1,4}\d{4,}\b', " ", name)
+
+    # ── Final cleanup ──────────────────────────────────────────────────────
     name = re.sub(r"\s+", " ", name).strip()
+    name = name.strip(" .-,()")
+
     return name.upper() or "PROGRAM"
+
 
 
 def _entry(start: str, end: str, text: str) -> dict:
@@ -830,7 +899,10 @@ def _clean_text(text: str) -> str:
     # Remove RTF control sequences but NOT HTML italic/bold tags
     cleaned = re.sub(r"\{\\[^}]+\}", "", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    return "\n".join(line.strip() for line in cleaned.splitlines() if line.strip()).strip()
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if lines and re.match(r"^\d+$", lines[-1]):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
 
 
 def _strip_speaker_label(text: str) -> str:
@@ -898,11 +970,12 @@ def _add_seconds(tc: str, amount: float) -> str:
 
 def _to_seconds(tc: str) -> float | None:
     tc = normalize_timecode(tc)
-    match = re.match(r"^(\d{2}):(\d{2}):(\d{2}),(\d{3})$", tc)
+    match = re.match(r"^(\d{1,3}):(\d{2}):(\d{2})[,.](\d{1,4})$", tc)
     if not match:
         return None
-    h, m, s, ms = match.groups()
-    raw_seconds = int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+    h, m, s, ms_str = match.groups()
+    ms = int(ms_str[:3].ljust(3, '0'))
+    raw_seconds = int(h) * 3600 + int(m) * 60 + int(s) + ms / 1000.0
     # Snap to nearest 25 FPS frame exactly
     return round(raw_seconds * _FPS) / _FPS
 
@@ -916,11 +989,33 @@ def _from_seconds(seconds: float) -> str:
     return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int(ms):03d}"
 
 
-def _renumber(entries: list[dict]) -> list[dict]:
+def _renumber(entries: list[dict], gap: float = 0.0) -> list[dict]:
+    """Renumber and KEEP every entry that has text + a start time.
+
+    NEVER drop a subtitle just because its end time is missing — instead
+    infer the end from the next subtitle's start (or a default 3s span).
+    This guarantees no dialogue is silently lost during conversion.
+    """
     result = []
-    for i, entry in enumerate(entries, start=1):
-        if entry.get("text") and entry.get("start_time") and entry.get("end_time"):
-            item = dict(entry)
-            item["id"] = i
-            result.append(item)
+    # Filter to keep entries that have usable text and a start time.
+    kept = [e for e in entries if e.get("text", "").strip() and e.get("start_time")]
+    for i, entry in enumerate(kept, start=1):
+        item = dict(entry)
+        start = entry.get("start_time")
+        end = entry.get("end_time")
+        # Infer end time if missing: use next start (minus gap) or +3s.
+        if not end:
+            nxt = kept[i] if i < len(kept) else None
+            if nxt and nxt.get("start_time"):
+                nxt_secs = _to_seconds(nxt.get("start_time")) or 0
+                cur_secs = _to_seconds(start) or 0
+                end_secs = max(nxt_secs - gap, cur_secs + 0.2)
+                end = _from_seconds(end_secs)
+            else:
+                cur_secs = _to_seconds(start) or 0
+                end = _from_seconds(cur_secs + 3.0)
+        item["start_time"] = start
+        item["end_time"] = end
+        item["id"] = i
+        result.append(item)
     return result

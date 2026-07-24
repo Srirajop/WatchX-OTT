@@ -1,0 +1,2 @@
+Max characters per line: 42
+Max lines: 2

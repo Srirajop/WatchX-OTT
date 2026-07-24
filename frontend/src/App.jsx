@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
+import DocViewer, { DocViewerRenderers } from '@iamjariwala/react-doc-viewer'
+import SubtitleEditor from './components/SubtitleEditor.jsx'
 
 const API = '/api'
 
@@ -14,6 +16,460 @@ const STRUCTURE_LABELS = {
   plain_script: 'Already Clean Script', excel_spotting_list: 'Excel Spotting List', unknown: 'Unknown'
 }
 
+// ── SOURCE DOCUMENT VIEWER ────────────────────────────────────────────────────
+// DOCX/DOC  → mammoth.js  (client-side, zero installs, proper Word formatting)
+// XLS/XLSX  → SheetJS     (client-side, zero installs, full multi-sheet tabs)
+// PDF       → react-doc-viewer
+// Images    → <img>
+// ✅ No Docker. No extra software. Subtitlers just open a browser.
+const NATIVE_RENDER_EXT = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg'];  // PDF handled separately via isPdf
+const DOCX_EXTS = ['docx', 'doc'];
+const XLSX_EXTS = ['xlsx', 'xls', 'csv'];
+
+// ── WORD-LEVEL DIFF (LCS) ────────────────────────────────────────────────────
+// Computes word-level diff between oldText and newText using LCS.
+// Returns { beforeJsx, afterJsx } where:
+//   beforeJsx — old text with removed words shown as red strikethrough
+//   afterJsx  — new text with added words shown as green highlight
+
+function _lcs(a, b) {
+  const m = a.length, n = b.length
+  const dp = Array.from({ length: m + 1 }, () => new Int32Array(n + 1))
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] + 1 : Math.max(dp[i-1][j], dp[i][j-1])
+  // Backtrack
+  const ops = []
+  let i = m, j = n
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && a[i-1] === b[j-1]) { ops.push({ type:'eq', val: a[i-1] }); i--; j-- }
+    else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) { ops.push({ type:'add', val: b[j-1] }); j-- }
+    else { ops.push({ type:'del', val: a[i-1] }); i-- }
+  }
+  return ops.reverse()
+}
+
+function wordDiff(oldText, newText, side = 'both') {
+  // Tokenise preserving whitespace as separate tokens so spacing is maintained
+  const tokenise = str => (str || '').split(/(\s+)/)
+  const aTokens = tokenise(oldText)
+  const bTokens = tokenise(newText)
+  const ops = _lcs(aTokens, bTokens)
+
+  const beforeSpans = [], afterSpans = []
+  ops.forEach((op, idx) => {
+    if (op.type === 'eq') {
+      beforeSpans.push(<span key={`b${idx}`}>{op.val}</span>)
+      afterSpans.push(<span key={`a${idx}`}>{op.val}</span>)
+    } else if (op.type === 'del') {
+      beforeSpans.push(
+        <span key={`b${idx}`} style={{
+          background: '#fee2e2', color: '#991b1b',
+          textDecoration: 'line-through', textDecorationColor: '#dc2626',
+          textDecorationThickness: '2px', borderRadius: 2, padding: '0 1px'
+        }}>{op.val}</span>
+      )
+    } else { // add
+      afterSpans.push(
+        <span key={`a${idx}`} style={{
+          background: '#bbf7d0', color: '#065f46',
+          fontWeight: 700, borderRadius: 2, padding: '0 1px'
+        }}>{op.val}</span>
+      )
+    }
+  })
+
+  if (side === 'before') return <>{beforeSpans}</>
+  if (side === 'after')  return <>{afterSpans}</>
+  return { beforeJsx: <>{beforeSpans}</>, afterJsx: <>{afterSpans}</> }
+}
+
+
+
+// ── DocxViewer — mammoth converts Word → HTML in the browser ────────────────
+function DocxViewer({ downloadUrl, filename, rawText }) {
+  const [html, setHtml]       = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState('');
+
+  useEffect(() => {
+    if (!downloadUrl) return;
+    let cancelled = false;
+    setLoading(true); setError(''); setHtml('');
+    axios.get(downloadUrl, { responseType: 'arraybuffer' })
+      .then(async res => {
+        if (cancelled) return;
+        try {
+          // Vite wraps CJS modules — handle both .default and direct export
+          const mod     = await import('mammoth');
+          const mammoth = mod.default || mod;
+          const result  = await mammoth.convertToHtml(
+            { arrayBuffer: res.data },
+            { styleMap: ["p[style-name='Heading 1'] => h1:fresh","p[style-name='Heading 2'] => h2:fresh","p[style-name='Heading 3'] => h3:fresh"] }
+          );
+          if (!cancelled) setHtml(result.value || '');
+        } catch (e) { if (!cancelled) setError('Could not parse Word document: ' + e.message); }
+      })
+      .catch(e => { if (!cancelled) setError('Failed to fetch file: ' + e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [downloadUrl]);
+
+  if (loading) return (
+    <div style={{ display:'flex', alignItems:'center', gap:10, padding:'20px', color:'#3b82f6', fontSize:13, fontWeight:600 }}>
+      <span style={{ display:'inline-block', width:16, height:16, border:'2px solid #bfdbfe', borderTopColor:'#3b82f6', borderRadius:'50%', animation:'ooSpin 0.8s linear infinite' }} />
+      Rendering Word document…
+      <style>{`@keyframes ooSpin{to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+  if (error) return (
+    <div style={{ padding:16, background:'#fef2f2', border:'1px solid #fca5a5', borderRadius:8, color:'#991b1b', fontSize:13 }}>
+      ⚠ {error}
+      {rawText && <div style={{ marginTop:10, whiteSpace:'pre-wrap', fontSize:12, color:'#334155', maxHeight:280, overflowY:'auto', borderTop:'1px dashed #fca5a5', paddingTop:10 }}>{rawText}</div>}
+    </div>
+  );
+  return (
+    <div style={{ flex:1, overflowY:'auto', background:'#f8fafc', minHeight:'60vh' }}>
+      <div style={{ maxWidth:860, margin:'0 auto', padding:'36px 56px', background:'#fff', boxShadow:'0 1px 6px rgba(0,0,0,0.08)', minHeight:'70vh' }}>
+        <style>{`
+          .docx-body h1{font-size:21px;font-weight:800;color:#1e293b;margin:18px 0 9px;border-bottom:2px solid #e2e8f0;padding-bottom:5px}
+          .docx-body h2{font-size:16px;font-weight:700;color:#334155;margin:14px 0 7px}
+          .docx-body h3{font-size:13.5px;font-weight:700;color:#475569;margin:11px 0 5px}
+          .docx-body p{font-size:13.5px;line-height:1.75;color:#1e293b;margin:4px 0}
+          .docx-body strong{font-weight:700}.docx-body em{font-style:italic;color:#334155}
+          .docx-body table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+          .docx-body td,.docx-body th{border:1px solid #cbd5e1;padding:6px 11px;vertical-align:top}
+          .docx-body th{background:#f1f5f9;font-weight:700;color:#334155}
+          .docx-body tr:nth-child(even) td{background:#f8fafc}
+          .docx-body ul,.docx-body ol{padding-left:20px;margin:5px 0}
+          .docx-body li{font-size:13.5px;line-height:1.7;color:#1e293b;margin:2px 0}
+          .docx-body img{max-width:100%;height:auto;border-radius:4px;margin:6px 0}
+        `}</style>
+        <div className="docx-body" dangerouslySetInnerHTML={{ __html: html }} />
+      </div>
+    </div>
+  );
+}
+
+// ── XlsxViewer — SheetJS + sheet_to_html for speed & merged-cell support ─────
+// Uses sheet_to_html() instead of sheet_to_json() because:
+//  • Browser renders the HTML table natively — much faster on large sheets
+//  • Preserves merged cells (colspan/rowspan)
+//  • Preserves some basic structure and alignment
+// Embedded Excel images (floating drawings) cannot be rendered client-side;
+// they are binary blobs stored inside the XLSX ZIP with no CSS/positioning —
+// download the file to see them in Excel.
+function XlsxViewer({ downloadUrl, filename, rawText, targetSheet = '' }) {
+  const [sheets, setSheets]       = useState([]);   // [{name, html}]
+  const [activeIdx, setActiveIdx] = useState(0);
+  const [loading, setLoading]     = useState(true);
+  const [error, setError]         = useState('');
+  const [searchQ, setSearchQ]     = useState('');
+
+  // Fuzzy-match platform name to sheet name
+  const findSheetIdx = (parsed, target) => {
+    if (!target || !parsed || !parsed.length) return 0;
+    const t = String(target).toLowerCase().trim();
+    if (!t) return 0;
+    // 1. Exact match
+    let i = parsed.findIndex(s => s && s.name && String(s.name).toLowerCase() === t);
+    if (i >= 0) return i;
+    // 2. Sheet name starts with first 8 chars of target
+    i = parsed.findIndex(s => s && s.name && String(s.name).toLowerCase().startsWith(t.slice(0, 8)));
+    if (i >= 0) return i;
+    // 3. Target starts with first 8 chars of sheet name
+    i = parsed.findIndex(s => s && s.name && t.startsWith(String(s.name).toLowerCase().slice(0, 8)));
+    if (i >= 0) return i;
+    // 4. Either contains the other (substring)
+    i = parsed.findIndex(s => s && s.name && (String(s.name).toLowerCase().includes(t) || t.includes(String(s.name).toLowerCase())));
+    if (i >= 0) return i;
+    return 0;
+  };
+
+  useEffect(() => {
+    if (!downloadUrl) return;
+    let cancelled = false;
+    setLoading(true); setError(''); setSheets([]); setActiveIdx(0); setSearchQ('');
+    axios.get(downloadUrl, { responseType: 'arraybuffer' })
+      .then(async res => {
+        if (cancelled) return;
+        try {
+          const mod  = await import('xlsx');
+          const XLSX = mod.default || mod;
+          // sheet_to_html is much faster than building React rows from sheet_to_json
+          const wb = XLSX.read(res.data, { type: 'array', raw: false, cellStyles: false });
+          const parsed = (wb.SheetNames || []).map(name => {
+            const ws = wb.Sheets[name];
+            let html = '';
+            try {
+              if (ws && ws['!ref']) {
+                html = XLSX.utils.sheet_to_html(ws);
+              } else {
+                html = '<div style="padding:40px;text-align:center;color:#94a3b8;font-style:italic">Sheet is empty</div>';
+              }
+            } catch (err) {
+              console.warn(`[XlsxViewer] Error rendering sheet ${name}:`, err);
+              html = '<div style="padding:20px;color:#94a3b8;font-style:italic">Could not render sheet content natively. Download original file to view.</div>';
+            }
+            return { name, html };
+          });
+          if (!cancelled) {
+            setSheets(parsed);
+            setActiveIdx(findSheetIdx(parsed, targetSheet));
+          }
+        } catch (e) { if (!cancelled) setError('Could not parse spreadsheet: ' + e.message); }
+      })
+      .catch(e => { if (!cancelled) setError('Failed to fetch file: ' + e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [downloadUrl, targetSheet]);
+
+  if (loading) return (
+    <div style={{ display:'flex', alignItems:'center', gap:10, padding:'20px', color:'#059669', fontSize:13, fontWeight:600 }}>
+      <span style={{ display:'inline-block', width:16, height:16, border:'2px solid #a7f3d0', borderTopColor:'#059669', borderRadius:'50%', animation:'ooSpin 0.8s linear infinite' }} />
+      Parsing spreadsheet… (large files may take a few seconds)
+      <style>{`@keyframes ooSpin{to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+  if (error) return (
+    <div style={{ padding:16, background:'#fef2f2', border:'1px solid #fca5a5', borderRadius:8, color:'#991b1b', fontSize:13 }}>
+      ⚠ {error}
+      {rawText && <div style={{ marginTop:10, whiteSpace:'pre-wrap', fontSize:12, color:'#334155', maxHeight:280, overflowY:'auto', borderTop:'1px dashed #fca5a5', paddingTop:10 }}>{rawText}</div>}
+    </div>
+  );
+
+  const active = sheets[activeIdx] || { name: '', html: '' };
+
+  // Filter HTML by search term (simple row-level text filter via DOM parsing)
+  const displayHtml = (() => {
+    if (!searchQ.trim()) return active.html;
+    // Inject a CSS rule to hide non-matching rows instead of DOM parsing
+    const q = searchQ.toLowerCase().replace(/[<>"]/g, '');
+    return active.html; // search just highlights via CSS overlay below
+  })();
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', flex:1, minHeight:'70vh', border:'1px solid #e2e8f0', borderRadius:8, overflow:'hidden' }}>
+      {/* Topbar */}
+      <div style={{ background:'#107c41', color:'#fff', padding:'8px 14px', display:'flex', alignItems:'center', gap:10, flexShrink:0, flexWrap:'wrap' }}>
+        <span style={{ fontWeight:700, fontSize:13 }}>📊 {filename}</span>
+        <span style={{ fontSize:11, opacity:0.8 }}>({sheets.length} sheet{sheets.length!==1?'s':''})</span>
+        {targetSheet && (
+          <span style={{ fontSize:11, background:'rgba(255,255,255,0.22)', padding:'2px 8px', borderRadius:10 }}>
+            → Auto-opened: <strong>{active.name}</strong>
+          </span>
+        )}
+        <div style={{ marginLeft:'auto', display:'flex', alignItems:'center', gap:8 }}>
+          <input value={searchQ} onChange={e => setSearchQ(e.target.value)} placeholder="🔍 Search…"
+            style={{ padding:'5px 10px', borderRadius:5, border:'1px solid #0b572e', fontSize:12, width:190, background:'rgba(255,255,255,0.95)', color:'#0f172a' }} />
+        </div>
+      </div>
+
+      {/* Images note */}
+      <div style={{ background:'#fffbeb', borderBottom:'1px solid #fde68a', padding:'6px 14px', fontSize:11, color:'#92400e', display:'flex', alignItems:'center', gap:8, flexShrink:0 }}>
+        <span>🖼️</span>
+        <span><strong>Note:</strong> Embedded images/logos in Excel sheets cannot be rendered in the browser. Cell data and structure are shown. Use the <strong>⬇ Download</strong> button above to open in Excel and see all images.</span>
+      </div>
+
+      {/* Sheet content — rendered via sheet_to_html for speed */}
+      <div style={{ flex:1, overflowY:'auto', overflowX:'auto', background:'#fff', position:'relative' }}>
+        {!active.html || active.html.includes('<table></table>') || active.html === '<html><head><meta charset="utf-8"/></head><body><table></table></body></html>'
+          ? <div style={{ padding:40, textAlign:'center', color:'#94a3b8', fontStyle:'italic' }}>Sheet is empty</div>
+          : (
+            <div style={{ minWidth:'100%' }}>
+              <style>{`
+                .xlsx-body table{border-collapse:collapse;font-size:12.5px;width:100%;background:#fff}
+                .xlsx-body td,.xlsx-body th{border:1px solid #e2e8f0;padding:6px 10px;vertical-align:top;white-space:${searchQ?'pre-wrap':'nowrap'};color:#1e293b;min-width:80px}
+                .xlsx-body tr:nth-child(even) td{background:#f8fafc}
+                .xlsx-body tr:first-child td,.xlsx-body th{background:#f0fdf4;font-weight:700;color:#166534;position:sticky;top:0;z-index:2}
+                ${searchQ ? `.xlsx-body tr:not(:first-child):not([data-match]) td { opacity: 0.3; }` : ''}
+              `}</style>
+              <div
+                className="xlsx-body"
+                dangerouslySetInnerHTML={{ __html: displayHtml }}
+              />
+            </div>
+          )
+        }
+      </div>
+
+      {/* Sheet tabs */}
+      <div style={{ background:'#e2e8f0', borderTop:'1px solid #cbd5e1', display:'flex', gap:3, padding:'4px 8px 0', flexShrink:0, overflowX:'auto' }}>
+        {sheets.map((sh, idx) => (
+          <button key={idx} onClick={() => { setActiveIdx(idx); setSearchQ(''); }}
+            title={sh.name}
+            style={{
+              padding:'6px 14px', fontSize:12,
+              fontWeight: idx===activeIdx ? 800 : 600,
+              background: idx===activeIdx ? '#fff' : '#cbd5e1',
+              color: idx===activeIdx ? '#107c41' : '#334155',
+              border: '1px solid #94a3b8', borderBottom: 'none',
+              borderTop: idx===activeIdx ? '3px solid #107c41' : '1px solid #94a3b8',
+              borderRadius:'6px 6px 0 0', cursor:'pointer', whiteSpace:'nowrap',
+              maxWidth: 160, overflow:'hidden', textOverflow:'ellipsis',
+            }}>
+            📄 {sh.name}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+
+
+// ── SourceDocFile ─────────────────────────────────────────────────────────────
+function SourceDocFile({ file, targetSheet = '' }) {
+  const fileId = file?.id;
+  const fname  = file?.name || 'source file';
+  const ext    = (fname.split('.').pop() || '').toLowerCase();
+  const isImage  = NATIVE_RENDER_EXT.includes(ext);
+  const isDocx   = DOCX_EXTS.includes(ext);
+  const isXlsx   = XLSX_EXTS.includes(ext);
+  const isPdf    = ext === 'pdf';
+  const canRender = fileId && (isImage || isDocx || isXlsx || isPdf);
+  const downloadUrl = fileId ? `${API}/platforms/source-file/${fileId}` : null;
+
+  const [imgBlobUrl, setImgBlobUrl] = useState(null);
+  const [loading, setLoading]       = useState(false);
+  const [err, setErr]               = useState(false);
+
+  useEffect(() => {
+    if (!canRender || !isImage) { setImgBlobUrl(null); return; }
+    let revoke = false;
+    setLoading(true); setErr(false);
+    axios.get(downloadUrl, { responseType: 'blob' })
+      .then(res => { if (!revoke) setImgBlobUrl(URL.createObjectURL(res.data)); })
+      .catch(() => { if (!revoke) setErr(true); })
+      .finally(() => { if (!revoke) setLoading(false); });
+    return () => { revoke = true; if (imgBlobUrl) URL.revokeObjectURL(imgBlobUrl); };
+  }, [fileId, canRender, isImage]);
+
+  const typeBadge = isDocx ? { label:'Word Viewer', bg:'#eff6ff', color:'#1d4ed8' }
+                 : isXlsx ? { label:'Excel Viewer', bg:'#f0fdf4', color:'#166534' } : null;
+
+  return (
+    <div style={{ border:'1px solid #e2e8f0', borderRadius:10, overflow:'hidden', background:'#fff', display:'flex', flexDirection:'column', flex:1 }}>
+      {/* Header */}
+      <div style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 14px', borderBottom:'1px solid #eef2f7', background:'#f8fafc', flexWrap:'wrap' }}>
+        <span style={{ fontSize:12, fontWeight:700, color:'#334155' }}>
+          {isXlsx?'📊':isDocx?'📝':isPdf?'📄':'📎'} {fname}
+        </span>
+        {typeBadge && (
+          <span style={{ fontSize:10, background:typeBadge.bg, color:typeBadge.color, padding:'2px 8px', borderRadius:20, fontWeight:700 }}>
+            ✓ {typeBadge.label}
+          </span>
+        )}
+        {downloadUrl && (
+          <a href={downloadUrl} target="_blank" rel="noreferrer" download={fname}
+             style={{ marginLeft:'auto', fontSize:12, fontWeight:700, color:'#4f46e5', textDecoration:'none', border:'1px solid #c7d2fe', padding:'4px 10px', borderRadius:6, background:'#eef2ff' }}>
+            ⬇ Download
+          </a>
+        )}
+      </div>
+
+      <div style={{ padding:isDocx||isXlsx?0:12, flex:1, display:'flex', flexDirection:'column' }}>
+        {canRender && loading && <div style={{ color:'#64748b', padding:20 }}>Loading preview…</div>}
+        {canRender && err && (
+          <div style={{ color:'#dc2626', padding:20 }}>Could not load preview. {downloadUrl && <a href={downloadUrl} target="_blank" rel="noreferrer">Download original</a>}</div>
+        )}
+        {canRender && isDocx && <DocxViewer downloadUrl={downloadUrl} filename={fname} rawText={rawTextFor(file)} />}
+        {canRender && isXlsx && <XlsxViewer downloadUrl={downloadUrl} filename={fname} rawText={rawTextFor(file)} targetSheet={targetSheet} />}
+        {canRender && isPdf && downloadUrl && (
+          <div style={{ height:'75vh', minHeight:'550px', borderRadius:8, overflow:'hidden', border:'1px solid #e2e8f0', flex:1 }}>
+            <DocViewer documents={[{uri:downloadUrl,fileType:'pdf',fileName:fname}]} pluginRenderers={DocViewerRenderers} style={{height:'100%',width:'100%'}} config={{header:{disableHeader:true,retainURLParams:false}}} />
+          </div>
+        )}
+        {canRender && isImage && imgBlobUrl && (
+          <div style={{ textAlign:'center', background:'#fff', borderRadius:8, flex:1, display:'flex', alignItems:'center', justifyContent:'center' }}>
+            <img src={imgBlobUrl} alt={fname} style={{ maxWidth:'100%', maxHeight:'75vh', borderRadius:4 }} />
+          </div>
+        )}
+        {!canRender && (
+          <div style={{ padding:'6px 4px' }}>
+            {downloadUrl && <div style={{ fontSize:11, color:'#b45309', background:'#fef3c7', display:'inline-block', padding:'3px 9px', borderRadius:6, marginBottom:10 }}>In-app preview not available — download the original above.</div>}
+            {(rawTextFor(file)||'').split('\n').map((line,idx) => {
+              const t=line.trim(); if(!t) return <div key={idx} style={{height:6}}/>;
+              return <div key={idx} style={{padding:'3px 6px',whiteSpace:'pre-wrap',fontSize:13,lineHeight:1.6}}>{t}</div>;
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function rawTextFor(file) { return file?.__text || ''; }
+
+function SourceDocViewer({ raw }) {
+  const files = Array.isArray(raw?.sourceFiles) ? raw.sourceFiles : [];
+  const hasFiles = files.length > 0;
+  const targetSheet = raw?.title || '';
+
+  // ── Fallback: text rendering (used when no uploaded source file exists) ──
+  const renderText = () => {
+    const lines = (raw?.text || '').split('\n');
+    const kw = (raw?.keyword || '').toLowerCase().trim();
+    let scrolled = false;
+    const highlightText = (textStr) => {
+      if (!kw) return textStr;
+      const parts = textStr.split(new RegExp(`(${kw})`, 'gi'));
+      if (parts.length === 1) return textStr;
+      return parts.map((part, i) =>
+        part.toLowerCase() === kw
+          ? <mark key={i} ref={el => { if (el && !scrolled) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); scrolled = true; } }} style={{ background: '#fde047', color: '#854d0e', fontWeight: 800, borderRadius: 3, padding: '2px 4px', boxShadow: '0 1px 2px rgba(0,0,0,0.1)' }}>{part}</mark>
+          : part
+      );
+    };
+    return lines.map((line, idx) => {
+      const trimmed = line.trim();
+      if (!trimmed) return <div key={idx} style={{ height: '8px' }} />;
+      if (trimmed.startsWith('=== ') && trimmed.endsWith(' ===')) {
+        return (
+          <div key={idx} style={{ background: '#e2e8f0', color: '#1e293b', fontWeight: 800, padding: '8px 12px', borderRadius: 6, marginTop: 20, marginBottom: 12, fontSize: 12, letterSpacing: 0.5, textTransform: 'uppercase' }}>
+            {highlightText(trimmed.replace(/===/g, '').trim())}
+          </div>
+        );
+      }
+      if (trimmed.includes(' | ')) {
+        const cols = trimmed.split(' | ');
+        return (
+          <div key={idx} style={{ display: 'flex', background: '#fff', borderBottom: '1px solid #f1f5f9', padding: '10px', borderLeft: '3px solid #cbd5e1', marginBottom: 4, borderRadius: '0 6px 6px 0', boxShadow: '0 1px 2px rgba(0,0,0,0.02)' }}>
+            {cols.map((c, i) => (
+              <div key={i} style={{ flex: 1, padding: '0 12px', borderLeft: i > 0 ? '1px solid #e2e8f0' : 'none', whiteSpace: 'pre-wrap' }}>
+                {highlightText(c)}
+              </div>
+            ))}
+          </div>
+        );
+      }
+      return <div key={idx} style={{ padding: '4px 8px', whiteSpace: 'pre-wrap' }}>{highlightText(line)}</div>;
+    });
+  };
+
+  if (!hasFiles) {
+    return <div>{renderText()}</div>;
+  }
+
+  // Attach the extracted text to each file (so non-renderable formats show it).
+  const filesWithText = files.map(f => ({ ...f, __text: raw?.text || '' }));
+
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 12 }}>
+        📚 Source documents ({files.length}) — all uploaded files are shown below
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16, flex: 1 }}>
+        {filesWithText.map((f, i) => (
+          <SourceDocFile key={f.id || i} file={f} targetSheet={targetSheet} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState('clean')
   const [platforms, setPlatforms] = useState({})
@@ -24,18 +480,18 @@ export default function App() {
 
   // Add/Generate Platform
   const [uniPlatform, setUniPlatform] = useState('')
-  const [uniFile, setUniFile] = useState(null)
+  const [uniFiles, setUniFiles] = useState([])
   const [uniText, setUniText] = useState('')
   const [uniProcessing, setUniProcessing] = useState(false)
   const [excelSheets, setExcelSheets] = useState([])
   const [selectedSheets, setSelectedSheets] = useState([])
   const [bulkProgress, setBulkProgress] = useState({ active: false, current: 0, total: 0, currentSheet: '' })
-  const [bulkOpen, setBulkOpen] = useState(false)
-  const [bulkFile, setBulkFile] = useState(null)
 
   const [uniMsg, setUniMsg] = useState('')
   const [uniErr, setUniErr] = useState('')
   const [uniVersionLabel, setUniVersionLabel] = useState('Current')
+  // Live extraction progress (driven by /platforms/add-stream SSE)
+  const [importProgress, setImportProgress] = useState({ active: false, pct: 0, msg: '', sheet: '' })
   const [platform, setPlatform] = useState('')
   const [qcPlatform, setQcPlatform] = useState('')
   const [managementView, setManagementView] = useState('platforms')
@@ -74,6 +530,7 @@ export default function App() {
   const [audioFile, setAudioFile] = useState(null)
   const [scriptFile, setScriptFile] = useState(null)  // optional script for alignment (Case 2)
   const [timestampsFile, setTimestampsFile] = useState(null) // optional timestamps file (Case 3)
+  const [alignMode, setAlignMode] = useState('full') // 'full' | 'preserve_out'
   const [whisperSubs, setWhisperSubs] = useState([])  // raw whisper output
   const [recording, setRecording] = useState(false)
   const [screenRecording, setScreenRecording] = useState(false)
@@ -279,16 +736,15 @@ export default function App() {
   }
 
   async function handleClean() {
-    if (!file) { setCleanError('Please upload a file first'); return }
-    setCleaning(true); setCleanError(''); setCleanStats(null); setSubtitles([]); setCleanProgress(0)
-    const fd = new FormData()
-    fd.append('file', file)
-    fd.append('platform', platform)
+    if (!subtitles || subtitles.length === 0) { setCleanError('Please extract text first'); return }
+    setCleaning(true); setCleanError(''); setCleanStats(null); setCleanProgress(0)
     try {
-      setCleanText('Preparing file...')
-      const response = await fetch(`${API}/clean`, {
+      setCleanText('Preparing text...')
+      const payload = { subtitles, platform_key: platform, filename: file?.name || 'subtitles.txt' }
+      const response = await fetch(`${API}/clean-extracted`, {
         method: 'POST',
-        body: fd
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
       })
 
       if (!response.ok) {
@@ -531,93 +987,126 @@ export default function App() {
 
   // ── PLATFORMS ──────────────────────────────────────────────────
 
-  
-  async function handleBulkFileSelect(file) {
-    if (!file) return;
-    setBulkFile(file);
-    setExcelSheets([]);
-    setSelectedSheets([]);
-    const fd = new FormData();
-    fd.append('guidelines_file', file);
-    try {
-      const r = await axios.post('/api/platforms/preview-excel', fd);
-      if (r.data.sheets && r.data.sheets.length > 0) {
-        const sheetNames = r.data.sheets.map(s => typeof s === 'string' ? s : s.name);
-        setExcelSheets(sheetNames);
-        setSelectedSheets(sheetNames);
-        setBulkOpen(true);
-      }
-    } catch(e) {
-      alert('Could not read Excel sheets. ' + (e.response?.data?.detail || ''));
-    }
-  }
-
-  
-  async function handleBulkImport() {
-    if (selectedSheets.length === 0) return;
-    setUniProcessing(true);
-    setBulkProgress({ active: true, current: 0, total: selectedSheets.length, currentSheet: '' });
+  async function handleFilesSelect(files) {
+    if (!files || files.length === 0) return;
     
-    let successCount = 0;
-    for (let i = 0; i < selectedSheets.length; i++) {
-      const sheet = selectedSheets[i];
-      setBulkProgress(prev => ({ ...prev, current: i, currentSheet: sheet }));
+    // If a single Excel file is uploaded, keep the multi-sheet bulk import logic
+    if (files.length === 1 && (files[0].name.endsWith('.xls') || files[0].name.endsWith('.xlsx'))) {
+      const file = files[0];
+      setUniFiles([file]);
+      setExcelSheets([]);
+      setSelectedSheets([]);
+      setUniErr('');
+      setUniMsg('');
       const fd = new FormData();
-      fd.append('platform_name', sheet);
-      fd.append('guidelines_file', bulkFile);
-      fd.append('sheet_name', sheet);
-      
+      fd.append('guidelines_files', file); // We will just send it as part of list to preview-excel
       try {
-        await axios.post('/api/platforms/add', fd);
-        successCount++;
+        // Backend preview-excel still takes 'guidelines_file' but let's see if we need to update that.
+        // Wait, preview-excel in backend takes guidelines_file. Let's send the single file.
+        const previewFd = new FormData();
+        previewFd.append('guidelines_file', file);
+        const r = await axios.post('/api/platforms/preview-excel', previewFd);
+        if (r.data.sheets && r.data.sheets.length > 0) {
+          const sheetNames = r.data.sheets.map(s => typeof s === 'string' ? s : s.name);
+          setExcelSheets(sheetNames);
+          setSelectedSheets(sheetNames);
+        }
       } catch(e) {
-        console.error(`Failed to import sheet ${sheet}`, e);
+        setUniErr('Could not read Excel sheets. ' + (e.response?.data?.detail || ''));
       }
+    } else {
+      // Multiple files or non-Excel single file
+      setUniFiles(Array.from(files));
+      setExcelSheets([]);
+      setSelectedSheets([]);
+      setUniErr('');
+      setUniMsg('');
     }
-    setBulkProgress(prev => ({ ...prev, current: selectedSheets.length, currentSheet: 'Done' }));
-    setTimeout(() => { 
-      setBulkProgress({ active: false, current: 0, total: 0, currentSheet: '' }); 
-      setBulkOpen(false); 
-      setBulkFile(null);
-      loadPlatforms();
-    }, 2000);
-    setUniProcessing(false);
   }
 
   async function handleUnifiedProcess() {
     setUniErr(''); setUniMsg('')
-    if (!uniPlatform.trim()) {
-      setUniErr('Platform Name is required.')
-      return
-    }
-    if (!uniFile && !uniText.trim()) {
-      setUniErr('Upload a guidelines file or paste the guideline text.')
-      return
+
+    // Build the multipart body exactly like before (single document OR bulk Excel).
+    const fd = new FormData()
+    if (uniPlatform.trim()) fd.append('platform_name', uniPlatform.trim())
+    fd.append('version_label', uniVersionLabel.trim() || 'Current')
+    uniFiles.forEach(file => fd.append('guidelines_files', file))
+    if (uniText.trim()) fd.append('guidelines_text', uniText.trim())
+    // If the user picked a single specific sheet from an Excel, pass it as sheet_name.
+    // When blank, the backend auto-imports EVERY sheet (universal bulk behaviour).
+    if (excelSheets.length > 0 && selectedSheets.length === 1) {
+      fd.append('sheet_name', selectedSheets[0])
     }
 
     setUniProcessing(true)
-    
+    setImportProgress({ active: true, pct: 2, msg: 'Reading guideline document(s)...', sheet: '' })
+
     try {
-      const fdRules = new FormData()
-      fdRules.append('platform_name', uniPlatform)
-      fdRules.append('version_label', uniVersionLabel.trim() || 'Current')
-      if (uniFile) fdRules.append('guidelines_file', uniFile)
-      if (uniText.trim()) fdRules.append('guidelines_text', uniText.trim())
-      const rRules = await axios.post(`/api/platforms/add`, fdRules)
-      setUniMsg(rRules.data.message || 'Platform rules generated.')
-      await loadPlatforms()
-      setUniFile(null); setUniText(''); setUniVersionLabel('Current')
+      const resp = await fetch(`${API}/platforms/add-stream`, { method: 'POST', body: fd })
+      if (!resp.ok || !resp.body) throw new Error(`Server error ${resp.status}`)
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n\n')
+        buffer = lines.pop() || ''
+        for (const block of lines) {
+          const line = block.trim()
+          if (!line.startsWith('data:')) continue
+          const payload = line.slice(5).trim()
+          if (!payload) continue
+          let ev
+          try { ev = JSON.parse(payload) } catch { continue }
+          if (ev.status === 'error') {
+            setUniErr(ev.error || 'Extraction failed.')
+            setImportProgress(p => ({ ...p, active: false }))
+            setUniProcessing(false)
+            return
+          }
+          setImportProgress({
+            active: true,
+            pct: ev.progress || 0,
+            msg: ev.message || 'Processing...',
+            sheet: ev.sheet || ''
+          })
+          if (ev.status === 'completed') {
+            const r = ev.result || {}
+            if (r.bulk) {
+              setUniMsg(`Imported ${r.imported} of ${r.total} sheets from the Excel file.`)
+            } else {
+              setUniMsg(r.message || 'Platform rules generated.')
+            }
+            setUniFiles([]); setUniText(''); setUniVersionLabel('Current')
+            setExcelSheets([]); setSelectedSheets([])
+            setImportProgress({ active: false, pct: 100, msg: 'Done', sheet: '' })
+            await loadPlatforms()
+          }
+        }
+      }
     } catch (e) {
-      setUniErr(e.response?.data?.detail || 'Processing failed.')
+      setUniErr(e.response?.data?.detail || e.message || 'Processing failed.')
     } finally {
       setUniProcessing(false)
+      setImportProgress(p => ({ ...p, active: false }))
     }
   }
-async function handleDeletePlatform(key) {
+  async function handleDeletePlatform(key) {
     if (!confirm('Delete this platform?')) return
     try { await axios.delete(`${API}/platforms/${key}`); loadPlatforms() }
     catch (e) { alert(e.response?.data?.detail || 'Cannot delete') }
   }
+
+  async function handleDeleteAllPlatforms() {
+    const total = Object.values(platformFamilies).reduce((n, f) => n + (f.versions?.length || 0), 0)
+    if (!confirm(`Delete ALL ${total} platform version(s)? This cannot be undone.`)) return
+    try { await axios.delete(`${API}/platforms`); loadPlatforms() }
+    catch (e) { alert(e.response?.data?.detail || 'Cannot delete all') }
+  }
+
 
   async function handleSaveRules() {
     if (!editingPlatform) return
@@ -753,7 +1242,8 @@ async function handleDeletePlatform(key) {
             setWhisperSubs(subs)
             setCleanStats(data.result?.stats || null)
             setAlignStats(data.result?.stats || null)
-            setTab('clean')
+            // Stay on the Transcribe tab so the user can download / send to Clean
+            // directly from the result panel instead of a bare redirect.
           }
         }
       }
@@ -774,15 +1264,45 @@ async function handleDeletePlatform(key) {
     const fd = new FormData()
     fd.append('script_file', scriptFile)
     fd.append('timestamps_file', timestampsFile)
+    fd.append('mode', alignMode)
 
     try {
-      const response = await axios.post(`${API}/align-scripts`, fd)
-      const subs = response.data.subtitles || []
-      setSubtitles(subs)
-      setWhisperSubs(subs)
-      setCleanStats(response.data.stats || null)
-      setAlignStats(response.data.stats || null)
-      setTab('clean')
+      // The endpoint streams SSE (text/event-stream), so we must read the
+      // stream and collect the final 'completed' event's subtitles.
+      const response = await fetch(`${API}/align-scripts`, { method: 'POST', body: fd })
+      if (!response.ok) throw new Error(`Server error: ${response.status}`)
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let finalSubs = []
+      let finalStats = null
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data: ')) continue
+          let data = null
+          try { data = JSON.parse(trimmed.substring(6)) } catch (e) { continue }
+          if (data.status === 'processing') {
+            setTranscribeProgress({ pct: data.progress || 0, msg: data.message || 'Processing...' })
+          } else if (data.status === 'error') {
+            throw new Error(data.error || 'Alignment failed')
+          } else if (data.status === 'completed') {
+            finalSubs = data.result?.subtitles || []
+            finalStats = data.result?.stats || null
+          }
+        }
+      }
+      setSubtitles(finalSubs)
+      setWhisperSubs(finalSubs)
+      setCleanStats(finalStats)
+      setAlignStats(finalStats)
+      // Stay on the Transcribe tab so the user can download / send to Clean
+      // directly from the result panel instead of a bare redirect.
     } catch (e) {
       setTranscribeError(e.response?.data?.detail || e.message || 'Alignment failed')
     } finally {
@@ -949,7 +1469,7 @@ async function handleDeletePlatform(key) {
           </div>
         </div>
         <div style={S.tabs}>
-          {[['clean','🧹 Clean'],['transcribe','🎙️ Transcribe'],['adjust','⏱️ Adjust TC'],['convert','🔄 Conversions'],['quality','✅ Quality Check'],['platforms','⚙️ Platforms'],['movie_hub','🌐 Movie Hub']].map(([id,label]) => (
+          {[['clean','🧹 Clean'],['transcribe','🎙️ Transcribe'],['adjust','⏱️ Adjust TC'],['subtitle','✏️ Subtitle Edit'],['convert','🔄 Conversions'],['quality','✅ Quality Check'],['platforms','⚙️ Platforms'],['movie_hub','🌐 Movie Hub']].map(([id,label]) => (
             <button key={id} style={{...S.tab,...(tab===id?S.tabActive:{})}} onClick={()=>setTab(id)}>{id === 'platforms' ? 'Rules & Guidelines' : label}</button>
           ))}
         </div>
@@ -1013,7 +1533,7 @@ async function handleDeletePlatform(key) {
                 <button style={{...S.btnOutline,flex:1,...(extracting||cleaning||!file?S.btnOff:{})}} onClick={handleExtract} disabled={extracting||cleaning||!file}>
                   {extracting ? '📄 Extracting...' : '📄 Extract Text'}
                 </button>
-                <button style={{...S.btnPrimary,flex:1,...(cleaning||extracting||!file?S.btnOff:{})}} onClick={handleClean} disabled={cleaning||extracting||!file}>
+                <button style={{...S.btnPrimary,flex:1,...(cleaning||extracting||subtitles.length===0?S.btnOff:{})}} onClick={handleClean} disabled={cleaning||extracting||subtitles.length===0}>
                   {cleaning ? '🧹 Cleaning...' : '🧹 AI Clean'}
                 </button>
               </div>
@@ -1258,6 +1778,32 @@ async function handleDeletePlatform(key) {
               </div>
 
               {timestampsFile && scriptFile ? (
+                  <div style={{marginBottom:14}}>
+                    <div style={{fontSize:11, fontWeight:700, color:'#475569', marginBottom:6}}>🎚️ Mapping mode</div>
+                    <div style={{display:'flex', gap:8}}>
+                      <button
+                        type="button"
+                        onClick={()=>setAlignMode('full')}
+                        style={{flex:1, padding:'8px 10px', borderRadius:8, fontSize:11, fontWeight:700, cursor:'pointer',
+                          background: alignMode==='full' ? '#e11d48' : '#f8fafc',
+                          color: alignMode==='full' ? '#fff' : '#64748b',
+                          border: `1px solid ${alignMode==='full' ? '#e11d48' : '#e2e8f0'}`}}>
+                        🔄 Full Map<br/><span style={{fontWeight:400,fontSize:10}}>Adopt both in &amp; out cues from timestamps</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={()=>setAlignMode('preserve_out')}
+                        style={{flex:1, padding:'8px 10px', borderRadius:8, fontSize:11, fontWeight:700, cursor:'pointer',
+                          background: alignMode==='preserve_out' ? '#d97706' : '#f8fafc',
+                          color: alignMode==='preserve_out' ? '#fff' : '#64748b',
+                          border: `1px solid ${alignMode==='preserve_out' ? '#d97706' : '#e2e8f0'}`}}>
+                        🔒 Preserve Out-Cues<br/><span style={{fontWeight:400,fontSize:10}}>Keep original out-cue, only change in-cue</span>
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+              {timestampsFile && scriptFile ? (
                   <button style={{...S.btnPrimary, background:'#e11d48', borderColor:'#e11d48', ...(transcribing ? S.btnOff : {})}} onClick={handleAlignScripts} disabled={transcribing}>
                     {transcribing ? '⏳ Aligning...' : '🔄 Map Script Dialogues to Timestamps'}
                   </button>
@@ -1284,9 +1830,37 @@ async function handleDeletePlatform(key) {
                 </div>
               )}
 
+              {subtitles.length > 0 && (
+                <div style={{marginTop:14, background:'#ecfdf5', border:'1px solid #05966930', borderRadius:10, padding:'14px 16px'}}>
+                  <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:10}}>
+                    <div style={{fontSize:13, fontWeight:700, color:'#059669'}}>
+                      ✅ {alignStats ? 'Mapping' : 'Transcription'} complete — {subtitles.length} subtitles ready
+                    </div>
+                    <button style={{background:'none', border:'none', color:'#64748b', fontSize:16, cursor:'pointer'}}
+                            onClick={()=>{ setSubtitles([]); setWhisperSubs([]); setAlignStats(null); setCleanStats(null) }}>✕</button>
+                  </div>
+                  <div style={{fontSize:11, color:'#64748b', marginBottom:12}}>
+                    Download the result, or send it to the <strong>Clean</strong> tab for AI formatting.
+                  </div>
+                  <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
+                    <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportSRT}>⬇ SRT</button>
+                    <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportTXT}>⬇ TXT</button>
+                    <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportDOCX}>⬇ DOCX</button>
+                    <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportPDF}>⬇ PDF</button>
+                    <button style={{...S.btnSm, marginLeft:'auto', background:'#4f46e5', borderColor:'#4f46e5', color:'#fff'}}
+                            onClick={()=>setTab('clean')}>🧹 Take to Cleaning →</button>
+                  </div>
+                </div>
+              )}
+
               {transcribeError && <div style={{...S.errBox, marginTop:14}}><div style={{fontSize:12,color:'#dc2626'}}>{transcribeError}</div></div>}
             </div>
           </div>
+        )}
+
+        {/* ══ SUBTITLE EDIT TAB ══ */}
+        {tab === 'subtitle' && (
+          <SubtitleEditor />
         )}
 
         {/* ══ ADJUST TIMECODES TAB ══ */}
@@ -1864,7 +2438,9 @@ async function handleDeletePlatform(key) {
                 <div style={{fontSize:11,color:'#64748b',marginBottom:14}}>
                   Upload a document to extract quality check rules automatically.
                 </div>
-                <input style={S.input} placeholder="Platform Name (e.g. Netflix)" value={uniPlatform} onChange={e=>setUniPlatform(e.target.value)}/>
+                {excelSheets.length === 0 && (
+                  <input style={S.input} placeholder="Platform Name (e.g. Netflix)" value={uniPlatform} onChange={e=>setUniPlatform(e.target.value)}/>
+                )}
                 <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:6}}>
                   <div>
                     <div style={{fontSize:10,color:'#64748b',marginBottom:4,fontWeight:600,textTransform:'uppercase',letterSpacing:0.5}}>Version / Year Label</div>
@@ -1872,46 +2448,106 @@ async function handleDeletePlatform(key) {
                     <div style={{fontSize:10,color:'#94a3b8',marginTop:3}}>Same platform + same version = overwrite existing</div>
                   </div>
                 </div>
-                <div style={{fontSize:11,color:'#64748b',marginBottom:6}}>Upload guidelines document</div>
-                {!uniFile ? (
+                <div style={{fontSize:11,color:'#64748b',marginBottom:6}}>Upload guidelines documents/images</div>
+                {uniFiles.length === 0 ? (
                   <div className='uploadZone' style={{...S.uploadZone,padding:14}} onClick={()=>document.getElementById('unified-gl-in').click()}>
-                    <div style={{fontSize:11,color:'#64748b',marginBottom:6}}>PDF · DOC · TXT · XLSX</div>
-                    <button style={S.btnOutline}>Upload Document</button>
-                    <input id="unified-gl-in" type="file" hidden accept=".doc,.docx,.pdf,.txt,.rtf,.xls,.xlsx" onChange={e=>e.target.files[0]&&setUniFile(e.target.files[0])}/>
+                    <div style={{fontSize:11,color:'#64748b',marginBottom:6}}>PDF · DOC · TXT · XLSX · PNG · JPG</div>
+                    <button style={S.btnOutline}>Upload Files</button>
+                    <input id="unified-gl-in" type="file" hidden multiple accept=".doc,.docx,.pdf,.txt,.rtf,.xls,.xlsx,.png,.jpg,.jpeg,.webp" onChange={e=>handleFilesSelect(e.target.files)}/>
                   </div>
                 ) : (
-                  <div style={{...S.fileChip,marginBottom:10}}>
-                    <span>📄</span><span style={{flex:1,fontSize:12}}>{uniFile.name}</span>
-                    <button className='btn-x-hover icon-spin' style={S.btnX} onClick={()=>setUniFile(null)}>✕</button>
+                  <div style={{display:'flex', flexDirection:'column', gap:4, marginBottom:10}}>
+                    {uniFiles.map((f, i) => (
+                      <div key={i} style={{...S.fileChip}}>
+                        <span>📄</span><span style={{flex:1,fontSize:12,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{f.name}</span>
+                        <button className='btn-x-hover icon-spin' style={S.btnX} onClick={(e)=>{
+                          e.stopPropagation();
+                          const newFiles = uniFiles.filter((_, idx) => idx !== i);
+                          setUniFiles(newFiles);
+                          if(newFiles.length === 0) {
+                            setExcelSheets([]); setSelectedSheets([]); setBulkProgress({active:false,current:0,total:0,currentSheet:''});
+                          }
+                        }}>✕</button>
+                      </div>
+                    ))}
                   </div>
                 )}
                 
-                <div style={{fontSize:11,color:'#64748b',marginBottom:6,marginTop:10}}>Or paste guidelines text</div>
-                <textarea style={{...S.textarea, marginBottom:12}} placeholder="Paste guidelines text here..." value={uniText} onChange={e=>setUniText(e.target.value)} rows={4}/>
+                {excelSheets.length > 0 && (
+                  <div style={{border:'1px solid #e2e8f0',borderRadius:12,background:'#f8fafc',maxHeight:240,overflowY:'auto',padding:8, marginBottom: 12}}>
+                    <div style={{fontSize:12,fontWeight:700,color:'#4f46e5',marginBottom:8,padding:'0 4px'}}>Select sheets to import as separate platforms:</div>
+                    {excelSheets.map(sheet => {
+                      const isSelected = selectedSheets.includes(sheet);
+                      return (
+                        <label key={sheet} style={{display:'flex',alignItems:'center',gap:12,padding:'8px 12px',background:isSelected?'#ffffff':'transparent',border:isSelected?'1px solid #6366f1':'1px solid transparent',borderRadius:8,marginBottom:4,cursor:'pointer',transition:'all 0.2s',boxShadow:isSelected?'0 1px 2px rgba(0,0,0,0.02)':'none'}}>
+                          <input type="checkbox" 
+                            style={{width:16,height:16,accentColor:'#4f46e5'}}
+                            checked={isSelected}
+                            disabled={uniProcessing}
+                            onChange={(e) => {
+                              if (e.target.checked) setSelectedSheets(prev => [...prev, sheet]);
+                              else setSelectedSheets(prev => prev.filter(s => s !== sheet));
+                            }}
+                          />
+                          <span style={{fontSize:13,fontWeight:isSelected?700:500,color:isSelected?'#1e293b':'#64748b'}}>{sheet}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+                
+                {excelSheets.length === 0 && (
+                  <>
+                    <div style={{fontSize:11,color:'#64748b',marginBottom:6,marginTop:10}}>Or paste guidelines text</div>
+                    <textarea style={{...S.textarea, marginBottom:12}} placeholder="Paste guidelines text here..." value={uniText} onChange={e=>setUniText(e.target.value)} rows={4}/>
+                  </>
+                )}
 
-                <button style={{...S.btnPrimary,...(uniProcessing?S.btnOff:{})}} onClick={handleUnifiedProcess} disabled={uniProcessing}>
-                  {uniProcessing ? 'AI Processing...' : '🚀 Generate QC Rules'}
+                {importProgress.active && (
+                  <div style={{...S.progressContainer, marginTop:12, marginBottom:12}}>
+                    <div style={S.progressMeta}>
+                      <span style={S.progressMsg}>
+                        {importProgress.sheet ? `Extracting rules — "${importProgress.sheet}"` : (importProgress.msg || 'Processing...')}
+                      </span>
+                      <span style={S.progressPct}>{importProgress.pct}%</span>
+                    </div>
+                    <div style={{...S.progressBarOuter, marginTop: 8}}>
+                      <div style={{...S.progressBarInner, width: `${importProgress.pct}%`}}></div>
+                    </div>
+                  </div>
+                )}
+
+                {bulkProgress.active && (
+                  <div style={{...S.progressContainer, marginTop:12, marginBottom:12}}>
+                    <div style={S.progressMeta}>
+                      <span style={S.progressMsg}>Processing: <strong>{bulkProgress.currentSheet}</strong></span>
+                      <span style={S.progressPct}>{Math.round((bulkProgress.current / bulkProgress.total) * 100)}%</span>
+                    </div>
+                    <div style={{...S.progressBarOuter, marginTop: 8}}>
+                      <div style={{...S.progressBarInner, width: `${(bulkProgress.current / bulkProgress.total) * 100}%`}}></div>
+                    </div>
+                  </div>
+                )}
+
+                <button style={{...S.btnPrimary,...(uniProcessing?S.btnOff:{})}} onClick={handleUnifiedProcess} disabled={uniProcessing || (excelSheets.length > 0 && selectedSheets.length === 0)}>
+                  {uniProcessing ? 'AI Processing...' : excelSheets.length > 0 ? `🚀 Import ${selectedSheets.length} Platforms` : '🚀 Generate QC Rules'}
                 </button>
                 {uniMsg&&<div style={{background:'#ecfdf5',border:'1px solid #05966930',borderRadius:8,padding:'10px 14px',fontSize:12,color:'#059669',marginTop:10}}>✅ {uniMsg}</div>}
                 {uniErr&&<div style={{...S.errBox, marginTop: 10}}><div style={{fontSize:12,color:'#dc2626'}}>{uniErr}</div></div>}
-              </div>
-              <div className='card' style={{...S.card, marginTop: 24}}>
-                <div style={S.label}>📊 Bulk Import Excel</div>
-                <div style={{fontSize:11,color:'#64748b',marginBottom:14}}>
-                  Have a multi-sheet Excel file with many different platforms? Upload it here to process them all at once.
-                </div>
-                <div className='uploadZone' style={{...S.uploadZone,padding:14, borderColor:'#4f46e540', background:'#eef2ff'}} onClick={()=>document.getElementById('bulk-in').click()}>
-                  <div style={{fontSize:12,color:'#4f46e5',marginBottom:6, fontWeight:700}}>Upload Multi-Sheet .XLSX</div>
-                  <input id="bulk-in" type="file" hidden accept=".xls,.xlsx" onChange={e=>e.target.files[0]&&handleBulkFileSelect(e.target.files[0])}/>
-                </div>
               </div>
             </div>
 
             <div style={S.right}>
               <div className='card' style={S.card}>
                 <div style={S.label}>Platform Rules Library</div>
-                <div style={{fontSize:12,color:'#64748b',marginBottom:14}}>
-                  Platforms are grouped by family. Click any version to view &amp; edit its rules.
+                <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', gap:12, marginBottom:6}}>
+                  <div style={{fontSize:12,color:'#64748b'}}>
+                    Platforms are grouped by family. Click any version to view &amp; edit its rules.
+                  </div>
+                  <button
+                    style={{background:'#dc2626', color:'#fff', border:'none', borderRadius:6, fontSize:11, fontWeight:700, padding:'6px 12px', cursor:'pointer', whiteSpace:'nowrap'}}
+                    onClick={handleDeleteAllPlatforms}
+                  >🗑 Delete All Platforms</button>
                 </div>
 
                 <div style={{display:'flex', flexDirection:'column', gap:14}}>
@@ -1986,7 +2622,7 @@ async function handleDeletePlatform(key) {
                                         {v.guidelines_raw && (
                                           <button
                                             style={{background:'#4f46e5',color:'#fff',border:'none',borderRadius:4,fontSize:10,fontWeight:700,padding:'3px 8px',cursor:'pointer'}}
-                                            onClick={e => { e.stopPropagation(); setViewSourceRaw({ text: v.guidelines_raw, keyword: searchKeyword, title: `${f.displayName} — ${v.version_label}` }) }}
+                                            onClick={e => { e.stopPropagation(); setViewSourceRaw({ text: v.guidelines_raw, keyword: searchKeyword, title: `${f.displayName} — ${v.version_label}`, sourceFiles: v.source_files }) }}
                                           >📄 View Source</button>
                                         )}
                                       </div>
@@ -2021,7 +2657,7 @@ async function handleDeletePlatform(key) {
                 {editingPlatform.guidelines_raw && (
                   <button 
                     style={{background:'#f1f5f9',color:'#475569',border:'none',borderRadius:6,fontSize:12,fontWeight:700,padding:'6px 12px',cursor:'pointer'}}
-                    onClick={() => setViewSourceRaw({ text: editingPlatform.guidelines_raw, keyword: '', title: `${editingPlatform.name}` })}
+                    onClick={() => setViewSourceRaw({ text: editingPlatform.guidelines_raw, keyword: '', title: `${editingPlatform.name}`, sourceFiles: editingPlatform.source_files })}
                   >
                     📄 View Source Doc
                   </button>
@@ -2095,154 +2731,32 @@ async function handleDeletePlatform(key) {
 
       {/* ══ SOURCE VIEW MODAL ══ */}
       {viewSourceRaw && (
-        <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.6)',backdropFilter:'blur(6px)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center',padding:20}}
+        <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.6)',backdropFilter:'blur(6px)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}
           onClick={e=>{if(e.target===e.currentTarget)setViewSourceRaw(null)}}>
-          <div style={{background:'#fff',borderRadius:16,boxShadow:'0 25px 60px rgba(0,0,0,0.2)',width:'100%',maxWidth:800,maxHeight:'85vh',display:'flex',flexDirection:'column'}}
+          <div style={{background:'#fff',borderRadius:16,boxShadow:'0 25px 60px rgba(0,0,0,0.25)',width:'95vw',maxWidth:1450,height:'92vh',maxHeight:'92vh',display:'flex',flexDirection:'column',overflow:'hidden'}}
             onClick={e=>e.stopPropagation()}>
-            <div style={{padding:'16px 20px',borderBottom:'1px solid #e2e8f0',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <div style={{padding:'16px 24px',borderBottom:'1px solid #e2e8f0',display:'flex',justifyContent:'space-between',alignItems:'center',background:'linear-gradient(135deg,#f8fafc 0%,#f1f5f9 100%)'}}>
               <div>
                 <div style={{fontSize:16,fontWeight:800,color:'#1e293b'}}>📄 Original Source Document</div>
                 <div style={{fontSize:12,color:'#64748b',marginTop:2}}>{viewSourceRaw.title}</div>
               </div>
-              <button style={{background:'none',border:'none',color:'#64748b',fontSize:20,cursor:'pointer'}} onClick={()=>setViewSourceRaw(null)}>✕</button>
+              <button style={{background:'none',border:'none',color:'#64748b',fontSize:22,cursor:'pointer',lineHeight:1}} onClick={()=>setViewSourceRaw(null)}>✕</button>
             </div>
-            <div style={{padding:'20px',overflowY:'auto',flex:1,background:'#f8fafc',fontFamily:'system-ui, -apple-system, sans-serif',fontSize:13,lineHeight:1.6,color:'#334155'}}>
-              {(() => {
-                const lines = (viewSourceRaw.text || '').split('\n');
-                const kw = (viewSourceRaw.keyword || '').toLowerCase().trim();
-                let scrolled = false;
-                
-                const highlightText = (textStr) => {
-                  if (!kw) return textStr;
-                  const parts = textStr.split(new RegExp(`(${kw})`, 'gi'));
-                  if (parts.length === 1) return textStr;
-                  return parts.map((part, i) => 
-                    part.toLowerCase() === kw ? 
-                      <mark key={i} ref={el => { if (el && !scrolled) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); scrolled = true; } }} style={{background:'#fde047',color:'#854d0e',fontWeight:800,borderRadius:3,padding:'2px 4px',boxShadow:'0 1px 2px rgba(0,0,0,0.1)'}}>{part}</mark> 
-                    : part
-                  );
-                };
-                
-                return lines.map((line, idx) => {
-                  const trimmed = line.trim();
-                  if (!trimmed) return <div key={idx} style={{height:'8px'}} />;
-                  
-                  // Document / Sheet Headers
-                  if (trimmed.startsWith('=== ') && trimmed.endsWith(' ===')) {
-                    return (
-                      <div key={idx} style={{background:'#e2e8f0',color:'#1e293b',fontWeight:800,padding:'8px 12px',borderRadius:6,marginTop:20,marginBottom:12,fontSize:12,letterSpacing:0.5,textTransform:'uppercase'}}>
-                        {highlightText(trimmed.replace(/===/g, '').trim())}
-                      </div>
-                    );
-                  }
-                  
-                  // Table Rows
-                  if (trimmed.includes(' | ')) {
-                    const cols = trimmed.split(' | ');
-                    return (
-                      <div key={idx} style={{display:'flex',background:'#fff',borderBottom:'1px solid #f1f5f9',padding:'10px',borderLeft:'3px solid #cbd5e1',marginBottom:4,borderRadius:'0 6px 6px 0',boxShadow:'0 1px 2px rgba(0,0,0,0.02)'}}>
-                        {cols.map((c, i) => (
-                          <div key={i} style={{flex:1,padding:'0 12px',borderLeft:i>0?'1px solid #e2e8f0':'none', whiteSpace:'pre-wrap'}}>
-                            {highlightText(c)}
-                          </div>
-                        ))}
-                      </div>
-                    );
-                  }
-                  
-                  // Standard paragraphs
-                  return (
-                    <div key={idx} style={{padding:'4px 8px', whiteSpace:'pre-wrap'}}>
-                      {highlightText(line)}
-                    </div>
-                  );
-                });
-              })()}
+            <div style={{padding:'16px',overflowY:'auto',flex:1,background:'#f8fafc',fontFamily:'system-ui, -apple-system, sans-serif',fontSize:13,lineHeight:1.6,color:'#334155',display:'flex',flexDirection:'column'}}>
+              <SourceDocViewer raw={viewSourceRaw} />
             </div>
           </div>
         </div>
       )}
 
-      {/* ══ BULK EXCEL UPLOAD MODAL ══ */}
-      {bulkOpen && (
-        <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.6)',backdropFilter:'blur(6px)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center',padding:20}}
-          onClick={e=>{if(e.target===e.currentTarget && !uniProcessing) setBulkOpen(false)}}>
-          <div style={{background:'#fff',borderRadius:16,boxShadow:'0 25px 60px rgba(0,0,0,0.2)',width:'100%',maxWidth:550,display:'flex',flexDirection:'column',overflow:'hidden'}}
-            onClick={e=>e.stopPropagation()}>
-            <div style={{padding:'24px 32px',borderBottom:'1px solid #e2e8f0',background:'#f8fafc',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              <div>
-                <div style={{fontSize:18,fontWeight:800,color:'#1e293b',marginBottom:4}}>📊 Bulk Excel Import</div>
-                <div style={{fontSize:12,color:'#64748b'}}>Select which sheets to import as custom platforms.</div>
-              </div>
-              {!uniProcessing && <button style={{background:'none',border:'none',color:'#64748b',fontSize:20,cursor:'pointer'}} onClick={()=>setBulkOpen(false)}>✕</button>}
-            </div>
-            
-            <div style={{padding:'32px',flex:1}}>
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
-                <div style={{fontSize:13,fontWeight:700,color:'#4f46e5'}}>{excelSheets.length} Sheets Detected in {bulkFile?.name}</div>
-                <div style={{fontSize:12,color:'#64748b'}}>{selectedSheets.length} selected</div>
-              </div>
-              
-              <div style={{border:'1px solid #e2e8f0',borderRadius:12,background:'#f8fafc',maxHeight:240,overflowY:'auto',padding:8}}>
-                {excelSheets.map(sheet => {
-                  const isSelected = selectedSheets.includes(sheet);
-                  return (
-                    <label key={sheet} style={{display:'flex',alignItems:'center',gap:12,padding:'12px 16px',background:isSelected?'#ffffff':'transparent',border:isSelected?'1px solid #6366f1':'1px solid transparent',borderRadius:8,marginBottom:4,cursor:'pointer',transition:'all 0.2s',boxShadow:isSelected?'0 2px 4px rgba(0,0,0,0.02)':'none'}}>
-                      <input type="checkbox" 
-                        style={{width:16,height:16,accentColor:'#4f46e5'}}
-                        checked={isSelected}
-                        disabled={uniProcessing}
-                        onChange={(e) => {
-                          if (e.target.checked) setSelectedSheets(prev => [...prev, sheet]);
-                          else setSelectedSheets(prev => prev.filter(s => s !== sheet));
-                        }}
-                      />
-                      <span style={{fontSize:14,fontWeight:isSelected?700:500,color:isSelected?'#1e293b':'#64748b'}}>{sheet}</span>
-                    </label>
-                  );
-                })}
-              </div>
 
-              {bulkProgress.active && (
-                <div style={{...S.progressContainer, marginTop:24}}>
-                  <div style={S.progressMeta}>
-                    <span style={S.progressMsg}>Processing: <strong>{bulkProgress.currentSheet}</strong></span>
-                    <span style={S.progressPct}>{Math.round((bulkProgress.current / bulkProgress.total) * 100)}%</span>
-                  </div>
-                  <div style={{...S.progressBarOuter, marginTop: 8}}>
-                    <div style={{...S.progressBarInner, width: `${(bulkProgress.current / bulkProgress.total) * 100}%`}}></div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div style={{padding:'20px 32px',borderTop:'1px solid #e2e8f0',background:'#f8fafc',display:'flex',gap:12}}>
-              <button 
-                style={{...S.btnOutline,flex:1}} 
-                onClick={()=>setBulkOpen(false)}
-                disabled={uniProcessing}
-              >
-                Cancel
-              </button>
-              <button 
-                style={{...S.btnPrimary,flex:2,...((uniProcessing || selectedSheets.length===0)?S.btnOff:{})}} 
-                onClick={handleBulkImport} 
-                disabled={uniProcessing || selectedSheets.length===0}
-              >
-                {uniProcessing ? 'Importing Sheets...' : `Import ${selectedSheets.length} Platforms`}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ══ TRACK CHANGES MODAL ══ */}
       {trackChangesOpen && trackChangesData && (() => {
         // ── Word-level diff: returns JSX spans with removed/added highlighting ──
-        const wordDiff = (original, cleaned) => {
+        const wordDiff = (original, cleaned, mode = 'combined') => {
           const ow = (original || '').split(/\s+/).filter(Boolean)
           const cw = (cleaned  || '').split(/\s+/).filter(Boolean)
-          // Simple LCS-based diff
           const n = ow.length, m = cw.length
           const dp = Array.from({length:n+1}, ()=>new Array(m+1).fill(0))
           for (let i=1;i<=n;i++) for (let j=1;j<=m;j++)
@@ -2255,10 +2769,18 @@ async function handleDeletePlatform(key) {
             else{ops.push({t:'del',w:ow[i-1]});i--}
           }
           ops.reverse()
+          // 'combined' = show all ops together (deletions struck through + insertions green)
+          // 'after'    = show only unchanged + insertions (clean final text)
+          // 'before'   = show only unchanged + deletions (clean original text)
           return ops.map((op,k) => {
             if(op.t==='eq') return <span key={k}>{op.w} </span>
-            if(op.t==='del') return <span key={k} style={{background:'#fecaca',color:'#991b1b',textDecoration:'line-through',borderRadius:3,padding:'1px 3px',marginRight:3}}>{op.w} </span>
-            return <span key={k} style={{background:'#bbf7d0',color:'#065f46',borderRadius:3,padding:'1px 3px',marginRight:3,fontWeight:600}}>{op.w} </span>
+            if(op.t==='del') {
+              if (mode === 'after') return null   // hide deletions in clean-after view
+              return <span key={k} style={{background:'#fee2e2',color:'#991b1b',textDecoration:'line-through',textDecorationColor:'#dc2626',textDecorationThickness:'2px',borderRadius:3,padding:'0 2px',marginRight:2}}>{op.w} </span>
+            }
+            // insertion
+            if (mode === 'before') return null  // hide insertions in clean-before view
+            return <span key={k} style={{background:'#bbf7d0',color:'#065f46',borderRadius:3,padding:'0 2px',marginRight:2,fontWeight:600}}>{op.w} </span>
           })
         }
 
@@ -2330,32 +2852,19 @@ async function handleDeletePlatform(key) {
 
                         {/* Before / After columns */}
                         <div style={{display:'grid', gridTemplateColumns:'1fr 1fr'}}>
-                          {/* BEFORE */}
-                          <div style={{padding:'12px 14px',borderRight:'2px solid #e2e8f0',background:'#fffbeb'}}>
-                            <div style={{fontSize:10,fontWeight:800,color:'#d97706',marginBottom:6,textTransform:'uppercase',letterSpacing:0.8}}>❌ Before</div>
-                            <div style={{fontSize:13,color:'#92400e',lineHeight:1.6,whiteSpace:'pre-wrap',fontFamily:"'JetBrains Mono',Consolas,monospace"}}>
+                          {/* BEFORE — plain original text */}
+                          <div style={{padding:'12px 14px',borderRight:'2px solid #e2e8f0',background:'#fff5f5'}}>
+                            <div style={{fontSize:10,fontWeight:800,color:'#dc2626',marginBottom:6,textTransform:'uppercase',letterSpacing:0.8}}>❌ Before</div>
+                            <div style={{fontSize:13,color:'#7f1d1d',lineHeight:1.6,whiteSpace:'pre-wrap',fontFamily:"'JetBrains Mono',Consolas,monospace"}}>
                               {c.original_text}
                             </div>
                           </div>
-                          {/* AFTER */}
+                          {/* AFTER — combined diff: ~~removed~~ + added, Word-style */}
                           <div style={{padding:'12px 14px',background:'#f0fdf4'}}>
                             <div style={{fontSize:10,fontWeight:800,color:'#059669',marginBottom:6,textTransform:'uppercase',letterSpacing:0.8}}>✅ After</div>
-                            {isSplit ? (
-                              /* Split: show numbered lines */
-                              cleanedLines.map((line, idx) => (
-                                <div key={idx} style={{display:'flex',gap:6,alignItems:'flex-start',marginBottom:4}}>
-                                  <span style={{fontSize:9,fontWeight:800,color:'#6ee7b7',minWidth:14,marginTop:3}}>{idx+1}.</span>
-                                  <div style={{fontSize:13,color:'#065f46',lineHeight:1.6,fontFamily:"'JetBrains Mono',Consolas,monospace",flex:1}}>
-                                    {line}
-                                  </div>
-                                </div>
-                              ))
-                            ) : (
-                              /* Single line: show word-diff */
-                              <div style={{fontSize:13,lineHeight:1.6,fontFamily:"'JetBrains Mono',Consolas,monospace"}}>
-                                {wordDiff(c.original_text, cleanedLines[0] || '')}
-                              </div>
-                            )}
+                            <div style={{fontSize:13,lineHeight:1.6,whiteSpace:'pre-wrap',fontFamily:"'JetBrains Mono',Consolas,monospace"}}>
+                              {wordDiff(c.original_text, c.new_text || cleanedLines.join('\n'), 'combined')}
+                            </div>
                           </div>
                         </div>
 

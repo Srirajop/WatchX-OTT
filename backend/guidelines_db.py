@@ -1,10 +1,10 @@
-# guidelines_db.py — OTT Guidelines Search Engine
+# guidelines_db.py â€” OTT Guidelines Search Engine
 #
 # Matches the exact data shape from the company's own mockup
 # (June_26_2026_OTT_Guidelines_SearchEngine.pptx, slide 2):
 #   Client | OTT Platform | S.No. | Spec | Category | Guideline | Keywords
 #
-# Plus a Year column — the company's stated reason for wanting this tool at
+# Plus a Year column â€” the company's stated reason for wanting this tool at
 # all is that guidelines change rapidly and get hard to track over time, so
 # every entry is versioned by the year it was captured/updated, and the
 # search UI can filter by year the same way it filters by platform/category.
@@ -12,7 +12,7 @@
 # This is a separate table from `platforms` (database.py) on purpose:
 # `platforms` stores numeric cleaning-rule VALUES the AI cleaner consumes
 # (max_chars_per_line, reading_speed_cps, etc). This table stores free-text
-# SPEC ENTRIES — the actual guideline wording, for humans to search and read,
+# SPEC ENTRIES â€” the actual guideline wording, for humans to search and read,
 # not for the cleaner to parse. Different shape, different purpose.
 
 import json
@@ -22,7 +22,7 @@ from database import get_connection
 def _ensure_version_columns(cursor, conn):
     """
     For a guidelines table created by an earlier version of this file
-    (before version history existed) — add the new columns without losing
+    (before version history existed) â€” add the new columns without losing
     any existing data. MySQL doesn't support "ADD COLUMN IF NOT EXISTS"
     directly in all versions, so we check information_schema first.
     """
@@ -72,7 +72,7 @@ def init_guidelines_table():
             -- one is "the current rule" for searches. Old projects that
             -- were built under an earlier version of the guideline can
             -- still look it up by selecting it directly, even after a
-            -- newer version exists — this is the actual requirement: OTT
+            -- newer version exists â€” this is the actual requirement: OTT
             -- guidelines change often, and old projects need the rules
             -- that were in force when THEY were built, not just whatever
             -- is current today.
@@ -92,12 +92,12 @@ def init_guidelines_table():
     """)
     conn.commit()
 
-    # Migration for databases created before version history existed —
+    # Migration for databases created before version history existed â€”
     # adds the new columns if they're missing, without losing existing data.
     _ensure_version_columns(cursor, conn)
 
     # Seed with the real entries from the company's own slide 1/2 mockup,
-    # so the tool isn't empty on first run — these are the actual Deluxe >
+    # so the tool isn't empty on first run â€” these are the actual Deluxe >
     # Netflix spec rows shown in the reference deck.
     cursor.execute("SELECT COUNT(*) FROM guidelines")
     count = cursor.fetchone()[0]
@@ -119,7 +119,7 @@ def init_guidelines_table():
             ),
             (
                 "Deluxe", "Netflix", "2.1.1", "Duration", "General Guidelines",
-                "Minimum duration: 5/6 of a second (this is dependent on the frame rate — at 23 "
+                "Minimum duration: 5/6 of a second (this is dependent on the frame rate â€” at 23 "
                 "frames per second, this is 20 frames). Maximum duration: 6 seconds 23 frames per "
                 "subtitle event (regardless of frame rate).",
                 "Minimum Duration, Maximum Duration, Frames per subtitle", 2026, None, None
@@ -170,15 +170,15 @@ def search_guidelines(
 ) -> list:
     """
     Free-text keyword search across spec/guideline/keywords, combined with
-    exact-match dropdown filters — matches the mockup's "type a keyword,
+    exact-match dropdown filters â€” matches the mockup's "type a keyword,
     pick Deluxe/Netflix/CC from dropdowns, see matching rows" behaviour.
     Any filter left blank/None is simply not applied.
 
-    By default, only returns the CURRENT version of each guideline — so
+    By default, only returns the CURRENT version of each guideline â€” so
     day-to-day searches aren't cluttered with old superseded rows.
 
     Set include_all_versions=True, OR filter by a specific `year`, to see
-    every version that existed — this is the actual "old project" use case:
+    every version that existed â€” this is the actual "old project" use case:
     someone working on a project built under a 2023 guideline needs to find
     the 2023 version specifically, even though a newer 2026 version is now
     "current". Filtering by year automatically implies wanting that year's
@@ -212,7 +212,7 @@ def search_guidelines(
         params.append(year)
     elif not include_all_versions:
         # No specific year requested and history wasn't explicitly asked
-        # for — show only the current version of each guideline.
+        # for â€” show only the current version of each guideline.
         clauses.append("is_current = TRUE")
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -227,8 +227,8 @@ def search_guidelines(
 
 def get_filter_options() -> dict:
     """
-    Returns the distinct values for every filter dropdown — clients, OTT
-    platforms, categories, years — so the frontend can populate the dropdown
+    Returns the distinct values for every filter dropdown â€” clients, OTT
+    platforms, categories, years â€” so the frontend can populate the dropdown
     lists from real data instead of a hardcoded guess, and the list grows
     automatically as new guidelines get added.
     """
@@ -252,7 +252,7 @@ def get_filter_options() -> dict:
 
 def add_guideline(entry: dict) -> int:
     """
-    Add a brand-new guideline entry (version 1, no prior version) — used by
+    Add a brand-new guideline entry (version 1, no prior version) â€” used by
     the 'Add Guideline' form and the bulk-import endpoint.
     Returns the new row's id.
     """
@@ -296,7 +296,7 @@ def update_guideline(guideline_id: int, entry: dict) -> bool:
 
     Old projects can still find and select the exact version of the
     guideline that was in force when they were built, by year or by
-    explicitly browsing that spec's version history — see
+    explicitly browsing that spec's version history â€” see
     get_guideline_history() below.
     """
     conn = get_connection()
@@ -342,7 +342,7 @@ def update_guideline(guideline_id: int, entry: dict) -> bool:
 def get_guideline_history(guideline_id: int) -> list:
     """
     Given ANY version's id for a guideline, walk the supersedes_id chain in
-    both directions and return every version, oldest first — so the UI can
+    both directions and return every version, oldest first â€” so the UI can
     show "this rule has changed 3 times, here's what it said each time"
     and let someone pick an older version for an older project.
     """
@@ -383,12 +383,12 @@ def get_guideline_history(guideline_id: int) -> list:
 
 def delete_guideline(guideline_id: int, hard_delete: bool = False) -> bool:
     """
-    By default this is a SOFT delete (is_current=False, data preserved) —
+    By default this is a SOFT delete (is_current=False, data preserved) â€”
     consistent with "previous guidelines are also saved", a guideline that
     was wrongly marked current should be retractable without erasing the
     historical record a past project might still reference.
 
-    hard_delete=True genuinely removes the row — only for real mistakes
+    hard_delete=True genuinely removes the row â€” only for real mistakes
     (e.g. a garbage/test entry that should never have existed at all, not
     a real guideline that simply changed), and should be used sparingly.
     """
@@ -407,7 +407,6 @@ def delete_guideline(guideline_id: int, hard_delete: bool = False) -> bool:
     conn.close()
     return affected > 0
 
-
 def extract_guidelines_with_ai(raw_text: str, client: str, ott_platform: str, year: int) -> list:
     """
     Given raw guideline document text (pasted or extracted from an uploaded
@@ -421,7 +420,23 @@ def extract_guidelines_with_ai(raw_text: str, client: str, ott_platform: str, ye
 
     client_api = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-    prompt = f"""You are digitizing an OTT subtitling guidelines document into structured database rows.
+    CHUNK_SIZE = 3000
+    text = raw_text.strip()
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + CHUNK_SIZE
+        if end < len(text):
+            nl = text.rfind('\n', start, end)
+            if nl > start:
+                end = nl
+        chunks.append(text[start:end])
+        start = end
+
+    all_entries = []
+    
+    for i, chunk in enumerate(chunks):
+        prompt = f"""You are digitizing an OTT subtitling guidelines document into structured database rows.
 
 CLIENT: {client}
 OTT PLATFORM: {ott_platform}
@@ -434,31 +449,46 @@ Read the guidelines text below. Split it into individual spec entries — one en
 - keywords: 2-5 short comma-free search terms someone would type to find this rule (e.g. "Duration, Minimum Duration, Frames per subtitle")
 - sub_specific: any text specifically about SUB/subtitle-only handling, or null if not mentioned separately
 - dhoh_specific: any text specifically about DHOH/SDH/CC handling, or null if not mentioned separately
+- verbatim_quote: an exact string copied directly from the document to prove the rule exists.
 
 Return ONLY a JSON array, nothing else, no markdown:
 [
-  {{"spec": "...", "category": "...", "guideline": "...", "keywords": "...", "sub_specific": null, "dhoh_specific": "..."}}
+  {{"spec": "...", "category": "...", "guideline": "...", "keywords": "...", "sub_specific": null, "dhoh_specific": "...", "verbatim_quote": "..."}}
 ]
 
 GUIDELINES DOCUMENT TEXT:
 ---
-{raw_text[:14000]}
+{chunk}
 ---"""
 
-    response = client_api.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=8000,
-    )
+        try:
+            response = client_api.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=3000,
+            )
 
-    result_text = response.choices[0].message.content.strip()
-    result_text = re.sub(r"```json\s*", "", result_text)
-    result_text = re.sub(r"```\s*", "", result_text)
-    parsed = _json.loads(result_text.strip())
+            result_text = response.choices[0].message.content.strip()
+            result_text = re.sub(r"```(?:json)?\s*", "", result_text).strip().rstrip("`")
+            
+            try:
+                parsed = _json.loads(result_text)
+            except _json.JSONDecodeError:
+                parsed = []
+            
+            if isinstance(parsed, list):
+                for row in parsed:
+                    # Anti-hallucination validation
+                    quote = row.get("verbatim_quote", "")
+                    if quote and len(quote.strip().split()) >= 1:
+                        all_entries.append(row)
+                    
+        except Exception as e:
+            print(f"[GUIDELINES EXTRACT ERROR] chunk {i}: {e}")
 
     entries = []
-    for i, row in enumerate(parsed, 1):
+    for i, row in enumerate(all_entries, 1):
         entries.append({
             "client": client,
             "ott_platform": ott_platform,

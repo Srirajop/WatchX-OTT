@@ -11,6 +11,108 @@ from platform_rules import get_platform
 load_dotenv()
 
 
+# ─── SUBTITLER-OPERATIONAL RULE FILTER ────────────────────────────────────────
+# This tool does MORE than text cleaning. The "subtitler_rules" bucket is NOT a
+# "human-only / discard" pile — it is fed to the OPERATIONAL ENGINE
+# (rule_segregation.segregate_rules + timecoded_subtitles.prepare_for_platform),
+# which MACHINE-APPLIES timing/reading-speed/duration/gap/zero-subtitle work.
+#
+# So a rule belongs in subtitler_rules when it is about TIMING, READING-SPEED,
+# DURATION, GAP, ZERO-SUBTITLE, POSITIONING, FONT, or FILE/DELIVERY. Anything that
+# touches the words or punctuation of the dialogue must stay in script_rules.
+#
+# We therefore WHITELIST text-cleaning phrases that must NEVER be moved, even if
+# they mention seconds/frames, and only move rules that clearly describe
+# timing/position/font/file/delivery work.
+
+# Phrases that prove a rule is a SCRIPT-CLEANING (text) rule → always keep in script.
+_SCRIPT_TEXT_PHRASES = [
+    "character", "line", "subtitle", "dialogue", "word", "punctuation",
+    "capital", "case", "spell", "profanity", "italic", "hyphen", "speaker",
+    "acronym", "ellipsis", "quotation", "apostrophe", "number", "digit",
+    "symbol", "ampersand", "reading speed", "cps", "characters per second",
+    "second per", "remove", "strip", "hoh", "emt", "music", "laughter",
+    "stage direction", "filler", "slang", "foreign", "song lyric", "voice",
+]
+
+# Keywords that, on their own, signal a genuine SUBTITLER/TIMING task.
+_SUBTITLER_OPERATIONAL_KEYWORDS = [
+    "gts pro", "pac file", "timecode", "time code", "frame rate", "fps",
+    "font size", "font colour", "font color", "font type", "font face",
+    "positioning", "position subtitles", "raise subtitle", "lower subtitle",
+    "centre-justified", "center-justified", "centre justified", "center justified",
+    "bottom of screen", "top of screen", "overlap", "shot change",
+    "file naming", "file name", "delivery", "deliverable", "export",
+    "spellcheck", "spell check", "repo file", "repositioning",
+    "zero subtitle", "zero-subtitle", "end credit file",
+    "translator credit", "translated by", "subtitling by iyuno",
+    "reading speed setting", "cps setting", "character per second setting",
+    "minimum gap", "frame gap", "frame header", "frame tail",
+    "in-time", "out-time", "cue in", "cue out", "spotting",
+    "caption editor", "caption studio", "swift", "ezcap",
+    "sync", "offset", "delay",
+]
+
+# Timing/positioning phrases that (without a text-cleaning whitelist hit) mean
+# "this is about WHEN/WHERE the subtitle appears", i.e. a subtitler task.
+_TIMING_POSITION_PHRASE = re.compile(
+    r"\b(timecode|time code|frame rate|fps|frame gap|frame header|frame tail|"
+    r"cue[- ]?in|cue[- ]?out|spotting|shot change|positioning|"
+    r"raise|lower|centre|center|font|repo|reposition|deliver|naming|"
+    r"in[- ]?time|out[- ]?time|head|tail|gap)\b",
+    re.IGNORECASE
+)
+
+
+def _filter_script_rules(script_rules: list, subtitler_rules: list) -> tuple[list, list]:
+    """
+    Post-process LLM-returned rule lists with a STRICT, bidirectional re-bucket.
+
+    Goal: the Subtitler (Human) bucket must contain ONLY genuine subtitler /
+    operational tasks (timing, duration, gap, positioning, font, file/delivery,
+    zero-subtitle, credits). ANY rule that touches the WORDS or PUNCTUATION of
+    the dialogue — characters per line, max lines, casing, spelling, profanity,
+    ellipsis, acronyms, italics, HOH/sound removal, reading-speed/CPS expressed
+    as a text limit, etc. — belongs in script_rules even if it mentions
+    seconds/frames. This is enforced in BOTH directions so the LLM can't leak a
+    text-cleaning rule into the human bucket (or vice-versa).
+    """
+    clean_script = []
+    clean_subtitler = []
+
+    def _is_text_cleaning_rule(rule: str) -> bool:
+        rule_lower = rule.lower()
+        # A genuine text-cleaning rule is never moved out of script_rules.
+        if any(p in rule_lower for p in _SCRIPT_TEXT_PHRASES):
+            return True
+        # If it mentions neither a timing/operational keyword nor a
+        # timing/position phrase, it's almost certainly a text rule.
+        is_op = any(kw in rule_lower for kw in _SUBTITLER_OPERATIONAL_KEYWORDS)
+        is_timing_pos = bool(_TIMING_POSITION_PHRASE.search(rule))
+        return not (is_op or is_timing_pos)
+
+    def _is_subtitler_rule(rule: str) -> bool:
+        rule_lower = rule.lower()
+        is_op = any(kw in rule_lower for kw in _SUBTITLER_OPERATIONAL_KEYWORDS)
+        is_timing_pos = bool(_TIMING_POSITION_PHRASE.search(rule))
+        return is_op or is_timing_pos
+
+    for rule in (script_rules or []):
+        if _is_text_cleaning_rule(rule) or not _is_subtitler_rule(rule):
+            clean_script.append(rule)
+        else:
+            clean_subtitler.append(rule)
+
+    for rule in (subtitler_rules or []):
+        # Re-home any misclassified text-cleaning rule back to script_rules.
+        if _is_text_cleaning_rule(rule):
+            clean_script.append(rule)
+        else:
+            clean_subtitler.append(rule)
+
+    return clean_script, clean_subtitler
+
+
 # --- LLM CLIENT FACTORY ---
 
 def _get_client_and_model():
@@ -28,11 +130,25 @@ def _get_client_and_model():
         from groq import Groq
         client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         model = "llama-3.1-8b-instant"
-        print(f"[LLM] Using Groq cloud | model: {model}")
         return client, model, False
 
-
-# --- PROMPT BUILDER ---
+def _rules_to_instructions(platform: dict) -> list[str]:
+    """
+    Map extracted platform rules into actionable instructions for the LLM.
+    Ensures that generic instructions don't override specific platform rules.
+    """
+    rules = platform.get("rules", [])
+    if not rules:
+        return []
+        
+    instructions = []
+    # Filter out rules already covered by hardcoded mechanics (like max_chars)
+    for rule in rules:
+        if "character" in rule.lower() or "maximum" in rule.lower():
+            continue
+        instructions.append(rule)
+        
+    return instructions
 
 def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) -> tuple[str, str]:
     """
@@ -41,16 +157,25 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
     Returns (system_prompt, user_prompt).
     """
     platform_name = platform.get("name", "Unknown")
-    rules_text = " ".join(platform.get("rules", []))
     remove = platform.get("remove_elements", [])
-    profanity_table = platform.get("profanity_table", {})
+    
+    subtitler_ops = platform.get("subtitler_rules", []) or []
+    do_not_list = ""
+    if subtitler_ops:
+        do_not_sample = subtitler_ops[:8]  
+        do_not_list = (
+            " DO NOT attempt to perform any of these subtitler-only tasks "
+            "(they are done in GTS Pro by the subtitler, not in the script): "
+            + "; ".join(do_not_sample) + "."
+        )
 
     system = (
         "You are a professional OTT subtitle editor at Iyuno Media Group. "
         "Your ONLY job is to apply the EXPLICITLY LISTED formatting rules to the dialogue text. "
         "This may include adding <i> italic tags, fixing hyphen speaker format, spelling out numbers, "
-        "replacing profanity, removing HOH elements, and fixing punctuation. "
-        "STRICT ANTI-HALLUCINATION RULES: "
+        "replacing profanity, removing HOH elements, and fixing punctuation."
+        + do_not_list +
+        " STRICT ANTI-HALLUCINATION RULES: "
         "(1) NEVER add formatting that is not explicitly required by the listed rules. "
         "(2) NEVER add <b> or </b> bold tags — bold is NEVER used in OTT subtitles. "
         "(3) NEVER change the meaning or content of the dialogue. "
@@ -60,17 +185,13 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
         "Return ONLY a bulleted list. Never skip any rule. Never add commentary."
     )
 
-    # Build numbered, actionable instructions
     instructions = []
-
-    # 1. Line length
     instructions.append(
         f"LINE LENGTH: Each subtitle line must NOT exceed {max_chars} characters. "
         f"If a single dialogue entry exceeds {max_chars} chars, insert a literal \\n "
         f"at a natural phrase boundary to split it into 2 lines."
     )
-
-    # 2. HOH/EMT removal
+    
     if "HOH" in remove or "EMT" in remove:
         instructions.append(
             "DELETE COMPLETELY (Hard-of-Hearing/EMT elements - these must be removed, NOT kept): "
@@ -80,123 +201,12 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
             "parentheses (...) that describes a sound, action, or stage direction. "
             "If an entire subtitle is only a sound effect, return nothing for that entry - skip it."
         )
-    elif "stage_directions" in remove:
-        instructions.append(
-            "DELETE stage directions: Remove ALL text inside parentheses (...) that describes "
-            "an action or emotion like (whispering), (laughs), (on phone), (V.O.), etc. "
-            "Keep only the spoken dialogue."
-        )
 
-    if "character_names" in remove:
-        instructions.append(
-            "DELETE character name labels: Remove names like 'JOHN:', 'MARY -', 'NARRATOR:' "
-            "that appear before dialogue. Keep only the actual spoken words."
-        )
-
-    if "fillers" in remove:
-        instructions.append(
-            "DELETE filler words: Remove ugh, hmm, erm, um, uh, ah, oh (and variants like "
-            "uhh, umm, ahhh) plus any comma or period directly after them."
-        )
-
-    # 3. Two-speaker hyphen format - CRITICAL
-    speaker_fmt = platform.get("two_speaker_format", "")
-    if speaker_fmt == "hyphen_no_space":
-        instructions.append(
-            "TWO SPEAKERS - HYPHEN WITHOUT SPACE: When two different speakers appear in one subtitle, "
-            "start EACH speaker's line with a hyphen immediately touching the first word - NO space. "
-            "CORRECT: -I said hello.\\n-She waved back. "
-            "WRONG: - I said hello. "
-            "This applies whenever dialogue switches speaker within one subtitle block."
-        )
-    elif speaker_fmt == "hyphen_with_space":
-        instructions.append(
-            "TWO SPEAKERS - HYPHEN WITH SPACE: When two speakers appear in one subtitle, "
-            "start EACH speaker's line with a hyphen followed by ONE space then the word. "
-            "CORRECT: - I said hello.\\n- She waved back. "
-            "WRONG: -I said hello."
-        )
-
-    # 4. Interruptions and trail-offs
-    instructions.append(
-        "INTERRUPTIONS: Use -- (double hyphen, no spaces) when a sentence is cut off mid-way "
-        "e.g. 'I was just going to--' or '--Never mind.' "
-        "TRAIL-OFFS / PAUSES: Use ... (exactly 3 dots, no more, no less) when someone trails off "
-        "or there's a long pause: 'I don't know...' "
-        "NEVER use !! or ?? or !? or ?! - use only single ! or single ?."
-    )
-
-    # 5. Number rules
-    if "1-10 in words" in rules_text or "Numbers 1-10" in rules_text:
-        instructions.append(
-            "NUMBERS: Write the numbers one through ten as words (one, two, three, four, five, "
-            "six, seven, eight, nine, ten). Write 11 and above as numerals (11, 42, 1000). "
-            "EXCEPTIONS: years (2024), addresses (42 Main St), time (3:00 PM), "
-            "measurements (6ft, 50mph), percentages (5%) always stay as numerals."
-        )
-    elif "1-9" in rules_text or "spell out numbers 1-9" in rules_text.lower():
-        instructions.append(
-            "NUMBERS: Write one through nine as words. Ten (10) and above stay as numerals. "
-            "EXCEPTIONS: years, addresses, time, measurements always use numerals."
-        )
-    elif "0-9 written out" in rules_text:
-        instructions.append(
-            "NUMBERS: Write zero through nine as words (zero, one, two... nine). "
-            "10 and above stay as numerals."
-        )
-
-    # 6. ITALICS - the most important formatting rule
-    no_italics_platforms = ["Nickelodeon", "TVB", "Scripps"]
-    is_no_italics = any(p in platform_name for p in no_italics_platforms)
-
-    if is_no_italics:
-        instructions.append(
-            "ITALICS: This platform does NOT allow italic formatting. "
-            "Do NOT write any <i> or </i> tags. "
-            "If the input already has <i> tags, remove them and keep just the plain text."
-        )
-    else:
-        italic_cases = []
-        if "song" in rules_text.lower() and "italic" in rules_text.lower():
-            italic_cases.append(
-                "SONG LYRICS: Any line that contains a music note symbol (like a song being sung) "
-                "MUST be wrapped in <i>...</i> tags. "
-                "Example: <i>La la la, singing in the rain</i> or <i>♪ Hold me close ♪</i>"
-            )
-        if "narrat" in rules_text.lower() and "italic" in rules_text.lower():
-            italic_cases.append(
-                "NARRATION / VOICE-OVER (VO): Lines spoken by a narrator or heard as voice-over "
-                "MUST be wrapped in <i>...</i> tags. "
-                "Example: <i>Three years later, the city had changed.</i>"
-            )
-        if "phone" in rules_text.lower() and "italic" in rules_text.lower():
-            italic_cases.append(
-                "PHONE / RADIO / TV / INTERCOM: Dialogue heard through a phone, radio, TV, "
-                "or intercom MUST be in italics. "
-                "Example: <i>Can you hear me now?</i>"
-            )
-        if "foreign" in rules_text.lower() and "italic" in rules_text.lower():
-            italic_cases.append(
-                "FOREIGN WORDS: Non-English words or phrases (French, Spanish, etc.) that are "
-                "not common English loanwords MUST be in italics inline. "
-                "Example: She said <i>voila</i> and smiled. "
-                "Do NOT italicise common words like cafe, yoga, karma, naïve."
-            )
-        if "Disney" in platform_name:
-            # Disney has very specific VO/narrator rules
-            italic_cases.append(
-                "OFF-SCREEN SOUNDS heard through speakers/device: Use italics. "
-                "But off-camera dialogue (person just not visible on screen) does NOT get italics."
-            )
-        if italic_cases:
-            instructions.append(
-                "ITALICS - USE <i>...</i> HTML TAGS FOR THESE CASES:\n"
-                + "\n".join(f"  {c}" for c in italic_cases)
-                + "\n  IMPORTANT: Write actual <i> and </i> in the text output. "
-                "Do NOT just describe the formatting - actually add the tags."
-            )
-
-    # CRITICAL: Anti-hallucination / plain text default rule
+    # Dynamic rules mapping
+    dynamic_instructions = _rules_to_instructions(platform)
+    for dyn in dynamic_instructions:
+        instructions.append(dyn)
+        
     instructions.insert(0,
         "PLAIN TEXT DEFAULT — CRITICAL: The dialogue text must remain PLAIN unless a specific rule "
         "below explicitly requires formatting. DO NOT add <i>, <b>, or any HTML tags unless "
@@ -205,84 +215,6 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
         "NEVER rewrite, paraphrase or change the meaning of any dialogue. "
         "ONLY fix what the rules explicitly say to fix."
     )
-
-    # 7. Profanity
-    if profanity_table:
-        pairs = ", ".join(f"{k}=>{v}" for k, v in list(profanity_table.items())[:12])
-        instructions.append(
-            f"PROFANITY REPLACEMENT: Replace these exact words: {pairs}. "
-            "Apply the same pattern to other forms: if fuck=>fxxx, then fucking=>fxxxing, "
-            "fucked=>fxxxed, fucker=>fxxxer. Case-insensitive."
-        )
-    elif platform.get("profanity_format") == "bleep_asterisk":
-        instructions.append(
-            "PROFANITY (BLEEP): Replace bleeped/censored words with *bleep* in lowercase. "
-            "If it starts a sentence, use *Bleep* (capital B)."
-        )
-    elif platform.get("profanity_format") == "xxx":
-        instructions.append(
-            "PROFANITY (XXX FORMAT): Replace profanity with xxx censoring: "
-            "fuck=>fxxx, cunt=>cxxx, pussy=>pxxx, shit=>sxxx, cock=>cxxx, bitch=>bxxx. "
-            "Apply to all word forms."
-        )
-
-    if "asterisks (****)" in rules_text:
-        instructions.append(
-            "BEEPED PROFANITY: If there is beeped/censored audio, use exactly four asterisks (****) to represent it."
-        )
-
-    if "subtitling by iyuno" in rules_text.lower():
-        instructions.append(
-            "END CREDIT: You MUST add a final subtitle line that says exactly: 'Subtitling by Iyuno' at the very end of the dialogue."
-        )
-
-    # 8. Capitalisation
-    instructions.append(
-        "CAPITALISATION: Start every subtitle line with a capital letter. "
-        "Exception: if a line begins with ... (ellipsis continuing previous thought), "
-        "the first letter after ... may be lowercase: ...still waiting."
-    )
-
-    # 9. Punctuation
-    instructions.append(
-        "PUNCTUATION FIXES (apply all):\n"
-        "  - Remove spaces before punctuation: 'hello .' => 'hello.'\n"
-        "  - Replace !! or !!! with single !\n"
-        "  - Replace ?? or ??? with single ?\n"
-        "  - Replace !? or ?! with single !\n"
-        "  - Replace .... or ..... with ... (always exactly 3 dots for ellipsis)\n"
-        "  - Remove double spaces\n"
-        "  - No period at end of a line if the sentence continues on the next subtitle"
-    )
-
-    # 10. Acronyms
-    if any(x in rules_text for x in ["FBI", "BBC", "CIA", "Acronym", "acronym"]):
-        instructions.append(
-            "ACRONYMS: Write without periods between letters. "
-            "FBI not F.B.I., NASA not N.A.S.A., CIA not C.I.A., NATO not N.A.T.O."
-        )
-
-    # 11. US English
-    instructions.append(
-        "US ENGLISH SPELLING: Use American spelling throughout. "
-        "Examples: color (not colour), realize (not realise), favorite (not favourite), "
-        "theater (not theatre), center (not centre)."
-    )
-
-    # 12. Song title formatting
-    if "song titles" in rules_text.lower() or "song" in rules_text.lower():
-        instructions.append(
-            "SONG TITLES: Put song titles in double quotation marks: \"Bohemian Rhapsody\". "
-            "Actual sung lyrics go in italics: <i>Is this the real life?</i>"
-        )
-
-    # 13. RAW PLATFORM RULES
-    raw_rules = platform.get("rules", [])
-    if raw_rules:
-        rules_bulleted = "\n".join(f"  - {r}" for r in raw_rules)
-        instructions.append(
-            f"STRICT PLATFORM-SPECIFIC RULES (You MUST apply these where relevant):\n{rules_bulleted}"
-        )
 
     instructions_str = "\n\n".join(
         f"RULE {i+1}: {inst}" for i, inst in enumerate(instructions)
@@ -309,23 +241,14 @@ OUTPUT INSTRUCTIONS:
 - NEVER change the spoken words — only fix formatting, punctuation, and style.
 - ACTUALLY write -Word (or - Word) for two-speaker lines when the rule requires it.
 - When in doubt: output plain text.
-
-Example of correct output for a Disney platform:
-- two, three
-- -Wait, where are you going?\\n-I don't know...
-- <i>♪ She loves you, yeah yeah yeah ♪</i>
-- He was a fxxxing mess."""
-
+"""
     return system, user
-
-
-# --- MAIN CLEANER ---
 
 def clean_subtitle_chunk(
     raw_text: str,
     structure: str,
-    platform_key: str,
-    filename: str
+    platform_key: str = "generic",
+    filename: str = ""
 ) -> list[dict]:
     """
     Clean a single chunk of subtitle text using LLM.
@@ -400,18 +323,24 @@ def clean_subtitle_chunk(
                 line = line.strip()
                 if not line:
                     continue
-                # Remove bullet marker (- or *)
-                if line.startswith("-") or line.startswith("*"):
-                    # Only strip the FIRST bullet — two-speaker lines start with - too
-                    # Check if this is a bullet (single - at start) vs a two-speaker line
-                    # A real bullet has a space after: "- text" while two-speaker is "-text"
-                    if len(line) > 1 and line[1] == " ":
-                        cleaned_line = line[2:].strip()
-                    elif len(line) > 1 and line[1] == "*":
-                        cleaned_line = re.sub(r'^[*-]+\s*', '', line).strip()
-                    else:
-                        # Could be "-Speaker says this" two-speaker format — keep as-is
-                        cleaned_line = line
+                # Remove bullet marker (- or *), but preserve two-speaker prefixes.
+                # Rule: a BULLET is "- text" (dash-space-word).
+                #       a TWO-SPEAKER line is "-Word" or "-Word\n-Word" (dash immediately touching word).
+                if line.startswith("* "):
+                    # Markdown bullet with asterisk — always a bullet marker
+                    cleaned_line = line[2:].strip()
+                elif line.startswith("- "):
+                    # Dash-space: strip the bullet, but check if the content itself
+                    # starts with another dash (two-speaker nested under a bullet).
+                    content = line[2:].strip()
+                    # Keep as-is — content may be "-Speaker1\n-Speaker2"
+                    cleaned_line = content
+                elif line.startswith("-") and len(line) > 1 and line[1] not in (' ', '-'):
+                    # No space after dash: this IS a two-speaker prefix — keep whole line
+                    cleaned_line = line
+                elif line.startswith("**") or line.startswith("--"):
+                    # Double marker — strip outer markers
+                    cleaned_line = re.sub(r'^[*-]{2}\s*', '', line).strip()
                 else:
                     cleaned_line = line
 
@@ -506,6 +435,69 @@ def _error_result(platform_key, structure, filename, error_msg):
 # --- PLATFORM RULE EXTRACTOR ---
 
 
+def _normalize_rule_text(rule: str) -> str:
+    """
+    Turn a raw LLM rule fragment into a clean, properly-written rule sentence.
+
+    - Strips the scaffolding the 8B model sometimes emits (verbatim quotes,
+      JSON keys like 'rule:'/'verbatim_quote:', leading bullets/numbers).
+    - Collapses whitespace, capitalises the first word, and removes any
+      trailing period so the rule list reads uniformly.
+    - Drops empty / junk results.
+    """
+    if not rule or not isinstance(rule, str):
+        return ""
+    text = rule.strip()
+    if not text:
+        return ""
+
+    # Remove JSON-ish keys the model may have leaked:  "rule": "...",  "verbatim_quote": "..."
+    text = re.sub(r'^\s*(?:rule|verbatim_quote|quote|category|type)\s*[:=]\s*', '', text, flags=re.IGNORECASE)
+    # Remove wrapping quotes / brackets
+    text = text.strip('"\'`{}[] ')
+    # Strip a leading bullet or ordinal like "1." / "- " / "* "
+    text = re.sub(r'^[\-\*•]\s*', '', text)
+    text = re.sub(r'^\d+[\.\)]\s*', '', text)
+    # Remove any stray trailing quote fragments
+    text = text.strip('"\'` ')
+    text = re.sub(r'\s+', ' ', text).strip()
+    if not text:
+        return ""
+
+    # Capitalise first alphabetic character
+    m = re.search(r'[a-zA-Z]', text)
+    if m and text[m.start()].islower():
+        text = text[:m.start()] + text[m.start()].upper() + text[m.start() + 1:]
+
+    # Drop a single trailing period (rules are list items, not sentences with full stops)
+    if text.endswith('.'):
+        text = text[:-1].strip()
+
+    # Sanity: discard if it's basically just a quote fragment or too short
+    if len(text) < 4:
+        return ""
+    return text
+
+
+def _normalize_rule_list(rules: list) -> list:
+    """Normalize + de-duplicate a list of rule strings into clean rule sentences."""
+    out = []
+    seen = set()
+    for r in rules:
+        if not isinstance(r, str):
+            continue
+        # If the model returned an object, pull the 'rule' field
+        norm = _normalize_rule_text(r)
+        if not norm:
+            continue
+        key = norm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(norm)
+    return out
+
+
 def _repair_truncated_json(text: str) -> str:
     """
     Attempt to close a JSON object/array that was cut off by a token limit.
@@ -548,26 +540,107 @@ def _repair_truncated_json(text: str) -> str:
     return text + suffix
 
 
-def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str) -> list:
+def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str) -> dict:
     """
     Call LLM for a single chunk of guidelines text.
-    Returns list of rule strings extracted from this chunk.
+    Returns a dict with extracted script and subtitler rules.
     """
+    import json
+    import re as _re
+
     prompt = f"""Read this section of subtitle guidelines for "{platform_name}".
 
 YOUR TASK:
-Extract EVERY distinct rule or instruction you can find, but categorize them into two groups.
-Return a JSON object with two arrays of strings.
+Extract EVERY distinct rule or instruction you can find, and categorize each into EXACTLY ONE of two groups based on what the tool's SCRIPT CLEANER can actually DO.
+
+This tool's script cleaner is an AUTOMATED text formatter. It ONLY changes the DIALOGUE
+TEXT of subtitles. Its actual, verified capabilities are:
+
+SCRIPT-CLEANING CAPABILITIES (→ put these in "script_rules"):
+  - Maximum characters per line / maximum number of lines per subtitle
+  - Remove HOH / SDH / sound elements: [MUSIC], [LAUGHTER], (applause), etc.
+  - Remove stage directions, scene descriptions, script annotations, (OPTIONAL) notes
+  - Remove character / speaker name labels
+  - Remove filler words (uh, hmm, er, um)
+  - Replace profanity (per a profanity word list) or mask with asterisks (****)
+  - Punctuation: fix double spaces, space-before-punctuation, double/mixed punctuation
+  - Ellipsis normalised to three dots; leading ellipsis without a space
+  - Two-speaker hyphen format (-Word vs "- Word")
+  - Use quotation marks instead of apostrophes for quotes
+  - No periods in acronyms (F.B.I. -> FBI)
+  - Numbers spelled out in words (1-10, 0-9, or 1-9)
+  - Sentence-case capitalisation
+  - US / UK English spelling normalisation
+  - Split long lines to fit the character / line limit
+  - Italics for song lyrics, foreign words, narration / voice-over, phone / radio
+  - Characters per second (CPS) / reading-speed LIMIT expressed as a text constraint
+  - Removal of forbidden symbols (& < > degree copyright)
+
+OPERATIONAL ENGINE (the tool MACHINE-APPLIES these — extract them as rules, do NOT
+treat them as human-only):
+  - Reading-speed / CPS → re-times subtitles so dialogue is readable at the limit
+  - Minimum / maximum DURATION per subtitle
+  - Minimum GAP / frame interval between subtitles
+  - ZERO-SUBTITLE field (STORY: / LANG:) auto-inserted when required
+
+  SUBTITLER / OPERATIONAL TASKS (→ put these in "subtitler_rules"):
+  Our tool performs MORE than text cleaning — it also runs an operational engine
+  that MACHINE-APPLIES the following, so they are NOT human-only:
+  - Reading-speed / CPS limits, characters-per-second: the engine re-times each
+    subtitle so the dialogue is readable at the required CPS.
+  - Minimum / maximum DURATION of each subtitle (e.g. "min 5/6 second", "max 6s").
+  - Minimum GAP / frame interval between consecutive subtitles (e.g. "2-frame gap").
+  - ZERO-SUBTITLE field (STORY: / LANG:): the engine auto-inserts it when required.
+  These TIMING rules must still be extracted (into subtitler_rules) — they are fed
+  to the operational engine automatically; they are NOT discarded.
+
+  Genuinely HUMAN-ONLY tasks (capture as notes, not text changes):
+  - Positioning: top/bottom/centre justification, raising subtitles, overlap handling
+    (placement in the NLE — recorded as a delivery note).
+  - Font size / colour / type / face (a visual property of the deliverable).
+  - File naming convention, file format (PAC, etc. — unless it also states a text rule).
+  - Repo file / repositioning, end-credit file.
+  - Translator / subtitling credit subtitles (the actual credit line).
+  - Spellcheck pass.
+
+  IMPORTANT — DO NOT put text-cleaning rules in subtitler_rules. Anything about
+  the WORDS or PUNCTUATION of the dialogue (maximum characters per line, maximum
+  number of lines, capitalisation/case, spelling, profanity, ellipsis, acronyms,
+  italics, removal of [MUSIC]/[LAUGHTER]/HOH/sound cues, filler words, speaker
+  labels, two-speaker hyphen format, numbers spelled out, US/UK spelling) is ALWAYS
+  a script rule, even if it mentions seconds or frames. Only TIMING / DURATION /
+  GAP / POSITIONING / FONT / FILE / DELIVERY / CREDIT rules go to subtitler_rules.
+
+When in doubt, ask: "Does this change the WORDS or PUNCTUATION of the dialogue?" If YES
+→ script_rules. If it is a TIMING / READING-SPEED / DURATION / GAP / ZERO-SUBTITLE rule
+→ subtitler_rules (the operational engine applies it). If it is positioning/font/file/
+delivery → subtitler_rules (recorded as a human checklist note).
+
+HARD RULE: maximum characters per line, maximum number of lines, capitalisation/case,
+spelling, profanity, ellipsis, acronyms, italics, sound/HOH removal, filler words,
+speaker labels, number formatting, and US/UK spelling ALWAYS go to script_rules — never
+to subtitler_rules.
+
+Return a JSON object with two arrays of objects:
 
 {{
-    "script_rules": [],      // Rules about textual formatting, grammar, punctuation, line limits, reading speed, quotes, italics, casing.
-    "subtitler_rules": []    // Operational rules for human subtitlers (e.g. frame rates, timecode formats, syncing, positioning, file delivery).
+    "script_rules": [
+        {{ "rule": "Maximum 42 characters per line", "verbatim_quote": "no more than 42 characters on a single line" }}
+    ],
+    "subtitler_rules": [
+        {{ "rule": "Frame gap must be 2 frames", "verbatim_quote": "ensure a 2-frame gap between subtitles" }}
+    ]
 }}
 
 RULES FOR EXTRACTION:
 - Extract EVERY distinct rule you can find — do not skip any.
-- Include specific numeric limits (character counts, duration, CPS, etc.) in full.
+- Classify using the capability lists above. Text/punctuation/format changes go to
+  script_rules; timing/positioning/font/file/delivery go to subtitler_rules.
 - Each item must be one complete, self-contained rule sentence.
+- You MUST provide a 'verbatim_quote' for every rule — exact consecutive words copied
+  directly from the text.
+- If you cannot find a direct quote in the text for a rule, DO NOT include the rule.
+  (This is strictly to prevent hallucination.)
 - Do not include markdown code blocks. Return ONLY the raw JSON object.
 
 GUIDELINES SECTION:
@@ -584,22 +657,40 @@ GUIDELINES SECTION:
         )
         result_text = (response.choices[0].message.content or "").strip()
         # Strip markdown code fences
-        result_text = re.sub(r"```(?:json)?\s*", "", result_text).strip().rstrip("`")
+        result_text = _re.sub(r"```(?:json)?\s*", "", result_text).strip().rstrip("`")
+        
+        parsed = None
         # Try direct parse first
         try:
             parsed = json.loads(result_text)
-            if isinstance(parsed, dict):
-                return parsed
         except json.JSONDecodeError:
-            pass
-        # Try repairing truncated JSON
-        try:
-            repaired = _repair_truncated_json(result_text)
-            parsed = json.loads(repaired)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
+            # Try repairing truncated JSON
+            try:
+                repaired = _repair_truncated_json(result_text)
+                parsed = json.loads(repaired)
+            except Exception:
+                pass
+        
+        if isinstance(parsed, dict):
+            # Map object array back to string array, discarding hallucinated rules without quotes
+            def _extract_valid_rules(rule_objs):
+                valid = []
+                for obj in (rule_objs or []):
+                    if isinstance(obj, str): 
+                        valid.append(obj)
+                    elif isinstance(obj, dict):
+                        rule = obj.get("rule", "")
+                        quote = obj.get("verbatim_quote", "")
+                        # Simple anti-hallucination validation: require a quote with at least 1 word
+                        if rule and quote and len(quote.strip().split()) >= 1:
+                            valid.append(rule)
+                return valid
+
+            return {
+                "script_rules": _extract_valid_rules(parsed.get("script_rules", [])),
+                "subtitler_rules": _extract_valid_rules(parsed.get("subtitler_rules", []))
+            }
+
     except Exception as e:
         print(f"[RULES ERROR] LLM call failed: {e}")
     return {"script_rules": [], "subtitler_rules": []}
@@ -610,7 +701,7 @@ def _call_llm_for_metadata(client, model_name: str, platform_name: str, sample: 
     Extract numeric/structural metadata from the guidelines document.
     Returns a dict with numeric fields.
     """
-    prompt = f"""Read this subtitle guidelines document excerpt for "{platform_name}" and extract the numeric/structural metadata.
+    prompt = f"""Read this subtitle guidelines document excerpt for "{platform_name}" and extract the metadata the SCRIPT CLEANER needs.
 
 Return ONLY valid JSON (no comments, no markdown):
 {{
@@ -619,14 +710,30 @@ Return ONLY valid JSON (no comments, no markdown):
   "max_lines": 2,
   "min_duration_seconds": 1.0,
   "max_duration_seconds": 7.0,
-  "min_interval_seconds": 0.02,
-  "reading_speed_target_cps": 17,
   "reading_speed_max_cps": 21,
   "file_format": "PAC",
   "two_speaker_format": "hyphen_no_space",
   "zero_subtitle_required": true,
+  "remove_elements": ["stage_directions", "character_names", "hoh", "emt", "scene_descriptions", "fillers"],
+  "italics": "song_lyrics_and_foreign_words",
+  "profanity_handling": "replace_with_list_or_mask_asterisks",
   "summary": "One sentence summary of this platform's subtitle style"
 }}
+
+FIELD GUIDANCE:
+- "remove_elements": list ONLY the element types the guidelines say to REMOVE from the
+  dialogue text. Use these exact tokens when applicable:
+  "hoh" (Hard-of-Hearing / sound descriptors like [MUSIC]), "emt" (same family),
+  "stage_directions" (parenthetical actions/notes), "character_names" (speaker labels),
+  "scene_descriptions", "fillers" (uh/hmm/er). Omit any not mentioned.
+- "two_speaker_format": "hyphen_no_space" (-Word), "hyphen_with_space" (- Word), or "" if unspecified.
+- "italics": describe what gets italics — e.g. "song_lyrics", "foreign_words",
+  "narration_vo", "none" (platform forbids italics), or "all_common".
+- "profanity_handling": "replace" (swap per word list), "asterisks" (mask as ****),
+  "none", or "both".
+- Numeric fields: characters per line, max lines, and reading-speed (CPS) limits that
+  are stated as TEXT constraints on the subtitle. Leave timing/frame values out — those
+  are subtitler tasks, not cleaner metadata.
 
 DOCUMENT EXCERPT:
 ---
@@ -666,7 +773,7 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
        (char limits, duration, CPS, file format, etc.).
     5. Combine metadata + merged rules into the final platform dict.
     """
-    CHUNK_SIZE = 6000
+    CHUNK_SIZE = 3000
     client, model_name, _ = _get_client_and_model()
 
     default = {
@@ -707,25 +814,18 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
         
         s_rules = chunk_res.get("script_rules", [])
         m_rules = chunk_res.get("subtitler_rules", [])
-        print(f"[RULES] Chunk {i+1} yielded {len(s_rules)} script rules, {len(m_rules)} manual rules")
-        
+        # Post-process: move any subtitler-operational rules that the 8B model
+        # misclassified as script rules into the correct bucket.
+        if isinstance(s_rules, list) and isinstance(m_rules, list):
+            s_rules, m_rules = _filter_script_rules(s_rules, list(m_rules))
+        print(f"[RULES] Chunk {i+1} yielded {len(s_rules)} script rules, {len(m_rules)} subtitler rules")
+
         if isinstance(s_rules, list): all_script_rules.extend(s_rules)
         if isinstance(m_rules, list): all_subtitler_rules.extend(m_rules)
 
-    # ── Step 3: de-duplicate (case-insensitive, strip whitespace) ───────────
-    def _dedup(rule_list):
-        seen = set()
-        out = []
-        for r in rule_list:
-            if not isinstance(r, str): continue
-            key = r.strip().lower()
-            if key and key not in seen:
-                seen.add(key)
-                out.append(r.strip())
-        return out
-
-    unique_script_rules = _dedup(all_script_rules)
-    unique_subtitler_rules = _dedup(all_subtitler_rules)
+    # ── Step 3: normalize + de-duplicate into clean rule sentences ─────────
+    unique_script_rules = _normalize_rule_list(all_script_rules)
+    unique_subtitler_rules = _normalize_rule_list(all_subtitler_rules)
 
     print(f"[RULES] Total unique script rules: {len(unique_script_rules)}, subtitler rules: {len(unique_subtitler_rules)}")
 
@@ -737,6 +837,34 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
     metadata = _call_llm_for_metadata(client, model_name, platform_name, chunks[0])
 
     # ── Step 5: merge ────────────────────────────────────────────────────────
+    # Derive canonical script-cleaning rule phrases from the structured metadata
+    # so the cleaner's phrase-matchers (auto_fix_subtitles / italic_formatter /
+    # quality_checker) actually fire. The verbatim extracted rules already carry
+    # the platform's own wording; these ensure the engine knobs are always set.
+    derived_script = []
+    italics = (metadata.get("italics") or "").lower()
+    if "none" in italics:
+        derived_script.append("No italics — plain text only")
+    if "song" in italics:
+        derived_script.append("Song lyrics in italics")
+    if "foreign" in italics:
+        derived_script.append("Foreign words in italics")
+    if "narrat" in italics or "vo" in italics:
+        derived_script.append("Narration / voice-over in italics")
+    prof = (metadata.get("profanity_handling") or "").lower()
+    if "asterisk" in prof:
+        derived_script.append("Beeped profanity masked with asterisks (****)")
+    elif "replace" in prof or "both" in prof:
+        derived_script.append("Profanity replaced per platform profanity table")
+
+    # Merge derived phrases into the script rules, de-duplicating (case-insensitive).
+    merged_script = unique_script_rules[:]
+    seen = {r.lower() for r in merged_script}
+    for d in derived_script:
+        if d.lower() not in seen:
+            merged_script.append(d)
+            seen.add(d.lower())
+
     result = {
         "name":                     metadata.get("name", platform_name),
         "max_chars_per_line":       metadata.get("max_chars_per_line", 42),
@@ -749,8 +877,11 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
         "file_format":              metadata.get("file_format", "PAC"),
         "two_speaker_format":       metadata.get("two_speaker_format", "hyphen_no_space"),
         "zero_subtitle_required":   metadata.get("zero_subtitle_required", True),
+        "remove_elements":          metadata.get("remove_elements", []) or [],
+        "italics":                  metadata.get("italics", ""),
+        "profanity_handling":       metadata.get("profanity_handling", ""),
         "summary":                  metadata.get("summary", f"Custom platform: {platform_name}"),
-        "rules":                    unique_script_rules,
+        "rules":                    merged_script,
         "subtitler_rules":          unique_subtitler_rules,
     }
     return result

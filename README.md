@@ -25,6 +25,32 @@ Built with: React + Python FastAPI + Groq (LLaMA 3.1 8B Instant) + MySQL
 - Add any new platform by uploading their guidelines document
 - AI reads guidelines and extracts rules automatically
 
+### Subtitle Edit tab — Auto-Translate (multi-provider AI)
+The Subtitle Edit tab has an Auto-Translate window that mirrors Subtitle Edit's
+multi-engine translation. A subtitler picks a provider, pastes their own API
+key (plus optional model + custom endpoint), and every line is translated into
+the target language. The key is stored only in the browser (localStorage) and is
+sent straight to the engine you chose.
+
+Supported providers (just like Subtitle Edit):
+- **Google Translate** — free, no key needed (default)
+- **ChatGPT / OpenAI**, **Claude (Anthropic)**, **Google Gemini**
+- **DeepL**, **DeepSeek**, **Groq**, **Mistral**, **OpenRouter**, **Perplexity**
+- **Ollama** (local), **LibreTranslate** (local/hosted), **Azure Translator**
+- **OpenAI-Compatible API** — point at any `/v1/chat/completions` endpoint
+  (vLLM, LM Studio, Together, xAI, …)
+
+How to use:
+1. Open the Subtitle Edit tab → 🌐 Auto-Translate.
+2. Pick the engine, paste your API key (for keyed engines), choose model/endpoint.
+3. Pick Source (optional, leave blank = auto-detect) and Target language.
+4. Translate. A live “translating N / Total” popup shows progress; you can
+   Stop & Apply or Stop & Revert mid-flight. Speaker labels and `<i>`/`<b>`
+   tags are preserved.
+
+Server-side key fallback: if a subtitler leaves the key blank, the backend will
+use a matching env var (e.g. `OPENAI_API_KEY`) if you set one in `.env`.
+
 ---
 
 ## Built-in Platforms (from your OTT Clients Protocol Excel)
@@ -134,6 +160,8 @@ subtitleai-v2/
     file_reader.py       — Smart reader for all formats
     quality_checker.py   — OTT defect checker
     platform_rules.py    — All 8 real platform rules
+    editor.py            — Subtitle import/export/sync + translate dispatch
+    translate_engines.py — Multi-provider AI translation engines
     database.py          — MySQL setup
     requirements.txt
     .env.example

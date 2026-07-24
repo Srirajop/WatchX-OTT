@@ -70,6 +70,11 @@ def init_db():
     for col_def in [
         "ALTER TABLE platforms ADD COLUMN platform_family VARCHAR(100) DEFAULT NULL",
         "ALTER TABLE platforms ADD COLUMN version_label VARCHAR(100) DEFAULT 'Current'",
+        "ALTER TABLE platforms ADD COLUMN italics VARCHAR(100) DEFAULT ''",
+        "ALTER TABLE platforms ADD COLUMN profanity_handling VARCHAR(100) DEFAULT ''",
+        "ALTER TABLE platforms ADD COLUMN source_file_id VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE platforms ADD COLUMN source_filename VARCHAR(255) DEFAULT NULL",
+        "ALTER TABLE platforms ADD COLUMN source_files TEXT DEFAULT NULL",
     ]:
         try:
             cursor.execute(col_def)
@@ -120,7 +125,7 @@ def get_all_platforms():
     cursor.close()
     conn.close()
     result = {}
-    _list_fields = {"rules", "subtitler_rules", "remove_elements"}
+    _list_fields = {"rules", "subtitler_rules", "remove_elements", "source_files"}
     _dict_fields = {"profanity_table"}
     for row in rows:
         for field in _list_fields:
@@ -177,14 +182,17 @@ def save_custom_platform(platform_key: str, data: dict):
             min_duration_seconds, max_duration_seconds, min_interval_seconds,
             reading_speed_target_cps, reading_speed_max_cps,
             file_format, two_speaker_format, zero_subtitle_required,
-            rules, subtitler_rules, summary, is_custom, guidelines_raw
+            rules, subtitler_rules, remove_elements, profanity_table,
+            italics, profanity_handling, summary, is_custom, guidelines_raw,
+            source_file_id, source_filename, source_files
         ) VALUES (
             %s, %s, %s, %s,
             %s, %s,
             %s, %s, %s,
             %s, %s,
             %s, %s, %s,
-            %s, %s, %s, TRUE, %s
+            %s, %s, %s, %s, %s, %s, %s, TRUE, %s,
+            %s, %s, %s
         )
         ON DUPLICATE KEY UPDATE
             platform_family = VALUES(platform_family),
@@ -202,9 +210,16 @@ def save_custom_platform(platform_key: str, data: dict):
             zero_subtitle_required = VALUES(zero_subtitle_required),
             rules = VALUES(rules),
             subtitler_rules = VALUES(subtitler_rules),
+            remove_elements = VALUES(remove_elements),
+            profanity_table = VALUES(profanity_table),
+            italics = VALUES(italics),
+            profanity_handling = VALUES(profanity_handling),
             summary = VALUES(summary),
             is_custom = TRUE,
-            guidelines_raw = VALUES(guidelines_raw)
+            guidelines_raw = VALUES(guidelines_raw),
+            source_file_id = VALUES(source_file_id),
+            source_filename = VALUES(source_filename),
+            source_files = VALUES(source_files)
     """, (
         platform_key,
         family,
@@ -222,8 +237,15 @@ def save_custom_platform(platform_key: str, data: dict):
         data.get("zero_subtitle_required", True),
         json.dumps(data.get("rules", [])),
         json.dumps(data.get("subtitler_rules", [])),
+        json.dumps(data.get("remove_elements", []) or []),
+        json.dumps(data.get("profanity_table", {}) or {}),
+        data.get("italics", ""),
+        data.get("profanity_handling", ""),
         data.get("summary", ""),
-        data.get("guidelines_raw", "")[:20000]
+        data.get("guidelines_raw", "")[:20000],
+        data.get("source_file_id") or None,
+        data.get("source_filename") or None,
+        json.dumps(data.get("source_files") or [])
     ))
     conn.commit()
     cursor.close()

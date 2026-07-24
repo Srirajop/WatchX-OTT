@@ -42,7 +42,7 @@ def _is_credits_or_preserved(line: str) -> bool:
     """Return True if this line is credit/title/on-screen content that must not be filtered."""
     return bool(_MUST_PRESERVE.search(line))
 
-# Stage directions in ANY bracket type — catches ALL parenthetical content
+# Stage directions / annotations in ANY bracket type — catches ALL non-dialogue content
 _BRACKETS = re.compile(
     r'\(speaking\s+\w+\)\s*'           # (speaking Spanish)
     r'|\(through\s+\w+\)\s*'           # (through telephone)
@@ -65,7 +65,17 @@ _BRACKETS = re.compile(
     r'|<[^>]+>'                        # <gasps> <laughs>
     r'|\(LAUGHS?\)|\(CHUCKLES?\)|\(GASPS?\)|\(SIGHS?\)|\(SCREAMS?\)'
     r'|\(CRIES?\)|\(SOBBING\)|\(MOANS?\)|\(GROANS?\)'
-    r'|\([^)]+:\s*[^)]+\)',            # Slang notes like (Come on: interjection...)
+    r'|\(OPTIONAL\)\s*'                # (OPTIONAL) — script production note, never dialogue
+    # Slang/annotation notes — colon-style: (Come on: interjection) (Syd: nickname for Sydney)
+    r'|\([^)]+:\s*[^)]{3,120}\)'
+    # Annotation-keyword parentheticals — (mild profanity, expression of shock) etc.
+    r'|\(\s*(?:(?:mild\s+)?profanity|slang|informal|archaic|colloquial|dialect|'
+    r'expression\s+of|term\s+of|reference\s+to|nickname\s+for|short\s+for|'
+    r'abbreviation|contraction|idiom|euphemism|exclamation|interjection|'
+    r'onomatopoeia|rhetorical|literal(?:ly)?|figurative(?:ly)?|vulgar|'
+    r'offensive|derogatory)[^)]{0,120}\)'
+    # Trailing lowercase descriptor: "Go away. (dismissive)" → strip "(dismissive)"
+    r'|\(\s*[a-z][a-z\s,\-]{3,60}\)\s*$',
     re.IGNORECASE
 )
 
@@ -362,6 +372,9 @@ def extract_script_with_speaker(text: str) -> list[str]:
         line = line.strip()
         if not line:
             continue
+        # Skip internal system headers added by file_reader
+        if line.startswith('=== PAGE ') or line.startswith('=== PARAGRAPHS ==='):
+            continue
         # Remove leading timecode
         line = _TIMECODE.sub('', line).strip()
         if not line:
@@ -403,6 +416,9 @@ def extract_script_with_timecodes(text: str) -> list[str]:
     lines = []
     for line in text.splitlines():
         line = line.strip()
+        # Skip internal system headers
+        if line.startswith('=== PAGE ') or line.startswith('=== PARAGRAPHS ==='):
+            continue
         line = _TIMECODE.sub('', line).strip()
         if not line:
             continue
@@ -425,7 +441,11 @@ def extract_plain(text: str) -> list[str]:
     lines = []
     for line in text.splitlines():
         line = line.strip()
-        if not line:
+        if not line or line.startswith('=== PAGE ') or line.startswith('=== PARAGRAPHS ==='):
+            continue
+            
+        # Skip pure uppercase lines that look like speaker labels
+        if re.match(r'^[A-Z0-9\s\.\-\'\/\(\)\&\,]{3,}$', line) and not _is_credits_or_preserved(line):
             continue
         cleaned = _clean_line(line)
         if _is_valid(cleaned, min_words=1):
@@ -444,6 +464,131 @@ def _dedup(lines: list[str]) -> list[str]:
             result.append(line)
             prev = line
     return result
+
+
+# ── FOOTAGE TIMECODE HELPER ———————————————————————————————————————
+
+_FOOTAGE_RE = re.compile(r'^(\d{1,4})\.(\d{2})$')
+
+
+def _footage_to_hmsf(footage_str: str) -> str:
+    """
+    Convert a footage timecode string like '56.11' → '00:00:37:11' (HH:MM:SS:FF).
+    Uses 35mm 24fps standard: 16 frames per foot.
+    Returns '' if the string is not a valid footage timecode.
+    """
+    m = _FOOTAGE_RE.match(footage_str.strip())
+    if not m:
+        return ''
+    feet, frames = int(m.group(1)), int(m.group(2))
+    if frames > 15:          # 35mm frames are 0-15; >15 means it's a decimal number
+        return ''
+    total_frames = feet * 16 + frames
+    total_secs = total_frames / 24.0
+    h  = int(total_secs // 3600)
+    mn = int((total_secs % 3600) // 60)
+    s  = int(total_secs % 60)
+    f  = total_frames % 24
+    return f'{h:02d}:{mn:02d}:{s:02d}:{f:02d}'
+
+
+# ── CCSL FOOTAGE EXTRACTOR ———————————————————————————————————————
+
+def extract_ccsl_footage(text: str) -> list[str]:
+    """
+    Extract dialogue from Hollywood CCSL documents that use footage timecodes.
+
+    Expected column layout (pipe-separated after spatial PDF parser):
+      SC# | FOOTAGE/SHOT DESCRIPTION/DIALOGUE | TITLE# | TITLE | START | FINISH | TOTAL
+
+    The TITLE column (index 3 or 4) holds the subtitle text.
+    START and FINISH columns hold footage timecodes (e.g. 55.00, 62.05).
+    These are converted to HH:MM:SS:FF and returned as timecode-prefixed lines
+    so the main extractor can attach them to subtitle objects.
+
+    Returns lines in format: "HH:MM:SS:FF --> HH:MM:SS:FF | dialogue text"
+    or plain dialogue text if no timecodes are found.
+    """
+    lines = []
+
+    # If the text is pipe-delimited (from spatial parser), use column parsing
+    pipe_lines = [l for l in text.splitlines() if '|' in l and l.strip()]
+
+    if pipe_lines:
+        for raw_line in pipe_lines:
+            if raw_line.strip().startswith('==='): continue
+            cells = [c.strip() for c in raw_line.split('|')]
+            if not cells: continue
+
+            # Skip header rows
+            if any(h in ' '.join(cells).upper() for h in
+                   ['SC#', 'FOOTAGE', 'TITLE#', 'START:', 'FINISH:', 'TOTAL:',
+                    'SHOT DESCR', 'TIMECODE', 'TIME CODE']):
+                continue
+
+            # Try to find START, FINISH, TOTAL columns (footage format values at the end)
+            footage_cells = []
+            for i, cell in enumerate(cells):
+                if _footage_to_hmsf(cell):
+                    footage_cells.append((i, cell))
+
+            start_tc = ''
+            finish_tc = ''
+            title_col_idx = -1
+
+            if len(footage_cells) >= 3:
+                # START, FINISH, TOTAL
+                start_tc  = _footage_to_hmsf(footage_cells[-3][1])
+                finish_tc = _footage_to_hmsf(footage_cells[-2][1])
+                title_col_idx = footage_cells[-3][0] - 1
+            elif len(footage_cells) == 2:
+                # START, FINISH
+                start_tc  = _footage_to_hmsf(footage_cells[-2][1])
+                finish_tc = _footage_to_hmsf(footage_cells[-1][1])
+                title_col_idx = footage_cells[-2][0] - 1
+            elif len(footage_cells) == 1:
+                start_tc = _footage_to_hmsf(footage_cells[0][1])
+                title_col_idx = footage_cells[0][0] - 1
+            
+            # If we couldn't find any timecode columns, it's not a valid subtitle row in CCSL
+            if title_col_idx < 0:
+                continue
+
+            # The TITLE (dialogue) is the cell immediately before START.
+            # However, if that cell is empty or looks like TITLE#, step back one more.
+            dialogue = cells[title_col_idx] if title_col_idx < len(cells) else ''
+            if not dialogue or re.match(r'^[\d\-\.]+$', dialogue):
+                if title_col_idx - 1 >= 0:
+                    dialogue = cells[title_col_idx - 1]
+
+            dialogue = _clean_line(dialogue)
+            dialogue = _SPEAKER_LABEL.sub('', dialogue).strip()
+            dialogue = re.sub(r'\([^)]{1,80}:[^)]{1,80}\)', '', dialogue).strip()
+
+            if not dialogue or not _is_valid(dialogue):
+                continue
+
+            # Skip scene descriptions that accidentally leaked in (strip leading footage/numbers first)
+            text_only = re.sub(r'^[\d\.\-\s]+', '', dialogue)
+            if _SCENE_HEADINGS.match(text_only) or _SKIP_PATTERNS.search(dialogue):
+                continue
+
+            # Skip "EXISTING ONSCREEN NARRATIVE TITLE:" prefixes
+            dialogue = re.sub(r'^(EXISTING\s+)?(ONSCREEN\s+)?(NARRATIVE\s+)?TITLE:\s*', '', dialogue, flags=re.IGNORECASE).strip()
+
+            # Build output line with timecodes if available
+            if start_tc and finish_tc:
+                lines.append(f'{start_tc} --> {finish_tc} | {dialogue}')
+            elif start_tc:
+                lines.append(f'{start_tc} | {dialogue}')
+            else:
+                lines.append(dialogue)
+
+        return _dedup(lines)
+
+    # Fallback: no pipe structure — treat as plain paragraph script
+    # Footage numbers will be filtered by the timecode skip pattern
+    return extract_script_with_speaker(text)
 
 
 # ── DISPATCHER ───────────────────────────────────────────────────────────────────
@@ -474,6 +619,7 @@ def pre_extract_dialogue(raw_text: str, structure: str, file_bytes: bytes = None
         'vtt_format':              extract_vtt,
         'table_with_timecodes':    extract_table,
         'ccsl_double_dialogue':    extract_table,
+        'ccsl_footage':            extract_ccsl_footage,  # Hollywood footage-TC format
         'excel_spotting_list':     extract_table,
         'paragraph_with_speaker':  extract_script_with_speaker,
         'paragraph_without_table': extract_script_with_timecodes,

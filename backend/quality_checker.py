@@ -86,8 +86,13 @@ def _strip_remaining_char_names(text: str) -> str:
     return '\n'.join(cleaned)
 
 def _capitalize_line(line: str) -> str:
-    # If it starts with ellipsis, keep lowercase as it indicates mid-sentence continuation
+    # If it starts with ellipsis, keep lowercase — mid-sentence continuation
     if line.startswith('...'):
+        return line
+    # Two-speaker mid-sentence continuation: "-...text" or "- ...text" — do NOT capitalise
+    # e.g. "-...still waiting." should stay lowercase
+    stripped = line.lstrip('-').lstrip()
+    if stripped.startswith('...'):
         return line
     # Find the first alphabetic character and capitalize it if it's lower
     m = re.search(r'[a-zA-Z]', line)
@@ -181,7 +186,7 @@ _HINT_SPEC = {
     "number_to_word":            ("Number(s) converted to words", ["in words", "spell out", "1-10", "0-9", "1-9"]),
     "us_spelling":               ("British -> US English spelling normalised", ["us english", "american", "spelling"]),
     "line_limit":                ("Line split to fit character / line limit", ["maximum", "characters per line", "lines per subtitle"]),
-    "zero_subtitle":             ("Zero-subtitle fields corrected", ["zero subtitle", "story:", "lang:"]),
+    "zero_subtitle":             ("Zero subtitle (programme info) auto-injected at 00:00:00", ["zero subtitle", "story:", "lang:"]),
     "italics_added":             ("Italics added (song / VO / phone / foreign word)", ["italic"]),
     "italics_removed":           ("Italics removed (platform does not allow italics)", ["no italic", "no text style", "italic"]),
 }
@@ -353,10 +358,59 @@ def auto_fix_subtitles(subtitles: list, platform_key: str) -> list:
             text = re.sub(r'\[SINGING[^\]]*\]', '', text, flags=re.IGNORECASE)
             text = re.sub(r'\[[^\]]*(?:sound|music|applause|laughter|singing|cheering|gunshot|explosion)[^\]]*\]', '', text, flags=re.IGNORECASE)
             text = re.sub(r'\(.*?(?:music|singing|narrator|narrating|chuckles|laughs|sighs|gasps|crying|sobbing|whimpering).*?\)', '', text, flags=re.IGNORECASE)
-            # Remove any remaining [...] blocks that look like HOH
-            text = re.sub(r'\[[A-Z ]+\]', '', text)
+            # Remove any remaining [...] bracket content (case-insensitive catch-all)
+            # Limit to 80 chars so we don't accidentally eat entire dialogue sentences
+            text = re.sub(r'\[[^\]]{0,80}\]', '', text, flags=re.IGNORECASE)
 
-        # 2. Remove stage directions
+        # 2a. UNIVERSAL: Strip (OPTIONAL) marker — always a script production note, never dialogue.
+        # e.g. "(OPTIONAL) MALE #1 - Right here." → "MALE #1 - Right here." (speaker label then stripped separately)
+        text = re.sub(r'\(OPTIONAL\)\s*', '', text, flags=re.IGNORECASE).strip()
+
+        # 2b. UNIVERSAL: Strip script annotations — these are NEVER dialogue.
+        # Source documents (CCSL, spotting lists, dialogue lists) embed editor notes
+        # inside parentheses: (Syd: nickname for Sydney), (mild profanity, expression of shock),
+        # (Come on: interjection), (informal), (slang for X), (archaic term), etc.
+        # These must be removed for ALL platforms — they are not part of the subtitle.
+        #
+        # Pattern 1: colon-style annotations (word: description) — very reliable signal
+        text = re.sub(
+            r'\([^)]{1,120}:[^)]{1,120}\)',
+            '',
+            text
+        )
+        # Pattern 2: annotation-keyword parentheticals (with or without colon)
+        # matches trailing or mid-line parentheticals containing annotation words
+        _ANNOTATION_KW = re.compile(
+            r'\(\s*(?:'
+            r'(?:mild\s+)?profanity|slang|informal|archaic|colloquial|dialect|'
+            r'expression\s+of|term\s+of|reference\s+to|nickname\s+for|'
+            r'short\s+for|abbreviation|contraction|idiom|euphemism|'
+            r'exclamation|interjection|onomatopoeia|rhetorical|'
+            r'literal(?:ly)?|figurative(?:ly)?|vulgar|offensive|derogatory'
+            r')[^)]{0,120}\)',
+            re.IGNORECASE
+        )
+        text = _ANNOTATION_KW.sub('', text)
+        # Pattern 3: trailing parenthetical at very end of line — if the remaining
+        # text without it is still valid dialogue, remove the trailing note.
+        # e.g. "Go away. (dismissive)" → "Go away."
+        # Guard: only remove if what's inside looks like a descriptor (no verb forms,
+        # no question/exclamation marks) and the text outside is at least 5 chars.
+        def _strip_trailing_annotation(m):
+            content = m.group(1)
+            # Keep if it's likely actual dialogue continuation (has ?, !, or verb+object)
+            if re.search(r'[?!]', content):
+                return m.group(0)
+            # Keep if it looks like a quoted word or name (short, titlecase)
+            if len(content.split()) <= 2 and content[0].isupper():
+                return m.group(0)
+            # Remove if content is a descriptor phrase (all lowercase or starts lowercase)
+            if content and content[0].islower():
+                return ''
+            return m.group(0)
+        text = re.sub(r'\s*\(([^)]{5,80})\)\s*$', _strip_trailing_annotation, text, flags=re.MULTILINE)
+
+        # 2b. Remove stage directions (platform-gated)
         if "stage_directions" in remove_elements:
             text = re.sub(r'\([^)]{1,100}\)', '', text)
             text = re.sub(r'\[[^\]]{1,100}\]', '', text)
@@ -393,9 +447,14 @@ def auto_fix_subtitles(subtitles: list, platform_key: str) -> list:
         text = re.sub(r'(?<!\.)\.{2}(?!\.)', '...', text)
 
         # 10. Two-speaker hyphen format
+        # First normalize em-dash / en-dash at line start — LLM sometimes outputs
+        # —Speaker or –Speaker instead of -Speaker.
+        text = re.sub(r'^[–—]', '-', text, flags=re.MULTILINE)
         if speaker_fmt == "hyphen_no_space":
+            # Convert "- Word" → "-Word" (remove space after leading dash)
             text = re.sub(r'^- ', '-', text, flags=re.MULTILINE)
         elif speaker_fmt == "hyphen_with_space":
+            # Convert "-Word" → "- Word" (add space after leading dash)
             text = re.sub(r'^-([^\-\s])', r'- \1', text, flags=re.MULTILINE)
 
         # --- PLATFORM-SPECIFIC TEXTUAL RULE ENFORCEMENT ---

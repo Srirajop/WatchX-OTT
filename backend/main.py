@@ -15,11 +15,11 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
 if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from dotenv import load_dotenv
-import json, io, re
+import json, io, re, asyncio
 
 from database import init_db, get_all_platforms, save_custom_platform, log_job
 from file_reader import read_file
@@ -265,7 +265,24 @@ async def clean_file_endpoint(
 
         # ── Auto-fix pass: apply platform rules in Python (100% reliable) ──
         from quality_checker import auto_fix_subtitles
+        from platform_rules import get_platform as _get_platform
         all_subtitles = auto_fix_subtitles(all_subtitles, platform)
+
+        # Re-evaluate flagged status after auto_fix.
+        # auto_fix resolves most issues (line splitting, profanity, formatting).
+        # Only keep flagged=True if the line is STILL too long after splitting.
+        _plat = _get_platform(platform)
+        _max_chars = int(_plat.get("max_chars_per_line", 42))
+        for sub in all_subtitles:
+            if sub.get("flagged"):
+                # Check if line is actually still too long
+                _still_long = any(
+                    len(re.sub(r'<[^>]+>', '', ln)) > _max_chars
+                    for ln in sub.get("text", "").split("\n")
+                )
+                if not _still_long:
+                    sub["flagged"] = False
+                    sub["flag_reason"] = ""
 
         total_lines = len(all_subtitles)
         flagged_lines = sum(1 for s in all_subtitles if s.get("flagged"))
@@ -913,6 +930,278 @@ async def adjust_timecodes_endpoint(data: dict):
 
 
 
+# ─── CLEANING & EXTRACTING ───────────────────────────────────────────
+
+@app.post("/extract")
+async def extract_endpoint(file: UploadFile = File(...)):
+    """Extract subtitles / timecodes from any uploaded file (SRT, VTT, DOCX, TXT, PDF, image)."""
+    file_bytes = await file.read()
+    filename = file.filename or "subtitles.txt"
+
+    async def event_stream():
+        yield f"data: {json.dumps({'status': 'starting', 'message': 'Reading uploaded file...', 'progress': 5})}\n\n"
+        await asyncio.sleep(0.05)
+        try:
+            from file_reader import read_file
+            from timecoded_subtitles import parse_timecoded_subtitles
+
+            file_data = read_file(file_bytes, filename)
+            raw_text = file_data.get("raw_text", "")
+
+            yield f"data: {json.dumps({'status': 'processing', 'message': 'Parsing subtitle dialogue & timecodes...', 'progress': 50})}\n\n"
+
+            parsed = parse_timecoded_subtitles(raw_text)
+            if not parsed:
+                lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+                parsed = [{"id": i, "start_time": "", "end_time": "", "text": line} for i, line in enumerate(lines, 1)]
+
+            subs = []
+            for i, item in enumerate(parsed, 1):
+                subs.append({
+                    "id": item.get("id", i),
+                    "start_time": item.get("start_time", ""),
+                    "end_time": item.get("end_time", ""),
+                    "text": item.get("text", ""),
+                    "flagged": False,
+                    "flag_reason": ""
+                })
+
+            stats = {
+                "total_lines": len(subs),
+                "original_format": filename,
+                "structure": file_data.get("structure", "unknown")
+            }
+
+            yield f"data: {json.dumps({'status': 'completed', 'progress': 100, 'result': {'subtitles': subs, 'stats': stats}})}\n\n"
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
+@app.post("/clean-extracted")
+async def clean_extracted_endpoint(data: dict):
+    """
+    Deterministic platform-rule cleaning of already-extracted subtitles.
+
+    Zero hallucination — uses ONLY Python rule engines, no LLM.
+    The AI (Groq/LM Studio) is for raw script → subtitle extraction only.
+    For already-extracted subtitles the deterministic engine is MORE accurate
+    because it applies every rule exactly, never changes dialogue meaning,
+    and never alters line counts.
+
+    Pipeline (in order):
+      1. clean_delivery_text   – remove speaker labels, stage directions, HOH noise
+      2. auto_fix_subtitles    – apply ALL platform rules: profanity, numbers, hyphen
+                                  format, italics, punctuation, sentence case,
+                                  US spelling, line splitting, HOH removal, etc.
+      3. prepare_for_platform  – timing repair: duration, gap, CPS, zero-subtitle
+      4. QC flag               – only flag lines with UNFIXABLE errors (still too long,
+                                  profanity missed, etc.) — not warnings/info
+    """
+    subs = data.get("subtitles", [])
+    platform_key = data.get("platform_key", "generic")
+    filename = data.get("filename", "subtitles.txt")
+
+    if not subs:
+        raise HTTPException(400, "No subtitles provided to clean")
+
+    async def event_stream():
+        yield f"data: {json.dumps({'status': 'starting', 'message': 'Loading platform rules...', 'progress': 0})}\n\n"
+        await asyncio.sleep(0.05)
+        try:
+            from platform_rules import get_platform
+            from timecoded_subtitles import prepare_for_platform, clean_delivery_text
+            from quality_checker import auto_fix_subtitles
+            from italic_formatter import apply_italics_rules
+
+            platform_dict = get_platform(platform_key)
+            platform_name = platform_dict.get("name", platform_key)
+            max_chars = int(platform_dict.get("max_chars_per_line", 42))
+
+            # ── Pass 1: Per-subtitle text cleaning ───────────────────────────
+            # Removes speaker labels, stage directions, HOH elements, metadata
+            # noise — preserves <i>/<b> tags, dialogue text, music notes ♪
+            yield f"data: {json.dumps({'status': 'processing', 'message': f'Cleaning text for {platform_name}...', 'progress': 15})}\n\n"
+            await asyncio.sleep(0.05)
+
+            pass1 = []
+            for sub in subs:
+                item = dict(sub)
+                item["original_text"] = sub.get("text", "")
+                cleaned_text = clean_delivery_text(sub.get("text", ""))
+                item["text"] = cleaned_text if cleaned_text.strip() else sub.get("text", "")
+                pass1.append(item)
+
+            # ── Pass 2: Full platform rule enforcement ────────────────────────
+            # Applies every deterministic rule: profanity, numbers, hyphen format,
+            # ellipsis, sentence case, US spelling, HOH removal, line splitting,
+            # two-speaker format, song lyric casing, acronyms, symbols, etc.
+            yield f"data: {json.dumps({'status': 'processing', 'message': f'Applying {platform_name} formatting rules...', 'progress': 40})}\n\n"
+            await asyncio.sleep(0.05)
+
+            pass2 = auto_fix_subtitles(pass1, platform_key)
+
+            # ── Pass 3: Italics rules ────────────────────────────────────────
+            # Applies platform-specific italics: song lyrics, VO, phone calls,
+            # foreign words, onscreen text — or strips italics if platform forbids
+            yield f"data: {json.dumps({'status': 'processing', 'message': 'Applying italics rules...', 'progress': 60})}\n\n"
+            await asyncio.sleep(0.05)
+
+            pass3 = apply_italics_rules(pass2, platform_key)
+
+            # ── Pass 4: Timing/structural rules ──────────────────────────────
+            # Repairs duration (min/max), gap between subtitles, CPS, zero-subtitle
+            yield f"data: {json.dumps({'status': 'processing', 'message': 'Applying timing and structural rules...', 'progress': 78})}\n\n"
+            await asyncio.sleep(0.05)
+
+            cleaned = prepare_for_platform(pass3, platform_key, filename)
+
+            # ── Pass 5: Targeted flag — unfixable errors only ─────────────────
+            # Only flag what genuinely could NOT be auto-fixed:
+            # - line still too long (very long word that can't be split)
+            # - profanity that slipped through all passes
+            # - HOH element that survived all passes
+            yield f"data: {json.dumps({'status': 'processing', 'message': 'Running quality check...', 'progress': 90})}\n\n"
+            await asyncio.sleep(0.05)
+
+            UNFIXABLE_TYPES = {
+                "LINE_TOO_LONG",          # single word longer than max_chars — human must rewrite
+                "TOO_MANY_LINES",         # needs human restructuring
+                "READING_SPEED_EXCEEDED", # text must be shortened — changing words = human job
+                "PROFANITY_NOT_REPLACED", # missed profanity
+                "HOH_EMT_ELEMENT",        # missed HOH element
+                "ZERO_SUBTITLE_INVALID",  # wrong/missing delivery fields
+            }
+
+            final_subs = []
+            for s in cleaned:
+                # Re-check line length post-cleaning — this is the single most
+                # reliable signal: if any line is STILL over max_chars after
+                # auto_fix tried to split it, a human needs to rewrite it.
+                lines_in_sub = s.get("text", "").split("\n")
+                still_too_long = any(
+                    len(re.sub(r'<[^>]+>', '', ln)) > max_chars
+                    for ln in lines_in_sub
+                )
+                final_subs.append({
+                    **s,
+                    "flagged": still_too_long,
+                    "flag_reason": (
+                        f"Line exceeds {max_chars} chars after auto-split — please shorten manually."
+                        if still_too_long else ""
+                    ),
+                })
+
+            yield f"data: {json.dumps({'status': 'processing', 'message': 'Finalizing...', 'progress': 97})}\n\n"
+            await asyncio.sleep(0.05)
+
+            changed_lines = sum(
+                1 for s in final_subs
+                if s.get("original_text", s.get("text", "")).strip() != s.get("text", "").strip()
+            )
+            stats = {
+                "total_lines": len(final_subs),
+                "flagged_lines": sum(1 for s in final_subs if s.get("flagged")),
+                "changed_lines": changed_lines,
+                "ai_used": False,
+                "platform": platform_name,
+                "original_format": filename,
+            }
+
+            yield f"data: {json.dumps({'status': 'completed', 'progress': 100, 'result': {'subtitles': final_subs, 'stats': stats}})}\n\n"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
+@app.post("/export/srt")
+async def export_srt_endpoint(data: dict):
+    subs = data.get("subtitles", [])
+    filename = (data.get("filename") or "subtitles").rsplit(".", 1)[0]
+    from timecoded_subtitles import subtitles_to_srt
+    content = subtitles_to_srt(subs)
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}_cleaned.srt"'}
+    )
+
+
+@app.post("/export/txt")
+async def export_txt_endpoint(data: dict):
+    subs = data.get("subtitles", [])
+    filename = (data.get("filename") or "subtitles").rsplit(".", 1)[0]
+    lines = []
+    for s in subs:
+        if s.get("start_time"):
+            lines.append(f"{s.get('start_time')} --> {s.get('end_time')}\n{s.get('text')}\n")
+        else:
+            lines.append(s.get("text", ""))
+    content = "\n".join(lines)
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{filename}_cleaned.txt"'}
+    )
+
+
+@app.post("/export/docx")
+async def export_docx_endpoint(data: dict):
+    subs = data.get("subtitles", [])
+    filename = (data.get("filename") or "subtitles").rsplit(".", 1)[0]
+    from docx import Document
+    doc = Document()
+    doc.add_heading(f"Cleaned Subtitles: {filename}", level=1)
+    for s in subs:
+        tc = f"{s.get('start_time','')} --> {s.get('end_time','')}" if s.get('start_time') else ""
+        p = doc.add_paragraph()
+        if tc:
+            p.add_run(tc + "\n").bold = True
+        p.add_run(s.get("text", ""))
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}_cleaned.docx"'}
+    )
+
+
+@app.post("/export/pdf")
+async def export_pdf_endpoint(data: dict):
+    subs = data.get("subtitles", [])
+    filename = (data.get("filename") or "subtitles").rsplit(".", 1)[0]
+    lines = []
+    for s in subs:
+        if s.get("start_time"):
+            lines.append(f"{s.get('start_time')} --> {s.get('end_time')}\n{s.get('text')}\n")
+        else:
+            lines.append(s.get("text", ""))
+    content = "\n".join(lines)
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{filename}_cleaned.txt"'}
+    )
+
+
+
 # ─── PLATFORMS ───────────────────────────────────────────────────
 
 @app.get("/platforms")
@@ -925,6 +1214,211 @@ def get_platforms():
         # DB not ready — return empty so UI prompts user to add guidelines
         return {"platforms": {}}
 
+
+
+def _extract_text_from_upload(file_bytes: bytes, filename: str, sheet_name: str = "") -> str:
+    """Return guideline text for one upload, OCR-inclusive (see file_reader)."""
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if ext in ("png", "jpg", "jpeg", "webp", "bmp", "gif"):
+        from ocr_reader import ocr_image_bytes
+        return ocr_image_bytes(file_bytes).strip()
+    if sheet_name.strip() and ext in ("xlsx", "xls"):
+        from file_reader import read_excel_sheet
+        return read_excel_sheet(file_bytes, sheet_name.strip()).strip()
+    from file_reader import read_file
+    return read_file(file_bytes, filename, force_ocr=True)["raw_text"].strip()
+
+
+def _save_one_platform(platform_name: str, version_label: str, raw_guidelines: str,
+                       source_files: list = None) -> dict:
+    """Extract rules from raw guideline text and persist one platform. Returns a result dict."""
+    platform_name = platform_name.strip()
+    version_label = version_label.strip() or "Current"
+    if not platform_name:
+        return {"status": "skipped", "reason": "Missing platform name"}
+
+    version_slug = re.sub(r'[^a-z0-9]', '_', version_label.lower()).strip('_')
+    platform_family = "custom_" + re.sub(r'[^a-z0-9]', '_', platform_name.lower())
+    platform_key = f"{platform_family}__{version_slug}"
+
+    if not raw_guidelines.strip():
+        return {"status": "skipped", "platform_name": platform_name,
+                "reason": "No readable text found in the document."}
+
+    print(f"[PLATFORMS] Extracting rules for '{platform_name}' v'{version_label}' from {len(raw_guidelines)} chars")
+    platform_data = extract_platform_rules_with_ai(raw_guidelines, platform_name)
+
+    platform_data["platform_family"] = platform_family
+    platform_data["version_label"]   = version_label
+    platform_data["guidelines_raw"]  = raw_guidelines
+    source_files = source_files or []
+    platform_data["source_files"]    = source_files
+    platform_data["source_file_id"]  = source_files[0]["id"] if source_files else None
+    platform_data["source_filename"] = source_files[0]["name"] if source_files else None
+
+    save_custom_platform(platform_key, platform_data)
+
+    rules_count = len(platform_data.get("rules", []))
+    print(f"[PLATFORMS] Saved '{platform_name}' ({version_label}) as '{platform_key}' with {rules_count} rules")
+
+    return {
+        "status": "ok",
+        "platform_key": platform_key,
+        "platform_family": platform_family,
+        "version_label": version_label,
+        "platform_name": platform_name,
+        "rules_extracted": rules_count,
+    }
+
+
+@app.post("/platforms/add-stream")
+async def add_platform_stream(
+    platform_name: str = Form(default=""),
+    version_label: str = Form(default="Current"),
+    sheet_name: str = Form(default=""),
+    guidelines_files: list[UploadFile] = File(default=[]),
+    guidelines_text: str = Form(default="")
+):
+    import asyncio, json as _json, queue as _queue, threading
+
+    file_snapshots = []
+    for f in guidelines_files:
+        if not f.filename:
+            continue
+        fb = await f.read()
+        if fb:
+            file_snapshots.append((f.filename, fb))
+    pasted = (guidelines_text or "").strip()
+    p_name = platform_name.strip()
+    v_label = version_label.strip() or "Current"
+    s_name = sheet_name.strip()
+
+    if not p_name and file_snapshots:
+        fname = file_snapshots[0][0]
+        base_name = _os.path.splitext(fname)[0]
+        clean_name = re.sub(r'^(screenshot|guidelines|rules|doc|pdf)_*', '', base_name, flags=re.IGNORECASE)
+        clean_name = re.sub(r'[\-_(0-9)]+', ' ', clean_name).strip()
+        p_name = clean_name.title() or "Custom Platform"
+
+    if not p_name:
+        p_name = "Custom Platform"
+
+    q: _queue.Queue = _queue.Queue()
+    SENTINEL = object()
+
+    def worker():
+        try:
+            from file_reader import list_excel_sheets
+            q.put({"status": "start", "progress": 5, "message": "Reading guideline document(s) & running OCR..."})
+
+            parts = []          # (label, text)
+            excel_files = []    # (filename, bytes)
+            source_files = []
+
+            for fname, fb in file_snapshots:
+                fid = _store_source_file(fb, fname)
+                if fid:
+                    source_files.append({"id": fid, "name": fname})
+
+            for fname, fb in file_snapshots:
+                ext = fname.lower().rsplit(".", 1)[-1]
+                if ext in ("xlsx", "xls") and not s_name:
+                    excel_files.append((fname, fb))
+                    continue
+                text = _extract_text_from_upload(fb, fname, s_name)
+                if text:
+                    parts.append((fname, text))
+
+            if pasted:
+                parts.append(("pasted_text", pasted))
+
+            # ── BULK EXCEL ────────────────────────────────────────────────────
+            if excel_files:
+                total = 0
+                try:
+                    for _, fb in excel_files:
+                        total += len(list_excel_sheets(fb) or [])
+                except Exception:
+                    total = len(excel_files)
+                done = 0
+                results = []
+                for fname, fb in excel_files:
+                    try:
+                        sheets = list_excel_sheets(fb) or []
+                    except Exception as e:
+                        results.append({"filename": fname, "status": "error", "reason": str(e)})
+                        continue
+                    if not sheets:
+                        results.append({"filename": fname, "status": "skipped", "reason": "No sheets found"})
+                        continue
+                    for sh in sheets:
+                        sname = sh["name"] if isinstance(sh, dict) else sh
+                        pname = p_name or sname
+                        done += 1
+                        prog = int(10 + (done / max(total, 1)) * 85)
+                        q.put({"status": "extracting", "progress": prog,
+                               "message": f'OCR + extracting rules — sheet "{sname}" ({done}/{total})',
+                               "sheet": sname})
+                        sheet_text = _extract_text_from_upload(fb, fname, sname)
+                        res = _save_one_platform(pname, v_label, sheet_text, source_files)
+                        res["filename"] = fname
+                        res["sheet_name"] = sname
+                        results.append(res)
+                ok = [r for r in results if r.get("status") == "ok"]
+                q.put({"status": "completed", "progress": 100, "result": {
+                    "success": True, "bulk": True, "total": len(results), "imported": len(ok),
+                    "results": results,
+                    "message": f"Imported {len(ok)} of {len(results)} sheets."
+                }})
+                return
+
+            # ── SINGLE PLATFORM ─────────────────────────────────────────────────
+            raw_guidelines = "\n\n".join(t for _, t in parts)
+            if not raw_guidelines.strip():
+                q.put({"status": "error", "error": "No readable text found in the document(s)."})
+                return
+
+            q.put({"status": "ocr", "progress": 30,
+                    "message": "OCR & image analysis complete. Extracting rules with AI..."})
+            res = _save_one_platform(p_name, v_label, raw_guidelines, source_files)
+            if res.get("status") != "ok":
+                q.put({"status": "error", "error": res.get("reason", "Could not import platform.")})
+                return
+
+            q.put({"status": "completed", "progress": 100, "result": {
+                "success": True,
+                "platform_key": res["platform_key"],
+                "platform_family": res["platform_family"],
+                "version_label": res["version_label"],
+                "platform_name": res["platform_name"],
+                "rules_extracted": res["rules_extracted"],
+                "message": f"Platform '{res['platform_name']}' saved with {res['rules_extracted']} rules extracted."
+            }})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            q.put({"status": "error", "error": str(e)})
+        finally:
+            q.put(SENTINEL)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def event_gen():
+        loop = asyncio.get_running_loop()
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is SENTINEL:
+                break
+            try:
+                yield f"data: {_json.dumps(item, ensure_ascii=False)}\n\n"
+            except Exception:
+                break
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
+    )
 
 
 @app.post("/platforms/add")
@@ -943,14 +1437,18 @@ async def add_platform(
     platform_key = f"{platform_family}__{version_slug}"
 
     raw_guidelines = ""
+    source_files = []
     if guidelines_file and guidelines_file.filename:
         file_bytes = await guidelines_file.read()
         if not file_bytes:
             raise HTTPException(400, "Uploaded guidelines file is empty")
 
+        fid = _store_source_file(file_bytes, guidelines_file.filename)
+        if fid:
+            source_files.append({"id": fid, "name": guidelines_file.filename})
+
         ext = guidelines_file.filename.lower().rsplit(".", 1)[-1]
         if sheet_name.strip() and ext in ("xlsx", "xls"):
-            # ── SHEET-SPECIFIC extraction: isolate one sheet from the workbook ──
             from file_reader import read_excel_sheet
             raw_guidelines = read_excel_sheet(file_bytes, sheet_name.strip())
             print(f"[PLATFORMS] Read sheet '{sheet_name}' → {len(raw_guidelines)} chars")
@@ -971,6 +1469,10 @@ async def add_platform(
     platform_data["platform_family"] = platform_family
     platform_data["version_label"]   = version_label.strip() or "Current"
     platform_data["guidelines_raw"]  = raw_guidelines
+    platform_data["source_files"]    = source_files
+    if source_files:
+        platform_data["source_file_id"]  = source_files[0]["id"]
+        platform_data["source_filename"] = source_files[0]["name"]
 
     save_custom_platform(platform_key, platform_data)
 
@@ -1033,6 +1535,12 @@ async def bulk_add_platforms(
     if not file_bytes:
         raise HTTPException(400, "File is empty")
 
+    source_files = []
+    if guidelines_file.filename:
+        fid = _store_source_file(file_bytes, guidelines_file.filename)
+        if fid:
+            source_files.append({"id": fid, "name": guidelines_file.filename})
+
     from file_reader import read_excel_sheet
 
     results = []
@@ -1061,6 +1569,10 @@ async def bulk_add_platforms(
             platform_data["platform_family"] = platform_family
             platform_data["version_label"]   = version
             platform_data["guidelines_raw"]  = raw
+            platform_data["source_files"]    = source_files
+            if source_files:
+                platform_data["source_file_id"]  = source_files[0]["id"]
+                platform_data["source_filename"] = source_files[0]["name"]
 
             save_custom_platform(platform_key, platform_data)
             rules_count = len(platform_data.get("rules", []))
@@ -1390,7 +1902,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     filename = file.filename or "audio.webm"
     
-    # Save the uploaded file to a temporary location for whisperX
+    # Save the uploaded file to a temporary location for Whisper
     with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
         content = await file.read()
         tmp.write(content)
@@ -1404,59 +1916,39 @@ async def transcribe_audio(file: UploadFile = File(...)):
         
         def worker():
             try:
-                import whisperx
-                q.put({"type": "status", "message": "Loading WhisperX model (small)...", "progress": 5})
-                device = "cpu"
-                compute_type = "int8"
-                # Use 'small' model — significantly better accuracy than 'base' with acceptable CPU speed
-                model = whisperx.load_model("small", device, compute_type=compute_type)
+                from faster_whisper import WhisperModel
 
-                q.put({"type": "status", "message": "Analyzing audio...", "progress": 10})
-                audio = whisperx.load_audio(tmp_path)
-                # WhisperX does VAD internally via load_model (no vad_filter argument in transcribe)
-                result = model.transcribe(audio, batch_size=4)
+                q.put({"type": "status", "message": "Loading Faster-Whisper AI model...", "progress": 10})
+                model = WhisperModel("small", device="cpu", compute_type="int8")
 
-                q.put({"type": "status", "message": "Running forced alignment for frame-accurate timecodes...", "progress": 55})
-                try:
-                    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
-                    result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
-                except Exception as align_err:
-                    print(f"[WhisperX] Alignment step failed ({align_err}), using raw Whisper timestamps")
+                q.put({"type": "status", "message": "Analyzing audio stream...", "progress": 20})
+                segments_gen, info = model.transcribe(
+                    tmp_path,
+                    beam_size=5,
+                    word_timestamps=True,
+                    vad_filter=True
+                )
 
-                duration = len(audio) / 16000.0
-                if duration <= 0: duration = 1.0
+                duration = getattr(info, "duration", 0) or 1.0
+                whisper_subs = []
 
-                q.put({"type": "status", "message": "Finalizing transcripts...", "progress": 92})
-                subs = []
-                for i, segment in enumerate(result["segments"], start=1):
-                    subs.append({
+                for i, seg in enumerate(segments_gen, start=1):
+                    pct = min(95, max(20, int(20 + (seg.end / duration) * 75)))
+                    q.put({"type": "status", "message": f"Transcribing dialogue ({pct}%)...", "progress": pct})
+                    whisper_subs.append({
                         "id": i,
-                        "start_time": _from_seconds(float(segment.get("start", 0.0))),
-                        "end_time": _from_seconds(float(segment.get("end", 0.0))),
-                        "text": segment.get("text", "").strip(),
+                        "start_time": _from_seconds(seg.start),
+                        "end_time": _from_seconds(seg.end),
+                        "text": seg.text.strip(),
                         "flagged": False,
                         "flag_reason": ""
                     })
-                q.put({"type": "done", "subtitles": subs})
 
-            except ImportError:
-                # Fallback to faster-whisper if whisperx is unavailable
-                try:
-                    from faster_whisper import WhisperModel
-                    q.put({"type": "status", "message": "Loading fallback Whisper model...", "progress": 5})
-                    model = WhisperModel("small", device="cpu", compute_type="int8")
-                    q.put({"type": "status", "message": "Transcribing...", "progress": 15})
-                    segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False, vad_filter=True)
-                    subs = []
-                    for i, seg in enumerate(segments, start=1):
-                        subs.append({"id": i, "start_time": _from_seconds(seg.start),
-                                     "end_time": _from_seconds(seg.end),
-                                     "text": seg.text.strip(), "flagged": False, "flag_reason": ""})
-                    q.put({"type": "done", "subtitles": subs})
-                except Exception as fb_err:
-                    q.put({"type": "error", "error": str(fb_err)})
+                q.put({"type": "done", "subtitles": whisper_subs})
+
             except Exception as e:
-                q.put({"type": "error", "error": str(e)})
+                print(f"[Transcribe Error] {e}")
+                q.put({"type": "error", "error": f"Transcription error: {str(e)}"})
 
         thread = threading.Thread(target=worker)
         thread.start()
@@ -1553,67 +2045,45 @@ async def transcribe_and_align_endpoint(
         
         def worker():
             try:
-                import whisperx
-                q.put({"type": "status", "message": "Loading WhisperX model (small)...", "progress": 5})
-                device = "cpu"
-                compute_type = "int8"
-                model = whisperx.load_model("small", device, compute_type=compute_type)
+                from faster_whisper import WhisperModel
 
-                q.put({"type": "status", "message": "Analyzing audio...", "progress": 10})
-                audio = whisperx.load_audio(tmp_path)
-                result = model.transcribe(audio, batch_size=4)
+                q.put({"type": "status", "message": "Loading Faster-Whisper AI model...", "progress": 10})
+                model = WhisperModel("small", device="cpu", compute_type="int8")
 
-                q.put({"type": "status", "message": "Running forced alignment for frame-accurate timecodes...", "progress": 55})
-                try:
-                    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
-                    result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
-                except Exception as align_err:
-                    print(f"[WhisperX] Alignment step failed ({align_err}), using raw Whisper timestamps")
+                q.put({"type": "status", "message": "Analyzing audio stream...", "progress": 20})
+                segments_gen, info = model.transcribe(
+                    tmp_path,
+                    beam_size=5,
+                    word_timestamps=True,
+                    vad_filter=True
+                )
 
-                duration = len(audio) / 16000.0
-                if duration <= 0: duration = 1.0
-
-                q.put({"type": "status", "message": "Finalizing transcripts...", "progress": 92})
+                duration = getattr(info, "duration", 0) or 1.0
                 whisper_subs = []
-                for i, segment in enumerate(result["segments"], start=1):
+
+                for i, seg in enumerate(segments_gen, start=1):
+                    pct = min(85, max(20, int(20 + (seg.end / duration) * 65)))
+                    q.put({"type": "status", "message": f"Extracting timecodes ({pct}%)...", "progress": pct})
                     whisper_subs.append({
                         "id": i,
-                        "start_time": _from_seconds(float(segment.get("start", 0.0))),
-                        "end_time": _from_seconds(float(segment.get("end", 0.0))),
-                        "text": segment.get("text", "").strip(),
+                        "start_time": _from_seconds(seg.start),
+                        "end_time": _from_seconds(seg.end),
+                        "text": seg.text.strip(),
                         "flagged": False,
                         "flag_reason": ""
                     })
 
-            except ImportError:
-                # Fallback to faster-whisper if whisperx is unavailable
-                try:
-                    from faster_whisper import WhisperModel
-                    q.put({"type": "status", "message": "Loading fallback Whisper model...", "progress": 5})
-                    model = WhisperModel("small", device="cpu", compute_type="int8")
-                    q.put({"type": "status", "message": "Transcribing (fallback)...", "progress": 15})
-                    segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=False, vad_filter=True)
-                    duration = info.duration or 1.0
-                    whisper_subs = []
-                    for i, seg in enumerate(segments, start=1):
-                        whisper_subs.append({"id": i, "start_time": _from_seconds(seg.start),
-                                             "end_time": _from_seconds(seg.end),
-                                             "text": seg.text.strip(), "flagged": False, "flag_reason": ""})
-                except Exception as fb_err:
-                    q.put({"type": "error", "error": str(fb_err)})
-                    return
+                if script_subs:
+                    q.put({"type": "status", "message": "Aligning script text with audio timecodes...", "progress": 90})
+                    final_subs = align_transcription_to_script(whisper_subs, script_subs)
+                else:
+                    final_subs = whisper_subs
+
+                q.put({"type": "done", "subtitles": final_subs})
+
             except Exception as e:
-                q.put({"type": "error", "error": str(e)})
-                return
-
-            # Reached only if transcription succeeded
-            if script_subs:
-                q.put({"type": "status", "message": "Aligning timecodes to script...", "progress": 95})
-                final_subs = align_transcription_to_script(whisper_subs, script_subs)
-            else:
-                final_subs = whisper_subs
-
-            q.put({"type": "done", "subtitles": final_subs})
+                print(f"[ForcedAlign Error] {e}")
+                q.put({"type": "error", "error": f"Alignment error: {str(e)}"})
 
         thread = threading.Thread(target=worker)
         thread.start()
@@ -1706,6 +2176,493 @@ async def align_scripts_endpoint(
         }
     }
 
+# ── SOURCE DOCUMENT HTML PREVIEW (DOC / DOCX / XLSX) ──────────────────────────
+import html as _html
+
+def _find_soffice():
+    for cand in (
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        "soffice", "libreoffice",
+    ):
+        try:
+            if _os.path.exists(cand):
+                return cand
+        except Exception:
+            pass
+    from shutil import which
+    return which("soffice") or which("libreoffice")
+
+
+def _docx_to_html(path: str) -> str:
+    from docx import Document
+    doc = Document(path)
+    out = ['<div style="font-family:Calibri,Arial,sans-serif;color:#1f2937;line-height:1.6;padding:8px 4px">']
+    def esc(t): return _html.escape(t or "")
+    for p in doc.paragraphs:
+        txt = esc(p.text)
+        if not txt.strip():
+            out.append('<div style="height:10px"></div>')
+            continue
+        style = (p.style.name or "").lower()
+        if "heading 1" in style:
+            out.append(f'<h1 style="font-size:22px;margin:14px 0 6px">{txt}</h1>')
+        elif "heading 2" in style:
+            out.append(f'<h2 style="font-size:18px;margin:12px 0 5px">{txt}</h2>')
+        elif "heading 3" in style:
+            out.append(f'<h3 style="font-size:15px;margin:10px 0 4px">{txt}</h3>')
+        elif "title" in style:
+            out.append(f'<h1 style="font-size:26px;text-align:center;margin:8px 0">{txt}</h1>')
+        else:
+            out.append(f'<p style="margin:4px 0">{txt}</p>')
+    for ti, table in enumerate(doc.tables):
+        out.append('<table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;margin:12px 0;width:100%;font-size:13px">')
+        for row in table.rows:
+            out.append("<tr>")
+            for cell in row.cells:
+                out.append(f'<td style="border:1px solid #cbd5e1;vertical-align:top">{esc(cell.text)}</td>')
+            out.append("</tr>")
+        out.append("</table>")
+    out.append("</div>")
+    return "".join(out)
+
+
+def _xlsx_to_html(path: str, active_sheet_name: str = "") -> str:
+    from openpyxl import load_workbook
+    try:
+        wb = load_workbook(path, data_only=True)
+    except Exception as e:
+        return f'<div style="font-family:sans-serif;color:#dc2626;padding:24px;background:#fef2f2;border-radius:8px">❌ Error reading Excel file: {_html.escape(str(e))}</div>'
+
+    sheet_names = wb.sheetnames
+    if not sheet_names:
+        return '<div style="font-family:sans-serif;color:#64748b;padding:24px;text-align:center">Excel file contains no worksheets.</div>'
+
+    default_idx = 0
+    if active_sheet_name:
+        target_lower = active_sheet_name.lower().strip()
+        for idx, name in enumerate(sheet_names):
+            name_lower = name.lower().strip()
+            if name_lower == target_lower or target_lower in name_lower or name_lower in target_lower:
+                default_idx = idx
+                break
+
+    filename = _os.path.basename(path)
+
+    def col_letter(col_idx):
+        result = ""
+        while col_idx >= 0:
+            result = chr(65 + (col_idx % 26)) + result
+            col_idx = (col_idx // 26) - 1
+        return result
+
+    html_parts = ["""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Calibri, Arial, sans-serif; background: #f8fafc; color: #1e293b; font-size: 13px; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  .excel-topbar { background: #107c41; color: white; padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-shrink: 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+  .excel-title { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .excel-controls { display: flex; align-items: center; gap: 10px; }
+  .excel-search { padding: 6px 12px; border-radius: 6px; border: 1px solid #0b572e; font-size: 12px; outline: none; width: 240px; background: rgba(255,255,255,0.95); color: #0f172a; }
+  .btn-toggle-wrap { padding: 5px 12px; background: rgba(255,255,255,0.2); color: white; border: 1px solid rgba(255,255,255,0.4); border-radius: 6px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s ease; }
+  .btn-toggle-wrap:hover { background: rgba(255,255,255,0.35); }
+  .excel-container { flex: 1; overflow: auto; background: #ffffff; position: relative; }
+  .excel-sheet { display: none; min-width: 100%; }
+  .excel-sheet.active { display: block; }
+  .excel-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12.5px; table-layout: auto; }
+  .excel-table th, .excel-table td { border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1; padding: 8px 12px; white-space: pre-wrap; word-break: break-word; vertical-align: top; line-height: 1.5; min-width: 120px; }
+  .excel-table.nowrap td { white-space: nowrap !important; max-width: none !important; }
+  .col-hdr { background: #f1f5f9; color: #475569; font-weight: 700; text-align: center; position: sticky; top: 0; z-index: 10; border-top: 1px solid #cbd5e1; user-select: none; font-size: 11px; white-space: nowrap !important; }
+  .row-num { background: #f1f5f9; color: #64748b; font-weight: 600; text-align: center; position: sticky; left: 0; z-index: 5; width: 45px; min-width: 45px; user-select: none; font-size: 11px; white-space: nowrap !important; }
+  .corner-hdr { background: #e2e8f0; position: sticky; top: 0; left: 0; z-index: 20; width: 45px; min-width: 45px; border-top: 1px solid #cbd5e1; }
+  .excel-tabs { background: #e2e8f0; border-top: 1px solid #cbd5e1; padding: 4px 8px 0; display: flex; gap: 4px; flex-shrink: 0; overflow-x: auto; user-select: none; }
+  .excel-tab { padding: 7px 16px; background: #cbd5e1; color: #334155; font-size: 12px; font-weight: 600; border-radius: 6px 6px 0 0; cursor: pointer; border: 1px solid #94a3b8; border-bottom: none; display: flex; align-items: center; gap: 6px; transition: all 0.15s ease; }
+  .excel-tab.active { background: #ffffff; color: #107c41; font-weight: 800; border-color: #cbd5e1; border-top: 3px solid #107c41; }
+  .excel-tab:hover:not(.active) { background: #e2e8f0; color: #0f172a; }
+  .badge-sheet { font-size: 10px; background: #e0e7ff; color: #3730a3; padding: 2px 6px; border-radius: 4px; font-weight: 700; margin-left: 4px; }
+</style>
+</head>
+<body>
+"""]
+
+    html_parts.append(f'''
+    <div class="excel-topbar">
+      <div class="excel-title">
+        <span>📊 {_html.escape(filename)}</span>
+        <span style="font-size: 11px; opacity: 0.85; font-weight: 500;">({len(sheet_names)} sheet{'s' if len(sheet_names) > 1 else ''})</span>
+      </div>
+      <div class="excel-controls">
+        <button class="btn-toggle-wrap" id="wrapToggleBtn" onclick="toggleWrapText()">↩ Text Wrap: ON</button>
+        <input type="text" class="excel-search" id="excelSearch" placeholder="🔍 Search active sheet..." onkeyup="filterExcelRows()" />
+      </div>
+    </div>
+    <div class="excel-container">
+    ''')
+
+    for s_idx, s_name in enumerate(sheet_names):
+        ws = wb[s_name]
+        is_active = (s_idx == default_idx)
+        active_cls = " active" if is_active else ""
+        
+        html_parts.append(f'<div class="excel-sheet{active_cls}" id="sheet-{s_idx}">')
+        
+        rows = list(ws.iter_rows(values_only=True))
+        non_empty_rows = [r for r in rows if any(c is not None and str(c).strip() != "" for c in r)]
+        
+        if not non_empty_rows:
+            html_parts.append('<div style="padding:40px;text-align:center;color:#64748b;font-style:italic">Sheet is empty</div></div>')
+            continue
+
+        max_cols = max(len(r) for r in non_empty_rows)
+        
+        html_parts.append('<table class="excel-table"><thead><tr>')
+        html_parts.append('<th class="corner-hdr"></th>')
+        for c in range(max_cols):
+            html_parts.append(f'<th class="col-hdr">{col_letter(c)}</th>')
+        html_parts.append('</tr></thead><tbody>')
+
+        for r_idx, row in enumerate(non_empty_rows):
+            html_parts.append(f'<tr class="excel-row"><td class="row-num">{r_idx + 1}</td>')
+            for c_idx in range(max_cols):
+                val = row[c_idx] if c_idx < len(row) else ""
+                val_str = "" if val is None else str(val)
+                is_header = (r_idx == 0)
+                cell_style = "font-weight:700;background:#f8fafc;" if is_header else ""
+                html_parts.append(f'<td style="{cell_style}" title="{_html.escape(val_str)}">{_html.escape(val_str)}</td>')
+            html_parts.append('</tr>')
+
+        html_parts.append('</tbody></table></div>')
+
+    html_parts.append('</div>')
+
+    html_parts.append('<div class="excel-tabs">')
+    for s_idx, s_name in enumerate(sheet_names):
+        is_active = (s_idx == default_idx)
+        active_cls = " active" if is_active else ""
+        badge = '<span class="badge-sheet">TARGET</span>' if is_active and active_sheet_name else ""
+        html_parts.append(f'''
+        <div class="excel-tab{active_cls}" id="tab-{s_idx}" onclick="switchSheet({s_idx})">
+          <span>📄</span>
+          <span>{_html.escape(s_name)}</span>
+          {badge}
+        </div>
+        ''')
+    html_parts.append('</div>')
+
+    html_parts.append('''
+    <script>
+      let isWrapped = true;
+      function toggleWrapText() {
+        isWrapped = !isWrapped;
+        const btn = document.getElementById('wrapToggleBtn');
+        const tables = document.querySelectorAll('.excel-table');
+        tables.forEach(tbl => {
+          if (isWrapped) {
+            tbl.classList.remove('nowrap');
+          } else {
+            tbl.classList.add('nowrap');
+          }
+        });
+        if (btn) btn.textContent = isWrapped ? '↩ Text Wrap: ON' : '➡️ Text Wrap: OFF';
+      }
+      function switchSheet(idx) {
+        document.querySelectorAll('.excel-sheet').forEach(s => s.classList.remove('active'));
+        document.querySelectorAll('.excel-tab').forEach(t => t.classList.remove('active'));
+        const activeSheet = document.getElementById('sheet-' + idx);
+        const activeTab = document.getElementById('tab-' + idx);
+        if (activeSheet) activeSheet.classList.add('active');
+        if (activeTab) activeTab.classList.add('active');
+        filterExcelRows();
+      }
+      function filterExcelRows() {
+        const q = (document.getElementById('excelSearch').value || '').toLowerCase().trim();
+        const activeSheet = document.querySelector('.excel-sheet.active');
+        if (!activeSheet) return;
+        const rows = activeSheet.querySelectorAll('tbody tr');
+        rows.forEach(r => {
+          if (!q) { r.style.display = ''; return; }
+          const txt = r.textContent.toLowerCase();
+          r.style.display = txt.includes(q) ? '' : 'none';
+        });
+      }
+    </script>
+    </body>
+    </html>
+    ''')
+
+    try:
+        wb.close()
+    except Exception:
+        pass
+
+    return "".join(html_parts)
+
+
+def _doc_to_html(path: str) -> str:
+    from file_reader import read_file
+    text = read_file(_read_bytes(path), _os.path.basename(path), force_ocr=False).get("raw_text", "")
+    esc = _html.escape(text or "")
+    return f'<div style="font-family:Consolas,monospace;white-space:pre-wrap;color:#1f2937;padding:8px">{esc}</div>'
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+# ── SOURCE DOCUMENT STORAGE ──────────────────────────────────────────────────
+import uuid as _uuid
+import os as _os
+
+SOURCE_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "uploads", "sources")
+SOURCE_MEDIA = {
+    "pdf": "application/pdf",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "txt": "text/plain",
+    "rtf": "application/rtf",
+    "csv": "text/csv",
+    "xml": "application/xml",
+    "ttml": "application/xml",
+    "html": "text/html",
+}
+
+
+def _store_source_file(file_bytes: bytes, filename: str) -> str:
+    """Persist original upload bytes; returns a unique file id for this file."""
+    try:
+        _os.makedirs(SOURCE_DIR, exist_ok=True)
+        ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "bin"
+        safe_name = re.sub(r"[^a-z0-9._-]", "_", filename.lower())
+        file_id = _uuid.uuid4().hex
+        path = _os.path.join(SOURCE_DIR, f"{file_id}__{safe_name}")
+        with open(path, "wb") as fh:
+            fh.write(file_bytes)
+        return file_id
+    except Exception as e:
+        print(f"[SOURCE] failed to store {filename}: {e}")
+        return None
+
+
+def _source_path_for(file_id: str):
+    if not file_id:
+        return None
+    try:
+        if _os.path.exists(SOURCE_DIR):
+            for entry in _os.listdir(SOURCE_DIR):
+                if entry.startswith(file_id + "__"):
+                    return _os.path.join(SOURCE_DIR, entry)
+    except Exception:
+        return None
+    return None
+
+
+def _source_preview_html(file_id: str, target_sheet: str = ""):
+    """Return (content_type, body) for an in-app preview of an office file."""
+    path = _source_path_for(file_id)
+    if not path:
+        return None
+    ext = path.lower().rsplit(".", 1)[-1]
+
+    if ext in ("xlsx", "xls", "csv"):
+        return ("text/html", _xlsx_to_html(path, active_sheet_name=target_sheet).encode("utf-8"))
+
+    soffice = _find_soffice()
+    if soffice and ext in ("doc", "docx"):
+        try:
+            import tempfile, subprocess
+            out_dir = tempfile.mkdtemp()
+            subprocess.run([soffice, "--headless", "--convert-to", "pdf",
+                            "--outdir", out_dir, path],
+                           capture_output=True, timeout=120)
+            pdf = _os.path.join(out_dir, _os.path.splitext(_os.path.basename(path))[0] + ".pdf")
+            if _os.path.exists(pdf):
+                return ("application/pdf", _read_bytes(pdf))
+        except Exception as e:
+            print(f"[SOURCE] soffice conversion failed, fallback to HTML: {e}")
+    if ext == "docx":
+        return ("text/html", _docx_to_html(path).encode("utf-8"))
+    if ext == "doc":
+        return ("text/html", _doc_to_html(path).encode("utf-8"))
+    return None
+@app.get("/platforms/source-file/{import_id}")
+def get_source_file(import_id: str):
+    """
+    Serve the ORIGINAL uploaded guideline document so the frontend can render a
+    faithful in-app preview (PDF, image, DOC, XLSX, …) instead of only text.
+    """
+    path = _source_path_for(import_id)
+    if not path or not _os.path.exists(path):
+        raise HTTPException(404, "Source file not found")
+    ext = path.lower().rsplit(".", 1)[-1]
+    media = SOURCE_MEDIA.get(ext, "application/octet-stream")
+    return StreamingResponse(
+        open(path, "rb"),
+        media_type=media,
+        headers={"Content-Disposition": f'inline; filename="{_os.path.basename(path)}"',
+                  "Cache-Control": "no-store"},
+    )
+
+
+@app.get("/platforms/source-preview/{file_id}")
+def get_source_preview(file_id: str, target_sheet: str = ""):
+    """
+    Serve an in-app PREVIEW of an office document (DOC/DOCX/XLSX). Returns either
+    a real PDF (if LibreOffice is installed for docs) or an interactive HTML rendering.
+    """
+    try:
+        result = _source_preview_html(file_id, target_sheet=target_sheet)
+        if not result:
+            raise HTTPException(404, "Preview not available for this file")
+        ctype, body = result
+        if ctype == "application/pdf":
+            return StreamingResponse(
+                iter([body]), media_type="application/pdf",
+                headers={"Content-Disposition": "inline", "Cache-Control": "no-store"},
+            )
+        return HTMLResponse(content=body)
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Error generating preview: {e}")
+
+
+# ── ONLYOFFICE DOCUMENT VIEWER ────────────────────────────────────────────────
+# Returns a signed JWT config so the frontend can initialise DocsAPI.DocEditor
+# in view-only mode.  The ONLYOFFICE server fetches the document directly from
+# our /platforms/source-file/{file_id} endpoint.
+
+_OFFICE_DOCTYPES = {
+    "docx": "word", "doc": "word",
+    "xlsx": "cell", "xls": "cell",
+    "pptx": "slide", "ppt": "slide",
+    "odt": "word", "ods": "cell", "odp": "slide",
+    "csv": "cell", "txt": "word",
+}
+
+
+@app.get("/platforms/onlyoffice-config/{file_id}")
+def get_onlyoffice_config(file_id: str, backend_url: str = ""):
+    """
+    Return a JWT-signed ONLYOFFICE editor configuration for view-only preview.
+    backend_url is the URL the ONLYOFFICE container uses to reach *our* backend
+    (must be accessible from inside Docker).
+    Defaults to http://localhost:8000 if not provided.
+    """
+    import hashlib
+    try:
+        import jwt as _jwt
+    except ImportError:
+        _jwt = None
+
+    oo_url = _os.getenv("ONLYOFFICE_URL", "http://localhost:8080").rstrip("/")
+    oo_secret = _os.getenv("ONLYOFFICE_JWT_SECRET", "")
+
+    # Resolve source file
+    path = _source_path_for(file_id)
+    if not path or not _os.path.exists(path):
+        raise HTTPException(404, "Source file not found")
+
+    filename = _os.path.basename(path)
+    # Strip the uuid prefix: "abc123__my_file.xlsx" → "my_file.xlsx"
+    display_name = filename.split("__", 1)[-1] if "__" in filename else filename
+    ext = display_name.lower().rsplit(".", 1)[-1] if "." in display_name else "bin"
+    doc_type = _OFFICE_DOCTYPES.get(ext, "word")
+
+    # Unique key: changes whenever file changes on disk (cache-busting)
+    mtime = _os.path.getmtime(path)
+    doc_key = hashlib.md5(f"{file_id}_{mtime}".encode()).hexdigest()[:20]
+
+    # URL where ONLYOFFICE will fetch the document.
+    # backend_url comes from the frontend (window.location.origin is useless for Docker,
+    # so caller should pass the machine's LAN IP or localhost:8000).
+    _backend = (backend_url or "http://localhost:8000").rstrip("/")
+    # Never point ONLYOFFICE at the Vite dev server (port 5173); always FastAPI (8000).
+    if ":5173" in _backend:
+        _backend = _backend.replace(":5173", ":8000")
+    file_url = f"{_backend}/platforms/source-file/{file_id}"
+
+    config = {
+        "document": {
+            "fileType": ext,
+            "key": doc_key,
+            "title": display_name,
+            "url": file_url,
+            "permissions": {
+                "comment": False,
+                "copy": True,
+                "download": True,
+                "edit": False,
+                "fillForms": False,
+                "modifyContentControl": False,
+                "modifyFilter": False,
+                "print": True,
+                "review": False,
+            },
+        },
+        "documentType": doc_type,
+        "editorConfig": {
+            "mode": "view",
+            "lang": "en",
+            "coEditing": {"mode": "strict", "change": False},
+            "customization": {
+                "autosave": False,
+                "chat": False,
+                "comments": False,
+                "compactHeader": True,
+                "feedback": False,
+                "help": False,
+                "hideRightMenu": True,
+                "hideRulers": True,
+                "plugins": False,
+                "toolbar": True,
+                "toolbarNoTabs": True,
+            },
+        },
+    }
+
+    # Sign with JWT if secret is configured
+    token = None
+    if oo_secret and _jwt is not None:
+        try:
+            token = _jwt.encode(config, oo_secret, algorithm="HS256")
+        except Exception as je:
+            print(f"[ONLYOFFICE] JWT signing failed: {je}")
+
+    return {
+        "onlyoffice_url": oo_url,
+        "config": config,
+        "token": token,
+        "doc_type": doc_type,
+        "filename": display_name,
+    }
+
+
+@app.get("/platforms/onlyoffice-health")
+def onlyoffice_health():
+    """Check whether the ONLYOFFICE Document Server is reachable."""
+    import httpx as _httpx
+    oo_url = _os.getenv("ONLYOFFICE_URL", "http://localhost:8080").rstrip("/")
+    try:
+        r = _httpx.get(f"{oo_url}/healthcheck", timeout=3.0)
+        return {"running": r.status_code == 200, "url": oo_url}
+    except Exception:
+        return {"running": False, "url": oo_url}
+
+
 # ─── MOVIES ──────────────────────────────────────────────────────
 
 from pydantic import BaseModel
@@ -1737,6 +2694,171 @@ def add_new_movie(req: MovieAddRequest):
     except Exception as e:
         print(f"Error adding movie: {e}")
         raise HTTPException(500, "Failed to add movie")
+
+# ─── SUBTITLE EDITOR ENDPOINTS ───────────────────────────────────
+
+from editor import (
+    parse_subtitles,
+    subtitles_to_format,
+    sync_offset,
+    sync_scale,
+    sync_visual,
+    sync_point_via_other,
+    translate_subtitles_stream,
+    get_provider_list,
+    detect_format,
+)
+import chardet
+
+class SyncRequest(BaseModel):
+    subtitles: list
+    mode: str = "offset"
+    seconds: float = 0.0
+    factor: float = 1.0
+    range_start_id: int | None = None
+    range_end_id: int | None = None
+    anchor_id: int | None = None
+    new_start: str | None = None
+    anchor_id2: int | None = None
+    new_start2: str | None = None
+    reference_subtitles: list | None = None
+    sub_index: int | None = None
+    ref_index: int | None = None
+    sub_index2: int | None = None
+    ref_index2: int | None = None
+
+class ExportRequest(BaseModel):
+    subtitles: list
+    format: str = "srt"
+    filename: str = "subtitles"
+
+translate_jobs = {}
+
+class StopTranslateRequest(BaseModel):
+    client_id: str
+    action: str = "apply"
+
+class TranslateRequest(BaseModel):
+    subtitles: list
+    target_language: str
+    source_language: str = ""
+    provider: str = "google"
+    client_id: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    custom_prompt: str | None = None
+
+@app.post("/editor/import")
+async def editor_import_file(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(400, "No file uploaded")
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "File is empty")
+    
+    # Detect encoding
+    detected = chardet.detect(content)
+    encoding = detected.get("encoding") or "utf-8"
+    try:
+        text = content.decode(encoding)
+    except Exception:
+        text = content.decode("utf-8", errors="replace")
+    
+    filename = file.filename or "subtitles.srt"
+    fmt = detect_format(filename, text)
+    subs = parse_subtitles(text, fmt, filename)
+    return {"status": "ok", "format": fmt, "filename": filename, "subtitles": subs}
+
+@app.post("/editor/export")
+def editor_export_file(req: ExportRequest):
+    if not req.subtitles:
+        raise HTTPException(400, "No subtitles provided")
+    fmt = (req.format or "srt").lower()
+    filename = req.filename or "subtitles"
+    output_text = subtitles_to_format(req.subtitles, fmt, filename)
+    
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}.{fmt}"'
+    }
+    return Response(content=output_text.encode("utf-8"), media_type="application/octet-stream", headers=headers)
+
+@app.post("/editor/sync")
+def editor_sync(req: SyncRequest):
+    subs = req.subtitles or []
+    mode = (req.mode or "offset").lower()
+    
+    if mode == "offset":
+        res = sync_offset(subs, req.seconds, req.range_start_id, req.range_end_id)
+    elif mode == "scale":
+        res = sync_scale(subs, req.factor, req.range_start_id, req.range_end_id)
+    elif mode == "visual":
+        res = sync_visual(
+            subs, req.anchor_id or 1, req.new_start or "00:00:00,000",
+            req.anchor_id2, req.new_start2,
+            req.range_start_id, req.range_end_id
+        )
+    elif mode == "point_via_other":
+        res = sync_point_via_other(
+            subs, req.reference_subtitles or [],
+            req.sub_index, req.ref_index,
+            req.sub_index2, req.ref_index2
+        )
+    else:
+        res = sync_offset(subs, req.seconds, req.range_start_id, req.range_end_id)
+        
+    return {"status": "ok", "subtitles": res}
+
+@app.get("/editor/translate/providers")
+def editor_translate_providers():
+    return {"providers": get_provider_list()}
+
+@app.post("/editor/translate/stop")
+def editor_translate_stop(req: StopTranslateRequest):
+    if req.client_id in translate_jobs:
+        translate_jobs[req.client_id]["stop"] = True
+        translate_jobs[req.client_id]["action"] = req.action
+    return {"status": "ok"}
+
+@app.post("/editor/translate")
+def editor_translate(req: TranslateRequest):
+    from fastapi.responses import StreamingResponse
+    config = {
+        "api_key": req.api_key,
+        "model": req.model,
+        "base_url": req.base_url,
+        "custom_prompt": req.custom_prompt,
+    }
+    
+    client_id = req.client_id
+    if client_id:
+        translate_jobs[client_id] = {"stop": False, "action": "apply"}
+        
+    def stop_check():
+        if client_id and client_id in translate_jobs:
+            return translate_jobs[client_id].get("stop", False)
+        return False
+        
+    def stop_action():
+        if client_id and client_id in translate_jobs:
+            return translate_jobs[client_id].get("action", "apply")
+        return "apply"
+
+    def event_stream():
+        try:
+            generator = translate_subtitles_stream(
+                req.subtitles, req.target_language, req.source_language,
+                provider=req.provider, config=config,
+                stop_check=stop_check, stop_action=stop_action
+            )
+            for event in generator:
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            if client_id and client_id in translate_jobs:
+                del translate_jobs[client_id]
+            
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
 
 if __name__ == "__main__":
     import uvicorn

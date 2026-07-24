@@ -463,15 +463,11 @@ def _looks_like_image(filename: str) -> bool:
 
 def _should_run_ocr(images: list, existing_text_length: int) -> bool:
     """
-    Shared trigger heuristic across all three formats: if we already
-    extracted a healthy amount of real text relative to how many images
-    are present, the images are probably just logos/decoration — skip OCR
-    (it's slow, roughly 1-3s per image, no reason to pay that cost when a
-    real text-based table/paragraph already gave us the content).
+    Shared trigger heuristic: if images are present, we ALWAYS run OCR 
+    because some platforms paste critical rules as screenshots, even if
+    the rest of the document is full of text.
     """
     if not images:
-        return False
-    if existing_text_length > 500 and len(images) <= 2:
         return False
     return True
 

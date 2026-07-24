@@ -120,17 +120,61 @@ def _is_narrator_line(metadata: dict) -> bool:
     return metadata.get("is_narration", False) or metadata.get("is_vo", False)
 
 
+def _derive_italics_rules_from_text(platform_key: str) -> dict:
+    """
+    For custom platforms not in the static lookup, derive italics behaviour
+    from the platform's rules text stored in the database.
+    Falls back to generic if rules cannot be loaded.
+    """
+    try:
+        from platform_rules import get_platform
+        platform = get_platform(platform_key)
+        rules_text = " ".join(platform.get("rules", []) or []).lower()
+    except Exception:
+        return _PLATFORM_ITALICS_RULES.get("generic", {})
+
+    # Explicit no-italics signals
+    if any(kw in rules_text for kw in [
+        "no italic", "do not use italic", "no text style", "no formatting",
+        "plain text only", "italics not", "not use italics", "without italics",
+    ]):
+        return {"no_italics": True}
+
+    # Build a derived rule dict from what the guidelines say
+    derived: dict = {}
+    if "song" in rules_text and "italic" in rules_text:
+        derived["song_lyrics"] = True
+        derived["singing"] = True
+    if ("narrat" in rules_text or "voice-over" in rules_text or "voice over" in rules_text or " vo " in rules_text) and "italic" in rules_text:
+        derived["narration_vo"] = True
+    if ("phone" in rules_text or "radio" in rules_text or "intercom" in rules_text) and "italic" in rules_text:
+        derived["phone_calls"] = True
+    if "foreign" in rules_text and "italic" in rules_text:
+        derived["foreign_terms"] = True
+
+    # If the document mentions italic at all but we matched nothing specific,
+    # fall back to generic so we at least handle song lyrics.
+    if not derived and "italic" in rules_text:
+        return _PLATFORM_ITALICS_RULES.get("generic", {})
+
+    # If italic is never mentioned, no italic formatting
+    if not derived and "italic" not in rules_text:
+        return {}
+
+    return derived
+
+
 def apply_italics_rules(subtitles: list[dict], platform_key: str) -> list[dict]:
     """
     Apply italics formatting to subtitle text based on platform rules.
-    
+
     This transforms:
     - Song lyrics (♪ lines) → wrapped in <i>...</i> for platforms that require it
     - Narration/VO lines → <i>...</i> where required
     - Foreign word snippets → inline <i>word</i> tags where required
     - Strips all italics for platforms that forbid them (Nickelodeon, TVB, Discovery Scripps)
     """
-    # Get platform rules — default to generic
+    # Get platform rules — check static lookup first, then derive from DB rules text
     key = platform_key.lower()
     rules = None
     for p_key in _PLATFORM_ITALICS_RULES:
@@ -138,7 +182,8 @@ def apply_italics_rules(subtitles: list[dict], platform_key: str) -> list[dict]:
             rules = _PLATFORM_ITALICS_RULES[p_key]
             break
     if rules is None:
-        rules = _PLATFORM_ITALICS_RULES.get("generic", {})
+        # Custom platform: derive italic behaviour from the actual guidelines text
+        rules = _derive_italics_rules_from_text(platform_key)
 
     # If platform explicitly forbids ALL italics, strip any existing italic tags
     if rules.get("no_italics"):
