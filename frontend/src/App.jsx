@@ -530,7 +530,7 @@ export default function App() {
   const [audioFile, setAudioFile] = useState(null)
   const [scriptFile, setScriptFile] = useState(null)  // optional script for alignment (Case 2)
   const [timestampsFile, setTimestampsFile] = useState(null) // optional timestamps file (Case 3)
-  const [alignMode, setAlignMode] = useState('full') // 'full' | 'preserve_out'
+  const [alignMode, setAlignMode] = useState('full') // 'full' | 'preserve_duration'
   const [whisperSubs, setWhisperSubs] = useState([])  // raw whisper output
   const [recording, setRecording] = useState(false)
   const [screenRecording, setScreenRecording] = useState(false)
@@ -1212,6 +1212,7 @@ export default function App() {
     fd.append('audio', audioFile)
     if (scriptFile) fd.append('script', scriptFile)
     fd.append('platform', platform)
+    fd.append('mode', alignMode)
 
     try {
       const response = await fetch(`${API}/transcribe-and-align`, { method: 'POST', body: fd })
@@ -1267,36 +1268,12 @@ export default function App() {
     fd.append('mode', alignMode)
 
     try {
-      // The endpoint streams SSE (text/event-stream), so we must read the
-      // stream and collect the final 'completed' event's subtitles.
       const response = await fetch(`${API}/align-scripts`, { method: 'POST', body: fd })
       if (!response.ok) throw new Error(`Server error: ${response.status}`)
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      let finalSubs = []
-      let finalStats = null
-      while (true) {
-        const { value, done } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed.startsWith('data: ')) continue
-          let data = null
-          try { data = JSON.parse(trimmed.substring(6)) } catch (e) { continue }
-          if (data.status === 'processing') {
-            setTranscribeProgress({ pct: data.progress || 0, msg: data.message || 'Processing...' })
-          } else if (data.status === 'error') {
-            throw new Error(data.error || 'Alignment failed')
-          } else if (data.status === 'completed') {
-            finalSubs = data.result?.subtitles || []
-            finalStats = data.result?.stats || null
-          }
-        }
-      }
+      
+      const data = await response.json()
+      const finalSubs = data.subtitles || []
+      const finalStats = data.stats || null
       setSubtitles(finalSubs)
       setWhisperSubs(finalSubs)
       setCleanStats(finalStats)
@@ -1511,10 +1488,10 @@ export default function App() {
                     onClick={()=>fileRef.current.click()}>
                     <div style={{fontSize:32,marginBottom:8}}>📁</div>
                     <div style={S.uploadTitle}>Drag & drop any OTT script file</div>
-                    <div style={S.uploadSub}>DOC · DOCX · PDF · SRT · VTT · XML · TTML · RTF · XLSX · CSV · TXT</div>
+                    <div style={S.uploadSub}>DOC · DOCX · PDF · PAC · SRT · VTT · XML · TTML · RTF · XLSX · CSV · TXT</div>
                     <div style={{...S.uploadSub,marginTop:4,color:'#94a3b8'}}>Tables · Paragraphs · CCSL Spotting Lists · Already cleaned scripts</div>
                     <input ref={fileRef} type="file" hidden
-                      accept=".doc,.docx,.pdf,.srt,.vtt,.webvtt,.xml,.ttml,.dfxp,.rtf,.xlsx,.xls,.csv,.txt,.json"
+                      accept=".doc,.docx,.pdf,.srt,.vtt,.webvtt,.xml,.ttml,.dfxp,.rtf,.xlsx,.xls,.csv,.txt,.json,.pac"
                       onChange={e=>e.target.files[0]&&setFile(e.target.files[0])}/>
                   </div>
                 ) : (
@@ -1642,8 +1619,8 @@ export default function App() {
                 <div className='uploadZone' style={{...S.uploadZone, padding:30}} onClick={()=>convertFileRef.current?.click()}>
                   <div style={{fontSize:32, marginBottom:10}}>📁</div>
                   <div style={S.uploadTitle}>{convertLoading ? 'Parsing file...' : 'Upload file to convert'}</div>
-                  <div style={S.uploadSub}>Supports SRT, VTT, TTML, XML, DOC, DOCX, PDF, RTF, CSV, TXT</div>
-                  <input ref={convertFileRef} type='file' hidden accept='.srt,.vtt,.doc,.docx,.pdf,.xml,.ttml,.dfxp,.rtf,.csv,.txt,.xlsx,.xls'
+                  <div style={S.uploadSub}>Supports SRT, VTT, PAC, TTML, XML, DOC, DOCX, PDF, RTF, CSV, TXT</div>
+                  <input ref={convertFileRef} type='file' hidden accept='.srt,.vtt,.doc,.docx,.pdf,.xml,.ttml,.dfxp,.rtf,.csv,.txt,.xlsx,.xls,.pac'
                     onChange={e=>handleConvertUpload(e.target.files?.[0])}/>
                 </div>
               ) : (
@@ -1792,12 +1769,12 @@ export default function App() {
                       </button>
                       <button
                         type="button"
-                        onClick={()=>setAlignMode('preserve_out')}
+                        onClick={()=>setAlignMode('preserve_duration')}
                         style={{flex:1, padding:'8px 10px', borderRadius:8, fontSize:11, fontWeight:700, cursor:'pointer',
-                          background: alignMode==='preserve_out' ? '#d97706' : '#f8fafc',
-                          color: alignMode==='preserve_out' ? '#fff' : '#64748b',
-                          border: `1px solid ${alignMode==='preserve_out' ? '#d97706' : '#e2e8f0'}`}}>
-                        🔒 Preserve Out-Cues<br/><span style={{fontWeight:400,fontSize:10}}>Keep original out-cue, only change in-cue</span>
+                          background: alignMode==='preserve_duration' ? '#d97706' : '#f8fafc',
+                          color: alignMode==='preserve_duration' ? '#fff' : '#64748b',
+                          border: `1px solid ${alignMode==='preserve_duration' ? '#d97706' : '#e2e8f0'}`}}>
+                        🔒 Preserve Duration<br/><span style={{fontWeight:400,fontSize:10}}>Keep original dialogue duration</span>
                       </button>
                     </div>
                   </div>
@@ -1831,26 +1808,41 @@ export default function App() {
               )}
 
               {subtitles.length > 0 && (
-                <div style={{marginTop:14, background:'#ecfdf5', border:'1px solid #05966930', borderRadius:10, padding:'14px 16px'}}>
-                  <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:10}}>
-                    <div style={{fontSize:13, fontWeight:700, color:'#059669'}}>
-                      ✅ {alignStats ? 'Mapping' : 'Transcription'} complete — {subtitles.length} subtitles ready
+                <>
+                  <div style={{marginTop:14, background:'#ecfdf5', border:'1px solid #05966930', borderRadius:10, padding:'14px 16px'}}>
+                    <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:10}}>
+                      <div style={{fontSize:13, fontWeight:700, color:'#059669'}}>
+                        ✅ {alignStats ? 'Mapping' : 'Transcription'} complete — {subtitles.length} subtitles ready
+                      </div>
+                      <button style={{background:'none', border:'none', color:'#64748b', fontSize:16, cursor:'pointer'}}
+                              onClick={()=>{ setSubtitles([]); setWhisperSubs([]); setAlignStats(null); setCleanStats(null) }}>✕</button>
                     </div>
-                    <button style={{background:'none', border:'none', color:'#64748b', fontSize:16, cursor:'pointer'}}
-                            onClick={()=>{ setSubtitles([]); setWhisperSubs([]); setAlignStats(null); setCleanStats(null) }}>✕</button>
+                    <div style={{fontSize:11, color:'#64748b', marginBottom:12}}>
+                      Download the result, or send it to the <strong>Clean</strong> tab for AI formatting.
+                    </div>
+                    <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
+                      <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportSRT}>⬇ SRT</button>
+                      <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportTXT}>⬇ TXT</button>
+                      <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportDOCX}>⬇ DOCX</button>
+                      <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportPDF}>⬇ PDF</button>
+                      <button style={{...S.btnSm, marginLeft:'auto', background:'#4f46e5', borderColor:'#4f46e5', color:'#fff'}}
+                              onClick={()=>setTab('clean')}>🧹 Take to Cleaning →</button>
+                    </div>
                   </div>
-                  <div style={{fontSize:11, color:'#64748b', marginBottom:12}}>
-                    Download the result, or send it to the <strong>Clean</strong> tab for AI formatting.
-                  </div>
-                  <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
-                    <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportSRT}>⬇ SRT</button>
-                    <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportTXT}>⬇ TXT</button>
-                    <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportDOCX}>⬇ DOCX</button>
-                    <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportPDF}>⬇ PDF</button>
-                    <button style={{...S.btnSm, marginLeft:'auto', background:'#4f46e5', borderColor:'#4f46e5', color:'#fff'}}
-                            onClick={()=>setTab('clean')}>🧹 Take to Cleaning →</button>
-                  </div>
-                </div>
+                  {subtitles.some(sub => (sub.manual_placement || !sub.start_time) && sub.text?.trim()) && (
+                    <div style={{marginTop:10, background:'#fff7ed', border:'1px solid #fdba74', borderRadius:10, padding:'12px 14px'}}>
+                      <div style={{fontSize:12, fontWeight:700, color:'#c2410c', marginBottom:5}}>Manual timestamp placement required</div>
+                      <div style={{fontSize:11, color:'#9a3412', marginBottom:8}}>
+                        These original script dialogues need a subtitle editor's timing pass. Safe gaps are used where possible; anything without a safe gap remains in TXT/DOCX exports and Cleaning, because SRT cannot include a cue without timestamps.
+                      </div>
+                      {subtitles.filter(sub => (sub.manual_placement || !sub.start_time) && sub.text?.trim()).map((sub, index) => (
+                        <div key={`${sub.id || index}-${index}`} style={{fontSize:11, color:'#7c2d12', padding:'6px 0', borderTop:index ? '1px solid #fed7aa' : 'none'}}>
+                          <strong>#{sub.id || index + 1}</strong>{sub.start_time ? ` (${sub.start_time} → ${sub.end_time})` : ' (no safe gap)'} — {sub.text}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
 
               {transcribeError && <div style={{...S.errBox, marginTop:14}}><div style={{fontSize:12,color:'#dc2626'}}>{transcribeError}</div></div>}
@@ -2265,9 +2257,9 @@ export default function App() {
                     onClick={()=>qcFileRef.current.click()}>
                     <div style={{fontSize:24,marginBottom:6}}>📋</div>
                     <div style={S.uploadTitle}>Upload a different file to check</div>
-                    <div style={S.uploadSub}>SRT · TXT · DOC · any format</div>
+                    <div style={S.uploadSub}>SRT · TXT · DOC · PAC · any format</div>
                     <input ref={qcFileRef} type="file" hidden
-                      accept=".srt,.vtt,.txt,.doc,.docx,.pdf,.rtf,.xml,.ttml,.dfxp,.xlsx,.xls,.csv,.json"
+                      accept=".srt,.vtt,.txt,.doc,.docx,.pdf,.rtf,.xml,.ttml,.dfxp,.xlsx,.xls,.csv,.json,.pac"
                       onChange={e=>qcFileRef.current.files[0]&&selectQcFile(qcFileRef.current.files[0])}/>
                   </div>
                 ) : (

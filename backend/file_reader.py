@@ -5,7 +5,7 @@
 import io
 import re
 import chardet
-
+from pac_reader import read_pac
 
 class UnsupportedPMWError(ValueError):
     pass
@@ -136,6 +136,7 @@ def read_file(file_bytes: bytes, filename: str, force_ocr: bool = False) -> dict
         "txt": read_plain,
         "json": read_json,
         "pmw": read_pmw,
+        "pac": read_pac,
     }
 
     reader = readers.get(ext, read_plain)
@@ -207,7 +208,7 @@ def read_file(file_bytes: bytes, filename: str, force_ocr: bool = False) -> dict
 
 
 def detect_structure(text: str, ext: str) -> str:
-    if ext == "srt" or re.search(r'\d+\n\d{2}:\d{2}:\d{2},\d{3}\s+-->', text):
+    if ext in ["srt", "pac"] or re.search(r'\d+\n\d{2}:\d{2}:\d{2},\d{3}\s+-->', text):
         return "srt_format"
     if ext in ["vtt", "webvtt"] or text.startswith("WEBVTT"):
         return "vtt_format"

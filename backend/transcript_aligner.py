@@ -1,38 +1,32 @@
-# transcript_aligner.py — Maps Whisper-transcribed timecodes to cleaned script text
-# Case: OTT script has correct dialogues (may lack timestamps or timestamps are wrong).
-#       Whisper transcript has accurate timestamps but mishears/hallucinates words.
-# Goal: Keep OTT script text EXACTLY as-is; borrow timestamps from Whisper.
-#
-# Algorithm:
-#   1. Normalize both sides to word-token lists.
-#   2. Compute a similarity matrix: each (cleaned_line, whisper_window) pair gets a
-#      score combining word-overlap, token ratio, and subsequence coverage.
-#   3. Run a monotonic dynamic-programming alignment to find the globally best
-#      assignment of cleaned lines → Whisper segments (respects temporal order).
-#   4. High-confidence anchors (score ≥ ANCHOR_THRESHOLD) are fixed first.
-#   5. Low-confidence gaps between anchors are filled by interpolating timecodes
-#      from the surrounding anchors proportionally.
+"""Conservatively transfer timestamp cues onto trusted script dialogue.
 
-import re
+The script is the only source of output text.  Timestamp text is used solely
+to locate a matching cue, never copied into the result.  When a match cannot
+be established, the cue is left blank and flagged; manufacturing an estimated
+timecode is worse than asking an editor to review the line.
+"""
+
 import difflib
-from typing import Optional
+import re
 
 
-# ── Tuning constants ──────────────────────────────────────────────────────────
-ANCHOR_THRESHOLD  = 0.28   # score ≥ this → use Whisper timecode directly
-ACCEPT_THRESHOLD  = 0.18   # score ≥ this → accept but flag for review
-MAX_WINDOW        = 6      # max consecutive Whisper segments to merge for one cleaned line
-MAX_LOOKAHEAD     = 50     # how many Whisper segs ahead to search (per cleaned line)
-# ─────────────────────────────────────────────────────────────────────────────
+# A match below this is not reliable enough to assign a real timestamp.
+ACCEPT_THRESHOLD = 0.42
+ANCHOR_THRESHOLD = 0.62
+MAX_CUE_WINDOW = 6
+MAX_LOOKAHEAD = 50
+MIN_MANUAL_CUE_SECONDS = 0.08  # two frames at the project's 25 fps timebase
+_STOP_WORDS = {
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "of",
+    "is", "it", "i", "we", "he", "she", "they", "you", "was", "were",
+    "be", "are", "for",
+}
 
 
 def _normalize(text: str) -> str:
-    """Lowercase, strip HTML/punctuation, collapse whitespace."""
-    text = text.lower()
-    text = re.sub(r"<[^>]+>", "", text)       # strip italic/bold tags
-    text = re.sub(r"[^\w\s]", " ", text)      # remove punctuation
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    text = re.sub(r"<[^>]+>", "", text or "")
+    text = re.sub(r"[^\w\s]", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _tokens(text: str) -> list[str]:
@@ -40,273 +34,202 @@ def _tokens(text: str) -> list[str]:
 
 
 def _similarity(a_tokens: list[str], b_tokens: list[str]) -> float:
-    """
-    Multi-signal similarity between two token lists — robust against Whisper
-    mishearing individual words.
-
-    Signals combined:
-      1. SequenceMatcher ratio        — sensitive to word order
-      2. Jaccard word overlap         — robust when order slightly differs
-      3. Longest common subsequence   — handles inserted/deleted tokens
-      4. Length-penalty               — discourages matching very short queries
-                                        against very long Whisper windows
-    """
+    """Return a conservative word-level similarity score."""
     if not a_tokens or not b_tokens:
         return 0.0
 
-    # 1. SequenceMatcher ratio (word-level)
-    sm = difflib.SequenceMatcher(None, a_tokens, b_tokens, autojunk=False)
-    ratio = sm.ratio()
+    matcher = difflib.SequenceMatcher(None, a_tokens, b_tokens, autojunk=False)
+    ratio = matcher.ratio()
+    matched = sum(size for _, _, size in matcher.get_matching_blocks())
+    coverage = matched / len(a_tokens)
 
-    # 2. Jaccard word overlap (ignores order)
-    a_set = set(a_tokens)
-    b_set = set(b_tokens)
-    # Remove stop words that add noise
-    stops = {"the","a","an","and","or","but","in","on","at","to","of","is",
-             "it","i","we","he","she","they","you","was","were","be","are","for"}
-    a_content = a_set - stops
-    b_content = b_set - stops
-    if a_content or b_content:
-        jaccard = len(a_content & b_content) / len(a_content | b_content) if (a_content | b_content) else 0.0
+    a_content = set(a_tokens) - _STOP_WORDS
+    b_content = set(b_tokens) - _STOP_WORDS
+    if a_content:
+        # Do not allow common stop words to create a false match.
+        content_overlap = len(a_content & b_content) / len(a_content)
     else:
-        jaccard = len(a_set & b_set) / len(a_set | b_set) if (a_set | b_set) else 0.0
+        content_overlap = len(set(a_tokens) & set(b_tokens)) / len(set(a_tokens))
 
-    # 3. How many of the cleaned line's tokens appear (in order) in the window?
-    #    This is the "coverage" signal — key for Whisper which often ADDS words
-    #    but rarely REMOVES them entirely from the original script.
-    matched_blocks = sum(size for _, _, size in sm.get_matching_blocks())
-    coverage = matched_blocks / len(a_tokens) if a_tokens else 0.0
-
-    # 4. Length penalty: if the window is 4x larger than the cleaned line, boost less
-    len_ratio = len(a_tokens) / max(len(b_tokens), 1)
-    len_penalty = min(1.0, len_ratio * 2.0)
-
-    score = (ratio * 0.35 + jaccard * 0.30 + coverage * 0.25 + len_penalty * 0.10)
-    return round(score, 4)
+    # A very long collection of cues is not a useful match for one script line.
+    length_ratio = min(len(a_tokens), len(b_tokens)) / max(len(a_tokens), len(b_tokens))
+    return round(0.40 * coverage + 0.35 * content_overlap + 0.15 * ratio + 0.10 * length_ratio, 4)
 
 
-def _align_preserve_out_by_token_timeline(
-    whisper_subs: list[dict],
-    cleaned_subs: list[dict],
-) -> list[dict]:
-    return align_transcription_to_script(whisper_subs, cleaned_subs, mode="preserve_out")
+def _source_cues(subtitles: list[dict]) -> list[dict]:
+    from timecoded_subtitles import _to_seconds
+
+    cues = []
+    for index, sub in enumerate(subtitles):
+        start = _to_seconds(sub.get("start_time", ""))
+        end = _to_seconds(sub.get("end_time", ""))
+        tokens = _tokens(sub.get("text", ""))
+        # Keep a valid timestamp cue even when its dialogue column is blank:
+        # equal-count mapping is still a fully deterministic, useful operation.
+        if start is None or end is None or end <= start:
+            continue
+        cues.append({
+            "start": start,
+            "end": end,
+            "tokens": tokens,
+            "source_id": sub.get("id", index + 1),
+        })
+    return cues
+
+
+def _set_times(item: dict, cue_start: float, cue_end: float, mode: str, original_duration: float | None) -> None:
+    from timecoded_subtitles import _from_seconds
+
+    item["start_time"] = _from_seconds(cue_start)
+    if mode == "preserve_duration" and original_duration is not None:
+        item["end_time"] = _from_seconds(cue_start + original_duration)
+    else:
+        item["end_time"] = _from_seconds(cue_end)
+
+
+def _overlaps(start: float, end: float, intervals: list[tuple[float, float]]) -> bool:
+    """Return whether a cue has a real (not merely touching) overlap."""
+    return any(start < other_end and end > other_start for other_start, other_end in intervals)
+
+
+def _token_timeline(cues: list[dict]) -> list[dict]:
+    """Expand cue text into ordered pseudo-word timestamps.
+
+    Whisper supplies cue-level timing, not dependable word timing.  Splitting
+    each cue proportionally is nevertheless the only safe way to preserve
+    order when one Whisper cue contains several client-script dialogues.
+    """
+    timeline = []
+    for cue in cues:
+        count = len(cue["tokens"])
+        if not count:
+            continue
+        duration = cue["end"] - cue["start"]
+        for index, token in enumerate(cue["tokens"]):
+            timeline.append({
+                "token": token,
+                "start": cue["start"] + duration * index / count,
+                "end": cue["start"] + duration * (index + 1) / count,
+                "source_id": cue["source_id"],
+            })
+    return timeline
 
 
 def align_transcription_to_script(
-    whisper_subs: list[dict],   # Whisper/timestamp output — has timecodes, text may be rough
-    cleaned_subs: list[dict],   # OTT script — has correct text, timecodes may be unreliable or missing
+    whisper_subs: list[dict],
+    cleaned_subs: list[dict],
     similarity_threshold: float = ANCHOR_THRESHOLD,
-    mode: str = "full",          # "full" | "preserve_out"
+    mode: str = "full",
 ) -> list[dict]:
+    """Globally align client dialogue with the complete Whisper transcript.
+
+    The previous greedy cue-by-cue search lost its place whenever Whisper split
+    or merged dialogue.  Here the entire ordered token streams are aligned in
+    one pass, so a minor recognition error or a newline cannot shift the rest
+    of the episode onto the wrong timestamps.  Only client-script text is
+    returned.
     """
-    Transfer Whisper / source timestamps onto OTT cleaned script lines.
-    The cleaned text is NEVER modified — only start_time / end_time are assigned.
-    """
-    if not whisper_subs or not cleaned_subs:
-        return cleaned_subs
+    if not cleaned_subs:
+        return []
+    mode = "preserve_duration" if mode == "preserve_duration" else "full"
+    cues = _source_cues(whisper_subs)
+    timeline = _token_timeline(cues)
+    from timecoded_subtitles import _from_seconds, _to_seconds
 
-    from timecoded_subtitles import _to_seconds, _from_seconds
-
-    _preserve_out = mode == "preserve_out"
-
-    # Build normalized source cue windows. The timestamp file is already synced
-    # to video, so prefer whole cue boundaries over guessed per-token timings.
-    # The previous implementation aligned against a free token timeline and used
-    # the last token's estimated start as the out-cue; that made mapped cues end
-    # too early and allowed drift after one weak match.
-    source_segments: list[dict] = []
-    for seg_idx, sub in enumerate(whisper_subs):
+    script_tokens: list[str] = []
+    token_line: list[int] = []
+    line_token_counts: list[int] = []
+    for line_index, sub in enumerate(cleaned_subs):
         tokens = _tokens(sub.get("text", ""))
-        if not tokens:
-            continue
-        start = _to_seconds(sub.get("start_time", ""))
-        end = _to_seconds(sub.get("end_time", ""))
-        if start is None or end is None:
-            continue
-        if end <= start:
-            end = start + max(0.2, len(tokens) * 0.18)
-        source_segments.append({
-            "tokens": tokens,
-            "start": start,
-            "end": end,
-            "source_id": sub.get("id", seg_idx + 1),
-        })
+        line_token_counts.append(len(tokens))
+        script_tokens.extend(tokens)
+        token_line.extend([line_index] * len(tokens))
 
-    if not source_segments:
-        return cleaned_subs
+    source_tokens = [entry["token"] for entry in timeline]
+    matched_sources: list[list[int]] = [[] for _ in cleaned_subs]
+    if script_tokens and source_tokens:
+        matcher = difflib.SequenceMatcher(None, script_tokens, source_tokens, autojunk=False)
+        for block in matcher.get_matching_blocks():
+            for offset in range(block.size):
+                line_index = token_line[block.a + offset]
+                matched_sources[line_index].append(block.b + offset)
 
-    timeline: list[dict] = []
-    for seg in source_segments:
-        duration = seg["end"] - seg["start"]
-        count = len(seg["tokens"])
-        for tok_idx, token in enumerate(seg["tokens"]):
-            token_start = seg["start"] + duration * (tok_idx / max(count, 1))
-            token_end = seg["start"] + duration * ((tok_idx + 1) / max(count, 1))
-            timeline.append({
-                "token": token,
-                "start": token_start,
-                "end": max(token_end, token_start + 0.04),
-                "source_id": seg["source_id"],
-            })
-
-    result: list[dict] = []
-    cursor = 0
-    total_tokens = len(timeline)
-
-    for out_idx, cleaned_sub in enumerate(cleaned_subs, start=1):
-        item = dict(cleaned_sub)
-        ct = _tokens(cleaned_sub.get("text", ""))
-        original_end = cleaned_sub.get("end_time", "")
-        original_end_ok = _to_seconds(original_end) is not None if original_end else False
-
-        if not ct:
-            item.setdefault("start_time", "")
-            item.setdefault("end_time", original_end if (_preserve_out and original_end_ok) else "")
-            item["id"] = out_idx
-            result.append(item)
-            continue
-
-        best_score = 0.0
-        best_start = -1
-        best_end = -1
-        min_len = max(1, int(len(ct) * 0.45))
-        max_len = min(100, max(len(ct) + 12, int(len(ct) * 2.8)))
-        search_start = cursor
-        search_end = min(total_tokens, cursor + max(300, len(ct) * 24))
-        target_len = len(ct)
-
-        for start_pos in range(search_start, search_end):
-            max_window_end = min(total_tokens, start_pos + max_len)
-            window_tokens: list[str] = []
-            for end_pos in range(start_pos + 1, max_window_end + 1):
-                window_tokens.append(timeline[end_pos - 1]["token"])
-                if len(window_tokens) < min_len:
-                    continue
-                if len(window_tokens) > max(120, target_len * 4):
-                    break
-                score = _similarity(ct, window_tokens)
-                distance_penalty = max(0, start_pos - cursor) * 0.0015
-                window_penalty = 0.0
-                if len(window_tokens) > target_len * 3 and target_len >= 3:
-                    window_penalty += 0.025
-                adjusted = score - distance_penalty - window_penalty
-                if adjusted > best_score:
-                    best_score = adjusted
-                    best_start = start_pos
-                    best_end = end_pos
-
-        item["align_score"] = round(max(best_score, 0.0), 4)
+    result = []
+    for index, script_sub in enumerate(cleaned_subs):
+        item = dict(script_sub)
+        item["id"] = index + 1
         item["align_mode"] = mode
+        positions = matched_sources[index]
+        coverage = len(positions) / line_token_counts[index] if line_token_counts[index] else 0.0
+        item["align_score"] = round(coverage, 4)
+        original_start = _to_seconds(script_sub.get("start_time", ""))
+        original_end = _to_seconds(script_sub.get("end_time", ""))
+        original_duration = original_end - original_start if original_start is not None and original_end is not None and original_end > original_start else None
 
-        # Accept alignment if score meets ACCEPT_THRESHOLD (0.18)
-        if best_start >= 0 and best_score >= ACCEPT_THRESHOLD:
-            source_start = timeline[best_start]["start"]
-            source_end = timeline[best_end - 1]["end"]
-            item["start_time"] = _from_seconds(source_start)
-
-            original_end_sec = _to_seconds(original_end) if original_end_ok else None
-            can_preserve_out = (
-                _preserve_out
-                and original_end_sec is not None
-                and original_end_sec > source_start + 0.2
-            )
-            if can_preserve_out:
-                item["end_time"] = original_end
-            else:
-                item["end_time"] = _from_seconds(max(source_end, source_start + 0.2))
-
-            start_source_id = timeline[best_start]["source_id"]
-            end_source_id = timeline[best_end - 1]["source_id"]
-            item["align_source"] = f"cue_{start_source_id}-{end_source_id}"
-            cursor = max(cursor + 1, best_end)
-
-            if best_score >= ANCHOR_THRESHOLD:
-                item.setdefault("flagged", False)
-                item.setdefault("flag_reason", "")
-            else:
-                item["flagged"] = True
-                item["flag_reason"] = f"Low-confidence alignment (score: {best_score:.2f}) — please verify"
+        if positions:
+            first, last = timeline[min(positions)], timeline[max(positions)]
+            start, end = first["start"], last["end"]
+            if mode == "preserve_duration" and original_duration is not None:
+                end = start + original_duration
+            item["start_time"] = _from_seconds(start)
+            item["end_time"] = _from_seconds(max(end, start + 0.04))
+            item["align_source"] = f"token_{first['source_id']}-{last['source_id']}"
+            item["flagged"] = coverage < 0.35
+            item["flag_reason"] = "Partial transcript match; verify timing" if item["flagged"] else ""
         else:
-            # Low score / uncertain match: mark for interpolation, do not advance cursor far
+            # Filled from a bounded gap after all exact global anchors are set.
             item["start_time"] = ""
-            if _preserve_out and original_end_ok:
-                item["end_time"] = original_end
-            else:
-                item["end_time"] = ""
+            item["end_time"] = ""
             item["align_source"] = ""
             item["flagged"] = True
-            item["flag_reason"] = f"Uncertain alignment (score: {best_score:.2f}) — will be interpolated"
-
-        item["id"] = out_idx
+            item["flag_reason"] = "No transcript words matched; placed between surrounding aligned dialogue if possible"
         result.append(item)
 
-    # Interpolate timecodes for any unmatched lines between anchors
-    result = _interpolate_missing_timecodes(result, preserve_out=_preserve_out)
-
-    for idx, sub in enumerate(result, start=1):
-        sub["id"] = idx
+    # Place completely unmatched client lines in their chronological gap.  This
+    # preserves all dialogue in the SRT without overlapping Whisper-derived
+    # cues, while clearly marking the generated cue for a human timing pass.
+    pending = [i for i, item in enumerate(result) if not item.get("start_time") and item.get("text", "").strip()]
+    group_start = 0
+    while group_start < len(pending):
+        group_end = group_start
+        while group_end + 1 < len(pending) and pending[group_end + 1] == pending[group_end] + 1:
+            group_end += 1
+        indices = pending[group_start:group_end + 1]
+        previous_end = _to_seconds(result[indices[0] - 1].get("end_time", "")) if indices[0] else 0.0
+        next_start = _to_seconds(result[indices[-1] + 1].get("start_time", "")) if indices[-1] + 1 < len(result) else None
+        if previous_end is not None and next_start is not None and next_start - previous_end >= len(indices) * MIN_MANUAL_CUE_SECONDS:
+            slot = (next_start - previous_end) / len(indices)
+            for position, item_index in enumerate(indices):
+                item = result[item_index]
+                item["start_time"] = _from_seconds(previous_end + position * slot)
+                item["end_time"] = _from_seconds(previous_end + (position + 1) * slot)
+                item["align_source"] = "manual_gap"
+                item["manual_placement"] = True
+                item["flag_reason"] = "No transcript words matched; placed in surrounding gap — set final timing manually"
+        else:
+            # A Whisper cue can contain the surrounding dialogue without a gap
+            # at all.  Reserve a tiny, non-overlapping tail from the preceding
+            # mapped cue so the client dialogue is still delivered in the SRT.
+            # The cue is explicitly flagged for a subtitler to set accurately.
+            donor_index = indices[0] - 1
+            donor_start = _to_seconds(result[donor_index].get("start_time", "")) if donor_index >= 0 else None
+            donor_end = _to_seconds(result[donor_index].get("end_time", "")) if donor_index >= 0 else None
+            reservation = len(indices) * MIN_MANUAL_CUE_SECONDS
+            if donor_start is not None and donor_end is not None and donor_end - donor_start >= reservation + MIN_MANUAL_CUE_SECONDS:
+                reserved_start = donor_end - reservation
+                result[donor_index]["end_time"] = _from_seconds(reserved_start)
+                for position, item_index in enumerate(indices):
+                    item = result[item_index]
+                    item["start_time"] = _from_seconds(reserved_start + position * MIN_MANUAL_CUE_SECONDS)
+                    item["end_time"] = _from_seconds(reserved_start + (position + 1) * MIN_MANUAL_CUE_SECONDS)
+                    item["align_source"] = "manual_split"
+                    item["manual_placement"] = True
+                    item["flag_reason"] = "No transcript words matched; reserved a non-overlapping cue — set final timing manually"
+        group_start = group_end + 1
 
     return result
 
 
-def _interpolate_missing_timecodes(subtitles: list[dict], preserve_out: bool = False) -> list[dict]:
-    """
-    Fill missing timecodes by interpolating from neighbouring known timecodes.
-    Evenly distributes the gap between the previous and next known timecodes
-    across all unmatched lines between them.
-    """
-    from timecoded_subtitles import _to_seconds, _from_seconds
-
-    n = len(subtitles)
-
-    # Collect the positions and times of all anchors
-    anchors: list[tuple[int, float, float]] = []  # (index, start_sec, end_sec)
-    for i, sub in enumerate(subtitles):
-        if sub.get("start_time") and sub.get("end_time"):
-            s = _to_seconds(sub["start_time"])
-            e = _to_seconds(sub["end_time"])
-            if s is not None and e is not None:
-                anchors.append((i, s, e))
-
-    if not anchors:
-        # No anchors at all — generate 3s slots from t=0
-        for i, sub in enumerate(subtitles):
-            if not sub.get("start_time"):
-                t = i * 3.0
-                sub["start_time"] = _from_seconds(t)
-                if not (preserve_out and sub.get("end_time")):
-                    sub["end_time"] = _from_seconds(t + 2.0)
-        return subtitles
-
-    # Fill gaps between consecutive anchors
-    # Prepend a virtual anchor at t=0 if first real anchor is not at index 0
-    if anchors[0][0] > 0:
-        anchors.insert(0, (-1, max(0.0, anchors[0][1] - 3.0 * anchors[0][0]), 0.0))
-
-    # Append a virtual end anchor
-    if anchors[-1][0] < n - 1:
-        last_end = anchors[-1][2]
-        remaining = n - 1 - anchors[-1][0]
-        anchors.append((n, last_end + 3.0 * remaining, last_end + 3.0 * remaining + 2.0))
-
-    for k in range(len(anchors) - 1):
-        a_idx, a_start, a_end = anchors[k]
-        b_idx, b_start, b_end = anchors[k + 1]
-
-        # Find all unmatched subs between a_idx and b_idx (exclusive)
-        gap_indices = [i for i in range(a_idx + 1, b_idx) if not subtitles[i].get("start_time")]
-        if not gap_indices:
-            continue
-
-        # Distribute the time gap evenly
-        total_gap = b_start - a_end
-        slot = total_gap / (len(gap_indices) + 1)
-
-        for rank, gi in enumerate(gap_indices, start=1):
-            t_start = a_end + slot * rank
-            t_end   = t_start + max(1.5, slot * 0.85)
-            subtitles[gi]["start_time"] = _from_seconds(max(0.0, t_start))
-            if not (preserve_out and subtitles[gi].get("end_time")):
-                subtitles[gi]["end_time"] = _from_seconds(max(0.0, t_end))
-
-    return subtitles
+def _align_preserve_duration_by_token_timeline(whisper_subs: list[dict], cleaned_subs: list[dict]) -> list[dict]:
+    """Backward-compatible internal entry point."""
+    return align_transcription_to_script(whisper_subs, cleaned_subs, mode="preserve_duration")

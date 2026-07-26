@@ -101,7 +101,7 @@ async def clean_file_endpoint(
     
     ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",".pmw",
                ".rtf",".srt",".vtt",".webvtt",".xlsx",".xls",
-               ".csv",".txt",".json"]
+               ".csv",".txt",".json",".pac"]
 
     filename = file.filename or "unknown.txt"
     ext = "." + filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
@@ -197,11 +197,11 @@ async def clean_file_endpoint(
         clean_input = raw_text
         print(f"[EXTRACT] No pre-extraction, sending raw text to LLM")
 
-    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
     # With pre-extraction, input is already clean dialogue.
     # We use optimized chunking to balance TPM limits and throughput.
     lmstudio_chunk = int(os.getenv("LM_STUDIO_CHUNK_SIZE", "1500"))
-    chunk_size = lmstudio_chunk if provider == "lmstudio" else 3000
+    chunk_size = lmstudio_chunk if provider == "lmstudio" else 8000 if provider == "gemini" else 3000
     chunks = chunk_text(clean_input, max_chunk_size=chunk_size)
     total_chunks = len(chunks)
     
@@ -332,7 +332,7 @@ async def extract_file_endpoint(
 ):
     ALLOWED = [".doc",".docx",".pdf",".xml",".ttml",".dfxp",".pmw",
                ".rtf",".srt",".vtt",".webvtt",".xlsx",".xls",
-               ".csv",".txt",".json"]
+               ".csv",".txt",".json",".pac"]
 
     filename = file.filename or "unknown.txt"
     ext = "." + filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
@@ -1997,7 +1997,8 @@ async def transcribe_audio(file: UploadFile = File(...)):
 async def transcribe_and_align_endpoint(
     audio: UploadFile = File(...),
     script: UploadFile = File(None),
-    platform: str = Form(default="generic")
+    platform: str = Form(default="generic"),
+    mode: str = Form("full")
 ):
     import tempfile
     import os
@@ -2027,15 +2028,24 @@ async def transcribe_and_align_endpoint(
         raw_text = file_data["raw_text"]
         structure = file_data["structure"]
         
-        platform_dict = get_platform(platform)
-        pre_extracted = pre_extract_dialogue(raw_text, structure, script_bytes, script_name, platform_dict)
-        if not pre_extracted:
-            pre_extracted = raw_text.splitlines()
+        from timecoded_subtitles import parse_timecoded_subtitles
+        
+        if structure in ("srt", "vtt", "ttml") or script_name.lower().endswith((".srt", ".vtt")):
+            parsed_subs = parse_timecoded_subtitles(raw_text)
+            for i, sub in enumerate(parsed_subs, 1):
+                sub.setdefault("id", i)
+                sub.setdefault("flagged", False)
+                script_subs.append(sub)
+        else:
+            platform_dict = get_platform(platform)
+            pre_extracted = pre_extract_dialogue(raw_text, structure, script_bytes, script_name, platform_dict)
+            if not pre_extracted:
+                pre_extracted = raw_text.splitlines()
 
-        for i, line in enumerate(pre_extracted, 1):
-            clean_line = line.strip()
-            if clean_line:
-                script_subs.append({"id": i, "text": clean_line, "flagged": False})
+            for i, line in enumerate(pre_extracted, 1):
+                clean_line = line.strip()
+                if clean_line:
+                    script_subs.append({"id": i, "text": clean_line, "flagged": False})
 
     async def transcribe_align_stream():
         yield f"data: {json.dumps({'status': 'starting', 'message': 'Initializing transcription engine...', 'progress': 0})}\n\n"
@@ -2075,7 +2085,7 @@ async def transcribe_and_align_endpoint(
 
                 if script_subs:
                     q.put({"type": "status", "message": "Aligning script text with audio timecodes...", "progress": 90})
-                    final_subs = align_transcription_to_script(whisper_subs, script_subs)
+                    final_subs = align_transcription_to_script(whisper_subs, script_subs, mode=mode)
                 else:
                     final_subs = whisper_subs
 
@@ -2130,7 +2140,8 @@ async def transcribe_and_align_endpoint(
 @app.post("/align-scripts")
 async def align_scripts_endpoint(
     script_file: UploadFile = File(...),
-    timestamps_file: UploadFile = File(...)
+    timestamps_file: UploadFile = File(...),
+    mode: str = Form("full")
 ):
     from file_reader import read_file
     from extractor import pre_extract_dialogue
@@ -2144,15 +2155,22 @@ async def align_scripts_endpoint(
     script_raw = script_data["raw_text"]
     script_structure = script_data["structure"]
     
-    pre_extracted = pre_extract_dialogue(script_raw, script_structure, script_bytes, script_name, {})
-    if not pre_extracted:
-        pre_extracted = script_raw.splitlines()
-        
     script_subs = []
-    for i, line in enumerate(pre_extracted, 1):
-        clean_line = line.strip()
-        if clean_line:
-            script_subs.append({"id": i, "text": clean_line, "flagged": False})
+    if script_structure in ("srt", "vtt", "ttml") or script_name.lower().endswith((".srt", ".vtt")):
+        parsed_subs = parse_timecoded_subtitles(script_raw)
+        for i, sub in enumerate(parsed_subs, 1):
+            sub.setdefault("id", i)
+            sub.setdefault("flagged", False)
+            script_subs.append(sub)
+    else:
+        pre_extracted = pre_extract_dialogue(script_raw, script_structure, script_bytes, script_name, {})
+        if not pre_extracted:
+            pre_extracted = script_raw.splitlines()
+            
+        for i, line in enumerate(pre_extracted, 1):
+            clean_line = line.strip()
+            if clean_line:
+                script_subs.append({"id": i, "text": clean_line, "flagged": False})
 
     ts_bytes = await timestamps_file.read()
     ts_name = timestamps_file.filename or "timestamps.srt"
@@ -2163,7 +2181,7 @@ async def align_scripts_endpoint(
     if not ts_subs:
         raise HTTPException(400, "Could not extract timecodes from the timestamps file.")
 
-    final_subs = align_transcription_to_script(ts_subs, script_subs)
+    final_subs = align_transcription_to_script(ts_subs, script_subs, mode=mode)
 
     return {
         "subtitles": final_subs,

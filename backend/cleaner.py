@@ -117,7 +117,7 @@ def _filter_script_rules(script_rules: list, subtitler_rules: list) -> tuple[lis
 
 def _get_client_and_model():
     """Returns (client, model_name, is_local) based on LLM_PROVIDER env var."""
-    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
 
     if provider == "lmstudio":
         from openai import OpenAI
@@ -126,10 +126,18 @@ def _get_client_and_model():
         client = OpenAI(base_url=url, api_key="lm-studio")
         print(f"[LLM] Using LM Studio: {url} | model: {model}")
         return client, model, True
+    elif provider == "gemini":
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=os.getenv("GEMINI_API_KEY"),
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        )
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        return client, model, False
     else:
         from groq import Groq
         client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        model = "llama-3.1-8b-instant"
+        model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         return client, model, False
 
 def _rules_to_instructions(platform: dict) -> list[str]:
@@ -179,9 +187,10 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
         "(1) NEVER add formatting that is not explicitly required by the listed rules. "
         "(2) NEVER add <b> or </b> bold tags — bold is NEVER used in OTT subtitles. "
         "(3) NEVER change the meaning or content of the dialogue. "
-        "(4) NEVER invent words, remove dialogue, or rewrite sentences. "
+        "(4) NEVER invent words, remove dialogue, or rewrite sentences. DO NOT \"fix\" grammar if it changes spoken words. "
         "(5) Only apply italics (<i>...</i>) when a specific rule explicitly requires it. "
         "(6) If no italic rule applies, output plain text with NO tags whatsoever. "
+        "(7) The number of subtitles in your output MUST MATCH the number of input subtitles (unless you completely delete an HOH-only line). "
         "Return ONLY a bulleted list. Never skip any rule. Never add commentary."
     )
 
@@ -225,13 +234,10 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
 MANDATORY FORMATTING RULES — APPLY ALL OF THEM:
 {instructions_str}
 
-INPUT DIALOGUE TO FORMAT:
----
-{raw_text}
----
-
 OUTPUT INSTRUCTIONS:
 - Return ONLY a bulleted list, one hyphen (-) per subtitle line.
+- DO NOT combine multiple subtitle lines into one.
+- DO NOT add extra lines. Output exactly one bullet per input line.
 - Apply EVERY rule above to each line.
 - If a line must be split due to length, use \\n between the two parts in the same bullet.
 - If an entire entry is ONLY a sound effect or HOH element to delete, skip it entirely.
@@ -241,6 +247,11 @@ OUTPUT INSTRUCTIONS:
 - NEVER change the spoken words — only fix formatting, punctuation, and style.
 - ACTUALLY write -Word (or - Word) for two-speaker lines when the rule requires it.
 - When in doubt: output plain text.
+
+INPUT DIALOGUE TO FORMAT:
+---
+{raw_text}
+---
 """
     return system, user
 
@@ -264,7 +275,7 @@ def clean_subtitle_chunk(
     client, model_name, is_local = _get_client_and_model()
     system_prompt, user_prompt = build_prompt(raw_text, structure, platform, max_chars)
 
-    max_output_tokens = 800 if is_local else 1200
+    max_output_tokens = 800 if is_local else (4000 if os.getenv("LLM_PROVIDER", "gemini").lower() == "gemini" else 1200)
     retry_delay = 0.5 if is_local else 2
     last_error = None
 
@@ -276,7 +287,7 @@ def clean_subtitle_chunk(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.15,   # lower temp = more deterministic rule following
+                temperature=0.0,   # lower temp = more deterministic rule following
                 max_tokens=max_output_tokens,
             )
             choice = response.choices[0]
@@ -652,7 +663,7 @@ GUIDELINES SECTION:
         response = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            temperature=0.0,
             max_tokens=3000,
         )
         result_text = (response.choices[0].message.content or "").strip()
@@ -744,7 +755,7 @@ DOCUMENT EXCERPT:
         response = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            temperature=0.0,
             max_tokens=800,
         )
         result_text = (response.choices[0].message.content or "").strip()

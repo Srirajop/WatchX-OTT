@@ -451,6 +451,10 @@ function SubtitleEditor() {
   // sync state & visual preview helpers
   const [offsetVal, setOffsetVal] = useState('')
   const [scaleVal, setScaleVal] = useState('')
+  const [fpsWorking, setFpsWorking] = useState('24')
+  const [fpsTarget, setFpsTarget] = useState('25')
+  const [durWorking, setDurWorking] = useState('')
+  const [durTarget, setDurTarget] = useState('')
   const [pointId, setPointId] = useState('')
   const [pointStart, setPointStart] = useState('')
   const [pointId2, setPointId2] = useState('')
@@ -998,6 +1002,29 @@ function SubtitleEditor() {
     const v = parseFloat(scaleVal); if (isNaN(v) || v <= 0) return flash('err', 'Enter a positive scale factor')
     doSync({ mode: 'scale', factor: v, ...syncRangePayload() })
   }
+  function applyFpsConversion() {
+    const w = parseFloat(fpsWorking)
+    const t = parseFloat(fpsTarget)
+    if (isNaN(w) || isNaN(t) || w <= 0 || t <= 0) return flash('err', 'Enter valid FPS numbers')
+    const factor = w / t
+    doSync({ mode: 'scale', factor: factor, ...syncRangePayload() })
+    setModal(null)
+  }
+  function applyDurationConversion() {
+    function parseToSec(str) {
+      if (!str) return NaN;
+      const parts = str.split(':').map(Number);
+      if (parts.length === 2) return parts[0] * 60 + parts[1];
+      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+      return parseFloat(str);
+    }
+    const w = parseToSec(durWorking)
+    const t = parseToSec(durTarget)
+    if (isNaN(w) || isNaN(t) || w <= 0 || t <= 0) return flash('err', 'Enter valid durations (e.g. 44:54)')
+    const factor = t / w
+    doSync({ mode: 'scale', factor: factor, ...syncRangePayload() })
+    setModal(null)
+  }
   function nudgeSelected(delta) {
     if (!pointId) return flash('err', 'Select a subtitle first')
     const id = parseInt(pointId, 10)
@@ -1183,6 +1210,7 @@ function SubtitleEditor() {
         <button style={st.tbBtn} onClick={() => setModal('subs')}>📄 Open Subtitles</button>
         <button style={{ ...st.tbBtn, background: '#7f1d1d', borderColor: '#991b1b' }} onClick={clearSubs} disabled={!subs.length}>🗑 Clear Subs</button>
         <button style={st.tbBtn} onClick={() => setModal('sync')}>⏱ Synchronize</button>
+        <button style={{ ...st.tbBtn, background: '#0f766e', borderColor: '#115e59', color: '#ccfbf1' }} onClick={() => setModal('fps')}>🎞 FPS Converter</button>
         <button style={st.tbBtn} onClick={() => setModal('translate')}>🌐 Auto-Translate</button>
         <button style={st.tbBtn} onClick={() => setModal('export')}>⬇ Export</button>
         <div style={{ flex: 1 }} />
@@ -1523,8 +1551,56 @@ function SubtitleEditor() {
         </Modal>
       )}
 
+      {modal === 'fps' && (
+        <Modal title="🎞 Auto-Stretch & FPS Converter" onClose={() => setModal(null)}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 8 }}>1. Scale by Exact Duration (Recommended)</div>
+          <div style={{ fontSize: 12.5, color: '#64748b', marginBottom: 12, lineHeight: 1.5 }}>
+            If your video content is identical but plays at a completely different speed, type the exact duration (HH:MM:SS or MM:SS) of both files.
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
+            <div>
+              <div style={st.fieldLabel}>Working Duration (Pirated)</div>
+              <input style={{ ...st.input, width: '100%' }} value={durWorking} onChange={e => setDurWorking(e.target.value)} placeholder="e.g. 1:44:54 or 44:54" />
+            </div>
+            <div>
+              <div style={st.fieldLabel}>Target Duration (GTS Pro)</div>
+              <input style={{ ...st.input, width: '100%' }} value={durTarget} onChange={e => setDurTarget(e.target.value)} placeholder="e.g. 1:37:12 or 37:12" />
+            </div>
+          </div>
+          <button style={{ ...st.primBtn, width: '100%', padding: 10, fontSize: 13, background: '#0f766e', marginBottom: 24 }} onClick={applyDurationConversion} disabled={busy}>
+            {busy ? 'Converting...' : 'Match Durations'}
+          </button>
+
+          <div style={{ borderTop: '1px solid #e2e8f0', paddingTop: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 8 }}>2. Scale by Exact FPS</div>
+            <div style={{ fontSize: 12.5, color: '#64748b', marginBottom: 12, lineHeight: 1.5 }}>
+              Use this for known PAL speedups (e.g., converting 24fps to 25fps).
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
+              <div>
+                <div style={st.fieldLabel}>Your Video FPS (Pirated)</div>
+                <input style={{ ...st.input, width: '100%' }} value={fpsWorking} onChange={e => setFpsWorking(e.target.value)} placeholder="e.g. 24" />
+              </div>
+              <div>
+                <div style={st.fieldLabel}>Client's Video FPS (GTS Pro)</div>
+                <input style={{ ...st.input, width: '100%' }} value={fpsTarget} onChange={e => setFpsTarget(e.target.value)} placeholder="e.g. 25" />
+              </div>
+            </div>
+            <button style={{ ...st.smallBtn, width: '100%', padding: 10, fontSize: 13 }} onClick={applyFpsConversion} disabled={busy}>
+              {busy ? 'Converting...' : 'Convert FPS'}
+            </button>
+          </div>
+
+          <div style={{ marginTop: 16, padding: 12, background: '#f1f5f9', borderRadius: 8, border: '1px solid #e2e8f0', fontSize: 11.5, color: '#475569', lineHeight: 1.5 }}>
+            <strong>💡 Tip: How to find FPS?</strong><br/>
+            <strong>Pirated Video:</strong> Open the video in VLC Media Player and press <code>Ctrl + J</code> to see the exact Frame Rate.<br/>
+            <strong>Client Video:</strong> Check the GTS Pro project settings. If unknown, you can often guess based on the region (US TV/Movies = 23.976 or 24, Europe/India/Australia TV = 25).
+          </div>
+        </Modal>
+      )}
+
       {modal === 'sync' && (
-        <Modal title="⏱ Visual Synchronization & Point Alignment" onClose={() => setModal(null)} maxWidth={980}>
+        <Modal title="⏱ Visual Synchronization & Point Alignment" onClose={() => setModal(null)} maxWidth={1200}>
           {/* Global Offset & Speed adjustment bar */}
           <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: 12, marginBottom: 14 }}>
             <div style={st.fieldLabel}>⚡ Quick Shift / Speed Scale</div>
@@ -1582,8 +1658,17 @@ function SubtitleEditor() {
                   {subs.map(s => <option key={s.id} value={s.id}>#{s.id} [{s.start_time}] {(s.text.split('\n')[0] || '').slice(0, 28)}</option>)}
                 </select>
 
-                <video ref={vsStartRef} src={videoSrc} style={{ width: '100%', borderRadius: 8, background: '#000', maxHeight: 200, display: 'block' }}
-                  onTimeUpdate={onVsStartUpdate} onLoadedMetadata={onVsStartUpdate} />
+                <div style={{ position: 'relative', width: '100%', background: '#000', borderRadius: 8, overflow: 'hidden' }}>
+                  <video ref={vsStartRef} src={videoSrc} style={{ width: '100%', maxHeight: 320, display: 'block' }}
+                    onTimeUpdate={onVsStartUpdate} onLoadedMetadata={onVsStartUpdate} />
+                  {pointId && (
+                    <div style={{ position: 'absolute', bottom: '10%', width: '100%', textAlign: 'center', pointerEvents: 'none', padding: '0 10%' }}>
+                      <span style={{ background: 'rgba(0,0,0,0.7)', color: 'white', padding: '4px 8px', borderRadius: 4, fontSize: 16, textShadow: '1px 1px 2px black', whiteSpace: 'pre-wrap' }}>
+                        {subs.find(s => s.id == pointId)?.text || ''}
+                      </span>
+                    </div>
+                  )}
+                </div>
 
                 {/* Point 1 Transport Controls */}
                 <div style={{ background: '#1e293b', borderRadius: 8, padding: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -1595,8 +1680,8 @@ function SubtitleEditor() {
                     <button style={st.transportBtn} onClick={() => nudgeVs(vsStartRef.current, 1)}>⏭ +1f</button>
                     <button style={st.transportBtn} onClick={() => nudgeVs(vsStartRef.current, -25)}>◀ -1s</button>
                     <button style={st.transportBtn} onClick={() => nudgeVs(vsStartRef.current, 25)}>▶ +1s</button>
-                    <button style={{ ...st.primBtn, padding: '6px 10px', fontSize: 11, marginLeft: 'auto' }} onClick={() => setPreviewTime(1)}>
-                      📍 Set Time ({pointStart || '00:00:00,000'})
+                    <button style={{ ...st.primBtn, padding: '8px 14px', fontSize: 12, fontWeight: 800, marginLeft: 'auto', background: '#0ea5e9' }} onClick={() => setPreviewTime(1)}>
+                      📍 SET TIME ({pointStart || '00:00:00,000'})
                     </button>
                   </div>
                   {/* Mini Waveform & Subtitle Block Timeline Scrubber */}
@@ -1631,8 +1716,17 @@ function SubtitleEditor() {
                   {subs.map(s => <option key={s.id} value={s.id}>#{s.id} [{s.start_time}] {(s.text.split('\n')[0] || '').slice(0, 28)}</option>)}
                 </select>
 
-                <video ref={vsEndRef} src={videoSrc} style={{ width: '100%', borderRadius: 8, background: '#000', maxHeight: 200, display: 'block' }}
-                  onTimeUpdate={onVsEndUpdate} onLoadedMetadata={onVsEndUpdate} />
+                <div style={{ position: 'relative', width: '100%', background: '#000', borderRadius: 8, overflow: 'hidden' }}>
+                  <video ref={vsEndRef} src={videoSrc} style={{ width: '100%', maxHeight: 320, display: 'block' }}
+                    onTimeUpdate={onVsEndUpdate} onLoadedMetadata={onVsEndUpdate} />
+                  {pointId2 && (
+                    <div style={{ position: 'absolute', bottom: '10%', width: '100%', textAlign: 'center', pointerEvents: 'none', padding: '0 10%' }}>
+                      <span style={{ background: 'rgba(0,0,0,0.7)', color: 'white', padding: '4px 8px', borderRadius: 4, fontSize: 16, textShadow: '1px 1px 2px black', whiteSpace: 'pre-wrap' }}>
+                        {subs.find(s => s.id == pointId2)?.text || ''}
+                      </span>
+                    </div>
+                  )}
+                </div>
 
                 {/* Point 2 Transport Controls */}
                 <div style={{ background: '#1e293b', borderRadius: 8, padding: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -1644,8 +1738,8 @@ function SubtitleEditor() {
                     <button style={st.transportBtn} onClick={() => nudgeVs(vsEndRef.current, 1)}>⏭ +1f</button>
                     <button style={st.transportBtn} onClick={() => nudgeVs(vsEndRef.current, -25)}>◀ -1s</button>
                     <button style={st.transportBtn} onClick={() => nudgeVs(vsEndRef.current, 25)}>▶ +1s</button>
-                    <button style={{ ...st.primBtn, padding: '6px 10px', fontSize: 11, background: '#d97706', borderColor: '#b45309', marginLeft: 'auto' }} onClick={() => setPreviewTime(2)}>
-                      📍 Set Time ({pointStart2 || '00:00:00,000'})
+                    <button style={{ ...st.primBtn, padding: '8px 14px', fontSize: 12, fontWeight: 800, background: '#d97706', borderColor: '#b45309', marginLeft: 'auto' }} onClick={() => setPreviewTime(2)}>
+                      📍 SET TIME ({pointStart2 || '00:00:00,000'})
                     </button>
                   </div>
                   {/* Mini Waveform & Subtitle Block Timeline Scrubber */}
