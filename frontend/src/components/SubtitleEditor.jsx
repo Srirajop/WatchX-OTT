@@ -361,7 +361,7 @@ const SubRow = memo(({ s, active, updateSub, removeSub, seekTo, setRowRef, st })
 function SubtitleEditor() {
   const [videoSrc, setVideoSrc] = useState(null)
   const [videoUrl, setVideoUrl] = useState('')
-  const [dur, setDuration] = useState(0)
+  const [duration, setDuration] = useState(0)
   const [activeId, setActiveId] = useState(null)
   const [subs, setSubs] = useState([])
   
