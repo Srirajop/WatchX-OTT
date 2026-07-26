@@ -337,9 +337,9 @@ const TlBlock = memo(({ s, active, pxPerSec, isEditorFullscreen, onBlockPointerD
   )
 })
 
-const SubRow = memo(({ s, active, updateSub, removeSub, seekTo, setRowRef, st }) => {
+const SubRow = memo(({ s, active, updateSub, removeSub, seekTo, rowRefs, st }) => {
   return (
-    <div ref={setRowRef}
+    <div ref={el => { if (rowRefs) rowRefs.current[s.id] = el }}
       style={{ ...st.subRow, ...(active ? st.subRowActive : {}) }}
       onClick={() => seekTo(tcToSec(s.start_time))}>
       <div style={st.tcInline}>
@@ -390,6 +390,35 @@ function SubtitleEditor() {
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
   }, [])
+
+  // Vertical resizing state
+  const [videoHeight, setVideoHeight] = useState(340)
+  const isDraggingVideo = useRef(false)
+  const dragVideoStart = useRef({ y: 0, h: 340 })
+
+  const onVideoResizerDown = useCallback((e) => {
+    e.preventDefault()
+    isDraggingVideo.current = true
+    dragVideoStart.current = { y: e.clientY, h: videoHeight }
+    document.body.style.cursor = 'row-resize'
+
+    const onMove = (ev) => {
+      if (!isDraggingVideo.current) return
+      const delta = ev.clientY - dragVideoStart.current.y
+      setVideoHeight(Math.max(150, Math.min(dragVideoStart.current.h + delta, 1000)))
+    }
+
+    const onUp = () => {
+      isDraggingVideo.current = false
+      document.body.style.cursor = ''
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }, [videoHeight])
+
   const [filename, setFilename] = useState('subtitles')
   const [formats, setFormats] = useState({ import: [], export: [] })
 
@@ -1387,7 +1416,7 @@ function SubtitleEditor() {
                   objectFit: 'contain',
                   display: 'block',
                   background: '#000',
-                } : (isEditorFullscreen ? { ...st.video, maxHeight: '340px', objectFit: 'contain' } : st.video)}
+                } : (isEditorFullscreen ? { ...st.video, maxHeight: videoHeight, height: videoHeight, objectFit: 'contain' } : st.video)}
                 src={videoSrc}
                 onLoadedMetadata={onMeta} onTimeUpdate={updateOnce}
                 onPlay={() => { setIsPlaying(true); startRaf() }}
@@ -1503,6 +1532,17 @@ function SubtitleEditor() {
               </span>
             </div>
           </div>
+
+          {/* Vertical Resizer Handle */}
+          {isEditorFullscreen && (
+            <div 
+              style={{ height: 12, cursor: 'row-resize', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'transparent', zIndex: 10, userSelect: 'none' }}
+              onPointerDown={onVideoResizerDown}
+            >
+              <div style={{ height: 4, width: 40, background: '#475569', borderRadius: 2 }} />
+            </div>
+          )}
+
           {/* timeline toolbar: zoom + hints */}
           <div style={st.tlToolbar}>
             <span style={{ fontWeight: 700 }}>🎞 Timeline</span>
@@ -1568,7 +1608,7 @@ function SubtitleEditor() {
             ) : subs.map(s => (
               <SubRow key={s.id} s={s} active={sameId(s.id, activeId)} 
                 updateSub={updateSub} removeSub={removeSub} seekTo={seekTo} 
-                setRowRef={el => (rowRefs.current[s.id] = el)} st={st} />
+                rowRefs={rowRefs} st={st} />
             ))}
           </div>
         </div>
