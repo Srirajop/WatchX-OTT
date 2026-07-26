@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, Component } from 'react'
+import React, { useState, useRef, useEffect, Component, memo, useCallback } from 'react'
 import axios from 'axios'
 
 const API = '/api'
@@ -313,12 +313,83 @@ function Modal({ title, onClose, maxWidth = 520, children }) {
   )
 }
 
+const TlBlock = memo(({ s, active, pxPerSec, isEditorFullscreen, onBlockPointerDown, seekTo, st, movedRef }) => {
+  const a = tcToSec(s.start_time), b = tcToSec(s.end_time) || a + 2
+  const left = a * pxPerSec
+  const width = Math.max(3, (b - a) * pxPerSec)
+  return (
+    <div title={`#${s.id}  ${s.start_time} → ${s.end_time}`}
+      style={{
+        ...st.tlBlock,
+        ...(active ? st.tlBlockActive : {}),
+        left,
+        width,
+        top: isEditorFullscreen ? 148 : 80,
+        height: isEditorFullscreen ? 44 : 36,
+      }}
+      onClick={e => { e.stopPropagation(); if (!movedRef.current) seekTo(a) }}>
+      <div style={st.tlHandle} onPointerDown={e => onBlockPointerDown(e, s, 'left')} />
+      <div style={st.tlBlockText} onPointerDown={e => onBlockPointerDown(e, s, 'move')}>
+        {s.text.split('\n')[0] || '(empty)'}
+      </div>
+      <div style={st.tlHandle} onPointerDown={e => onBlockPointerDown(e, s, 'right')} />
+    </div>
+  )
+})
+
+const SubRow = memo(({ s, active, updateSub, removeSub, seekTo, setRowRef, st }) => {
+  return (
+    <div ref={setRowRef}
+      style={{ ...st.subRow, ...(active ? st.subRowActive : {}) }}
+      onClick={() => seekTo(tcToSec(s.start_time))}>
+      <div style={st.tcInline}>
+        <span style={{ fontSize: 11, fontWeight: 800, color: '#94a3b8', minWidth: 26 }}>#{s.id}</span>
+        <input className="tc" style={st.tcField} value={s.start_time}
+          onChange={e => updateSub(s.id, 'start_time', e.target.value)} onClick={e => e.stopPropagation()} />
+        <span style={{ color: '#64748b' }}>→</span>
+        <input className="tc" style={st.tcField} value={s.end_time}
+          onChange={e => updateSub(s.id, 'end_time', e.target.value)} onClick={e => e.stopPropagation()} />
+        <button style={st.delBtn} onClick={e => { e.stopPropagation(); removeSub(s.id) }}>✕</button>
+      </div>
+      <textarea style={st.txtArea} value={s.text}
+        onChange={e => updateSub(s.id, 'text', e.target.value)}
+        onClick={e => e.stopPropagation()} />
+    </div>
+  )
+})
+
 function SubtitleEditor() {
   const [videoSrc, setVideoSrc] = useState(null)
   const [videoUrl, setVideoUrl] = useState('')
-  const [duration, setDuration] = useState(0)
+  const [dur, setDuration] = useState(0)
   const [activeId, setActiveId] = useState(null)
   const [subs, setSubs] = useState([])
+  
+  // Resizing state
+  const [listWidth, setListWidth] = useState(460)
+  const isDraggingList = useRef(false)
+
+  const onListResizerDown = useCallback((e) => {
+    e.preventDefault()
+    isDraggingList.current = true
+    document.body.style.cursor = 'col-resize'
+
+    const onMove = (ev) => {
+      if (!isDraggingList.current) return
+      const newWidth = document.body.clientWidth - ev.clientX
+      setListWidth(Math.max(250, Math.min(newWidth, 1200)))
+    }
+
+    const onUp = () => {
+      isDraggingList.current = false
+      document.body.style.cursor = ''
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }, [])
   const [filename, setFilename] = useState('subtitles')
   const [formats, setFormats] = useState({ import: [], export: [] })
 
@@ -607,13 +678,13 @@ function SubtitleEditor() {
   }
   function startRaf() { if (rafRef.current == null) rafRef.current = requestAnimationFrame(tick) }
   function stopRaf() { if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null } }
-  function updateOnce() {
+  const updateOnce = useCallback(() => {
     const v = videoRef.current
     if (!v) return
     paintPlayhead(v.currentTime)
     const id = activeIdAt(v.currentTime)
     setActiveId(prev => (prev === id ? prev : id))
-  }
+  }, [])
 
   function triggerAudioScrubBurst(timeSec, durationMs = 100, targetVideo = null) {
     if (!audioScrub) return
@@ -838,9 +909,9 @@ function SubtitleEditor() {
     startRaf()
     generateWaveform()
   }
-  function seekTo(sec) {
+  const seekTo = useCallback((sec) => {
     if (videoRef.current) { videoRef.current.currentTime = sec; updateOnce() }
-  }
+  }, [updateOnce])
   function seekFromEvent(e) {
     const inner = timelineInnerRef.current
     if (!inner) return
@@ -907,7 +978,7 @@ function SubtitleEditor() {
   }
 
   // ── timeline block drag / resize ──────────────────────
-  function onBlockPointerDown(e, s, mode) {
+  const onBlockPointerDown = useCallback((e, s, mode) => {
     e.stopPropagation()
     e.preventDefault()
     movedRef.current = false
@@ -917,7 +988,7 @@ function SubtitleEditor() {
     }
     window.addEventListener('pointermove', onDragMove)
     window.addEventListener('pointerup', onDragUp)
-  }
+  }, [])
   function onDragMove(e) {
     const d = dragRef.current
     if (!d) return
@@ -1145,14 +1216,16 @@ function SubtitleEditor() {
     } catch { /* backend will stop regardless once event is set; ignore network errors */ }
   }
 
-  function updateSub(id, field, value) { setSubs(subs.map(s => sameId(s.id, id) ? { ...s, [field]: value } : s)) }
-  function addSub() {
-    const last = subs[subs.length - 1]
-    const start = last ? secToTc(tcToSec(last.end_time || last.start_time) + 0.2) : '00:00:00,000'
-    const nextId = subs.length ? Math.max(...subs.map(s => s.id)) + 1 : 1
-    setSubs([...subs, { id: nextId, start_time: start, end_time: secToTc(tcToSec(start) + 2), text: '' }])
-  }
-  function removeSub(id) { setSubs(subs.filter(s => !sameId(s.id, id))) }
+  const updateSub = useCallback((id, field, value) => { setSubs(prev => prev.map(s => sameId(s.id, id) ? { ...s, [field]: value } : s)) }, [])
+  const addSub = useCallback(() => {
+    setSubs(prev => {
+      const last = prev[prev.length - 1]
+      const start = last ? secToTc(tcToSec(last.end_time || last.start_time) + 0.2) : '00:00:00,000'
+      const nextId = prev.length ? Math.max(...prev.map(s => s.id)) + 1 : 1
+      return [...prev, { id: nextId, start_time: start, end_time: secToTc(tcToSec(start) + 2), text: '' }]
+    })
+  }, [])
+  const removeSub = useCallback((id) => { setSubs(prev => prev.filter(s => !sameId(s.id, id))) }, [])
   function clearSubs() {
     setSubs([]); setRefSubs([])
     setPointId(''); setPointId2(''); setPointStart(''); setPointStart2(''); setMainIdx(''); setRefIdx(''); setMainIdx2(''); setRefIdx2('')
@@ -1285,7 +1358,11 @@ function SubtitleEditor() {
       )}
 
       {/* SIDE-BY-SIDE: video + synced subtitle list */}
-      <div style={isEditorFullscreen ? { ...st.mainGrid, flex: 1, minHeight: 450 } : st.mainGrid}>
+      <div style={{
+        ...(isEditorFullscreen ? { ...st.mainGrid, flex: 1, minHeight: 450 } : st.mainGrid),
+        gridTemplateColumns: `minmax(0,1fr) 12px ${listWidth}px`,
+        gap: 0
+      }}>
         {/* LEFT: video + detailed timeline (waveform + ruler + draggable blocks) */}
         <div style={isEditorFullscreen ? { ...st.videoCard, height: '100%', display: 'flex', flexDirection: 'column', minHeight: 450 } : st.videoCard}>
           {videoSrc ? (
@@ -1458,34 +1535,23 @@ function SubtitleEditor() {
                 ))}
               </div>
 
-              {subs.map(s => {
-                const a = tcToSec(s.start_time), b = tcToSec(s.end_time) || a + 2
-                const left = a * pxPerSec
-                const width = Math.max(3, (b - a) * pxPerSec)
-                const active = sameId(s.id, activeId)
-                return (
-                  <div key={s.id} title={`#${s.id}  ${s.start_time} → ${s.end_time}`}
-                    style={{
-                      ...st.tlBlock,
-                      ...(active ? st.tlBlockActive : {}),
-                      left,
-                      width,
-                      top: isEditorFullscreen ? 148 : 80,
-                      height: isEditorFullscreen ? 44 : 36,
-                    }}
-                    onClick={e => { e.stopPropagation(); if (!movedRef.current) seekTo(a) }}>
-                    <div style={st.tlHandle} onPointerDown={e => onBlockPointerDown(e, s, 'left')} />
-                    <div style={st.tlBlockText} onPointerDown={e => onBlockPointerDown(e, s, 'move')}>
-                      {s.text.split('\n')[0] || '(empty)'}
-                    </div>
-                    <div style={st.tlHandle} onPointerDown={e => onBlockPointerDown(e, s, 'right')} />
-                  </div>
-                )
-              })}
+              {subs.map(s => (
+                <TlBlock key={s.id} s={s} active={sameId(s.id, activeId)} pxPerSec={pxPerSec} 
+                  isEditorFullscreen={isEditorFullscreen} onBlockPointerDown={onBlockPointerDown} 
+                  seekTo={seekTo} st={st} movedRef={movedRef} />
+              ))}
 
               <div ref={playheadRef} style={{ ...st.playhead, left: '0%' }} />
             </div>
           </div>
+        </div>
+
+        {/* RESIZER */}
+        <div 
+          style={{ width: 12, cursor: 'col-resize', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'transparent', zIndex: 10, userSelect: 'none' }}
+          onPointerDown={onListResizerDown}
+        >
+          <div style={{ width: 4, height: 40, background: '#475569', borderRadius: 2 }} />
         </div>
 
         {/* RIGHT: subtitle list (synced with video) */}
@@ -1500,22 +1566,9 @@ function SubtitleEditor() {
                 No subtitles loaded.<br />Click “Open Subtitles” or drop a subtitle file anywhere.
               </div>
             ) : subs.map(s => (
-              <div key={s.id} ref={el => (rowRefs.current[s.id] = el)}
-                style={{ ...st.subRow, ...(sameId(s.id, activeId) ? st.subRowActive : {}) }}
-                onClick={() => seekTo(tcToSec(s.start_time))}>
-                <div style={st.tcInline}>
-                  <span style={{ fontSize: 11, fontWeight: 800, color: '#94a3b8', minWidth: 26 }}>#{s.id}</span>
-                  <input className="tc" style={st.tcField} value={s.start_time}
-                    onChange={e => updateSub(s.id, 'start_time', e.target.value)} onClick={e => e.stopPropagation()} />
-                  <span style={{ color: '#64748b' }}>→</span>
-                  <input className="tc" style={st.tcField} value={s.end_time}
-                    onChange={e => updateSub(s.id, 'end_time', e.target.value)} onClick={e => e.stopPropagation()} />
-                  <button style={st.delBtn} onClick={e => { e.stopPropagation(); removeSub(s.id) }}>✕</button>
-                </div>
-                <textarea style={st.txtArea} value={s.text}
-                  onChange={e => updateSub(s.id, 'text', e.target.value)}
-                  onClick={e => e.stopPropagation()} />
-              </div>
+              <SubRow key={s.id} s={s} active={sameId(s.id, activeId)} 
+                updateSub={updateSub} removeSub={removeSub} seekTo={seekTo} 
+                setRowRef={el => (rowRefs.current[s.id] = el)} st={st} />
             ))}
           </div>
         </div>

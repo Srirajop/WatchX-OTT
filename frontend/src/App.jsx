@@ -1851,9 +1851,9 @@ export default function App() {
         )}
 
         {/* ══ SUBTITLE EDIT TAB ══ */}
-        {tab === 'subtitle' && (
+        <div style={{ display: tab === 'subtitle' ? 'block' : 'none' }}>
           <SubtitleEditor />
-        )}
+        </div>
 
         {/* ══ ADJUST TIMECODES TAB ══ */}
         {tab === 'adjust' && (
