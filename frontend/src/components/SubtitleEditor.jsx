@@ -338,21 +338,34 @@ const TlBlock = memo(({ s, active, pxPerSec, isEditorFullscreen, onBlockPointerD
 })
 
 const SubRow = memo(({ s, active, updateSub, removeSub, seekTo, rowRefs, st }) => {
+  const [localText, setLocalText] = useState(s.text)
+  const [localStart, setLocalStart] = useState(s.start_time)
+  const [localEnd, setLocalEnd] = useState(s.end_time)
+
+  useEffect(() => { setLocalText(s.text) }, [s.text])
+  useEffect(() => { setLocalStart(s.start_time) }, [s.start_time])
+  useEffect(() => { setLocalEnd(s.end_time) }, [s.end_time])
+
   return (
     <div ref={el => { if (rowRefs) rowRefs.current[s.id] = el }}
       style={{ ...st.subRow, ...(active ? st.subRowActive : {}) }}
       onClick={() => seekTo(tcToSec(s.start_time))}>
       <div style={st.tcInline}>
         <span style={{ fontSize: 11, fontWeight: 800, color: '#94a3b8', minWidth: 26 }}>#{s.id}</span>
-        <input className="tc" style={st.tcField} value={s.start_time}
-          onChange={e => updateSub(s.id, 'start_time', e.target.value)} onClick={e => e.stopPropagation()} />
+        <input className="tc" style={st.tcField} value={localStart}
+          onChange={e => setLocalStart(e.target.value)} 
+          onBlur={() => { if (localStart !== s.start_time) updateSub(s.id, 'start_time', localStart) }}
+          onClick={e => e.stopPropagation()} />
         <span style={{ color: '#64748b' }}>→</span>
-        <input className="tc" style={st.tcField} value={s.end_time}
-          onChange={e => updateSub(s.id, 'end_time', e.target.value)} onClick={e => e.stopPropagation()} />
+        <input className="tc" style={st.tcField} value={localEnd}
+          onChange={e => setLocalEnd(e.target.value)} 
+          onBlur={() => { if (localEnd !== s.end_time) updateSub(s.id, 'end_time', localEnd) }}
+          onClick={e => e.stopPropagation()} />
         <button style={st.delBtn} onClick={e => { e.stopPropagation(); removeSub(s.id) }}>✕</button>
       </div>
-      <textarea style={st.txtArea} value={s.text}
-        onChange={e => updateSub(s.id, 'text', e.target.value)}
+      <textarea style={st.txtArea} value={localText}
+        onChange={e => setLocalText(e.target.value)}
+        onBlur={() => { if (localText !== s.text) updateSub(s.id, 'text', localText) }}
         onClick={e => e.stopPropagation()} />
     </div>
   )
@@ -377,12 +390,17 @@ function SubtitleEditor() {
     const onMove = (ev) => {
       if (!isDraggingList.current) return
       const newWidth = document.body.clientWidth - ev.clientX
-      setListWidth(Math.max(250, Math.min(newWidth, 1200)))
+      const w = Math.max(250, Math.min(newWidth, 1200))
+      if (editorGridRef.current) {
+        editorGridRef.current.style.gridTemplateColumns = `minmax(0,1fr) 12px ${w}px`
+      }
     }
 
-    const onUp = () => {
+    const onUp = (ev) => {
       isDraggingList.current = false
       document.body.style.cursor = ''
+      const newWidth = document.body.clientWidth - ev.clientX
+      setListWidth(Math.max(250, Math.min(newWidth, 1200)))
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
     }
@@ -405,12 +423,18 @@ function SubtitleEditor() {
     const onMove = (ev) => {
       if (!isDraggingVideo.current) return
       const delta = ev.clientY - dragVideoStart.current.y
-      setVideoHeight(Math.max(150, Math.min(dragVideoStart.current.h + delta, 1000)))
+      const h = Math.max(150, Math.min(dragVideoStart.current.h + delta, 1000))
+      if (videoContainerRef.current) {
+        videoContainerRef.current.style.maxHeight = `${h}px`
+        videoContainerRef.current.style.height = `${h}px`
+      }
     }
 
-    const onUp = () => {
+    const onUp = (ev) => {
       isDraggingVideo.current = false
       document.body.style.cursor = ''
+      const delta = ev.clientY - dragVideoStart.current.y
+      setVideoHeight(Math.max(150, Math.min(dragVideoStart.current.h + delta, 1000)))
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
     }
@@ -618,6 +642,8 @@ function SubtitleEditor() {
   const [translatePrompt, setTranslatePrompt] = useState('')
   const [showAdvTranslate, setShowAdvTranslate] = useState(false)
 
+  const editorGridRef = useRef(null)
+  const videoContainerRef = useRef(null)
   const videoRef = useRef(null)
   const videoShellRef = useRef(null)
   const fileVideoRef = useRef(null)
@@ -1387,7 +1413,9 @@ function SubtitleEditor() {
       )}
 
       {/* SIDE-BY-SIDE: video + synced subtitle list */}
-      <div style={{
+      <div 
+        ref={editorGridRef}
+        style={{
         ...(isEditorFullscreen ? { ...st.mainGrid, flex: 1, minHeight: 450 } : st.mainGrid),
         gridTemplateColumns: `minmax(0,1fr) 12px ${listWidth}px`,
         gap: 0
