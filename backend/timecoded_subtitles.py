@@ -387,6 +387,35 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
     if entries:
         return _renumber(entries)
 
+    # ── CCSL Footage Fallback ───────────────────────────────────────────────
+    # Hollywood FEET.FRAMES timecode format (e.g. 56.11, 62.05) used in CCSL
+    # docs like Juno. These pipe-delimited rows don't have recognizable header
+    # names, so the general column classifier above misses them. We fall back
+    # to the dedicated CCSL footage extractor here so timecodes + dialogue are
+    # returned as proper subtitle dicts instead of raw text with embedded TC.
+    _FOOTAGE_TC = re.compile(r'\b(\d{1,4})\.(\d{2})\b')
+    _footage_hits = 0
+    for _l in text.splitlines():
+        if '|' in _l and _FOOTAGE_TC.search(_l):
+            _footage_hits += 1
+    if _footage_hits > 5:
+        from extractor import extract_ccsl_footage
+        ccsl_lines = extract_ccsl_footage(text)
+        for line in ccsl_lines:
+            line = line.strip()
+            if not line:
+                continue
+            match = _INLINE_RANGE.search(line)
+            if match:
+                dialogue = line[match.end():].strip()
+                dialogue = re.sub(r'^\|', '', dialogue).strip()
+                if dialogue:
+                    entries.append(_entry(match.group("start"), match.group("end"), dialogue))
+            else:
+                entries.append({"start_time": "", "text": line})
+        if entries:
+            return _renumber(entries)
+
     # ── Flat-Column Script Parser ───────────────────────────────────────────
     # Handles PDFs like Tiny Toons (Deluxe As-Broadcast) where TIMECODE,
     # CHARACTER NAME, and DIALOGUE are on SEPARATE consecutive lines:
@@ -491,15 +520,31 @@ def prepare_for_platform(subtitles: list[dict], platform_key: str | dict, filena
     max_cps = float(platform.get("reading_speed_max_cps", 21))
     max_chars = int(platform.get("max_chars_per_line", 42))
     max_lines = int(platform.get("max_lines", 2))
+    # PAC is already a cue-based delivery format.  Its entries can be music
+    # symbols, numeric IDs, or all-caps on-screen text, all of which are valid
+    # subtitle cues even though the generic script-metadata heuristic would
+    # reject them.  A PAC -> SRT conversion must preserve every record.
+    preserve_all_pac_cues = filename.lower().endswith(".pac")
 
     cleaned = []
     for sub in ensure_srt_timings(subtitles):
         text = clean_delivery_text(sub.get("text", ""))
-        if not _is_dialogue_text(text):
+        if not preserve_all_pac_cues and not _is_dialogue_text(text):
             continue
         item = dict(sub)
         item["text"] = text
         cleaned.append(item)
+
+    # If any subtitles are missing start_time (e.g. from paragraph_with_speaker
+    # scripts with no embedded timecodes), assign sequential placeholders so
+    # _repair_timing_windows does not silently drop the entire file.
+    _has_tc = any(_to_seconds(s.get("start_time", "")) is not None for s in cleaned)
+    if not _has_tc and cleaned:
+        tc = 0.0
+        for item in cleaned:
+            item["start_time"] = _from_seconds(tc)
+            item["end_time"] = _from_seconds(tc + 2.0)
+            tc += 3.0
 
     cleaned.sort(key=lambda item: _to_seconds(item.get("start_time", "")) or 0)
     cleaned = _split_long_subtitles(cleaned, max_chars, max_lines)
@@ -535,6 +580,35 @@ _METADATA_LINE = re.compile(
     re.IGNORECASE
 )
 
+# CCSL files often include translator/explanatory notes after the actual title,
+# for example: "Wizard. (Bleeker's nickname for Juno)".  These notes are not
+# subtitle dialogue and must never reach the cleaner or the final SRT.  Keep
+# short production cues such as (OS), (VO), (SINGS), and (MAIN TITLE), which
+# carry subtitle meaning/formatting.
+_KEEP_PARENTHETICAL_CUE = re.compile(
+    r"^\s*(?:"
+    r"OS|VO|OC|CONT(?:'D|INUED)?|OVERLAPPING|SINGS?|SINGING|"
+    r"ON\s*SCREEN|ONSCREEN|MAIN\s+TITLE|TITLE|ITAL(?:ICS)?|"
+    r"WHISPERING|SCREAMING|LAUGHING"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_explanatory_parentheticals(text: str) -> str:
+    """Remove trailing CCSL annotations while retaining real subtitle cues."""
+    # Notes are commonly more than one sentence long; remove repeatedly in
+    # case a title has several independent explanations.
+    pattern = re.compile(r"\s*\(([^()]*)\)\s*$")
+    while True:
+        match = pattern.search(text)
+        if not match:
+            return text
+        content = match.group(1).strip()
+        if len(content) < 12 or _KEEP_PARENTHETICAL_CUE.match(content):
+            return text
+        text = text[:match.start()].rstrip()
+
 
 def clean_delivery_text(text: str) -> str:
     """
@@ -550,6 +624,12 @@ def clean_delivery_text(text: str) -> str:
     text = re.sub(r'<b>', '__BOLD_OPEN__', text)
     text = re.sub(r'</b>', '__BOLD_CLOSE__', text)
 
+    # ── 1b. Normalise spatial-parser bold/italic markers so they survive cleaning ──
+    # PDF/DOC spatial parsers emit **bold** and *italic* markers. Convert them
+    # to the same placeholders used above so they are preserved like real tags.
+    text = re.sub(r'\*\*(.+?)\*\*', r'__BOLD_OPEN__\1__BOLD_CLOSE__', text)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'__ITALIC_OPEN__\1__ITALIC_CLOSE__', text)
+
     # ── 2. Remove ONLY stage-direction parentheticals (not all brackets) ──
     # Keep: (VO), (OS), (CONT'D), (singing), (screaming) when they are alone
     # Remove: (speaking Spanish), (to himself), (through phone), etc.
@@ -562,6 +642,7 @@ def clean_delivery_text(text: str) -> str:
         re.IGNORECASE
     )
     text = _STAGE_PARENS.sub('', text)
+    text = _strip_explanatory_parentheticals(text)
 
     # Remove sound-effect brackets [MUSIC], [APPLAUSE] but NOT [words in song]
     text = re.sub(r'\[(?:MUSIC|APPLAUSE|LAUGHTER|CHEERING|GUNSHOT|EXPLOSION|SINGING)[^\]]*\]', '', text, flags=re.IGNORECASE)
@@ -609,12 +690,9 @@ def clean_delivery_text(text: str) -> str:
             continue
 
         # Skip pure speaker-name lines (all uppercase, no sentence punctuation)
-        # BUT never skip lines that contain music notes (♪ ♫) — those are song lyrics
-        stripped_for_check = re.sub(r"[\s.'\-/&#,/()+<>]+", "", re.sub(r'<[^>]+>', '', line))
-        has_music = bool(re.search(r'[♪♫🎵🎶]', line))
-        if not has_music and stripped_for_check.isupper() and 0 < len(stripped_for_check) <= 40:
-            if not re.search(r"[!?]", line) and not re.search(r'[a-z]', line):
-                continue  # pure speaker label — drop it
+        # We removed the overly aggressive 'isupper()' check here because it was
+        # completely obliterating scripts where all dialogue is in ALL CAPS.
+        # The LLM and format-specific parsers already handle stray speaker labels.
 
         # Strip speaker prefix WITHOUT colon/dash — ALL-CAPS word(s) followed by mixed-case dialogue
         # e.g. "LILA I thought he seemed sad." → "I thought he seemed sad."
@@ -923,23 +1001,31 @@ def _is_dialogue_text(text: str) -> bool:
     cleaned = text.strip()
     if _looks_like_zero_subtitle(cleaned):
         return True
+    # Strip spatial-parser bold/italic markers and HTML tags so scene headings like
+    # "<b>ACT</b> <b>ONE</b>" or "**ACT** **ONE**" are still recognised by the metadata filter below.
+    cleaned_norm = re.sub(r'\*\*(.+?)\*\*', r'\1', cleaned)
+    cleaned_norm = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'\1', cleaned_norm)
+    cleaned_norm = re.sub(r'<[^>]+>', '', cleaned_norm)
     # Filter out all production metadata lines
-    if _METADATA_LINE.match(cleaned):
+    if _METADATA_LINE.match(cleaned_norm):
         return False
-    if re.match(r"^(FADE IN|FADE OUT|CUT TO|SMASH CUT)$", cleaned, re.IGNORECASE):
+    if re.match(r"^(FADE IN|FADE OUT|CUT TO|SMASH CUT)$", cleaned_norm, re.IGNORECASE):
         return False
-    if _is_metadata_label(cleaned):
+    if _is_metadata_label(cleaned_norm):
         return False
     # Filter pure numeric/timecode lines
-    if re.match(r"^[\d\s:;,.|/-]+$", cleaned):
+    if re.match(r"^[\d\s:;,.|/-]+$", cleaned_norm):
         return False
     # Filter scene headings anywhere in line
-    if re.search(r'\b(INT\.|EXT\.|INT/EXT\.|EXT/INT\.)', cleaned, re.IGNORECASE):
+    if re.search(r'\b(INT\.|EXT\.|INT/EXT\.|EXT/INT\.)', cleaned_norm, re.IGNORECASE):
         return False
     # Filter QC credit lines
-    if re.search(r'\d+(st|nd|rd|th)\s+QC\s*:', cleaned, re.IGNORECASE):
+    if re.search(r'\d+(st|nd|rd|th)\s+QC\s*:', cleaned_norm, re.IGNORECASE):
         return False
-    return bool(re.search(r"[A-Za-z]", cleaned))
+    # Filter speaker-only lines (ALL CAPS label with no dialogue punctuation)
+    if re.match(r'^[A-Z][A-Z\s\.\-\'\/\(\)0-9\#\&\,]{1,40}$', cleaned_norm):
+        return False
+    return bool(re.search(r"[A-Za-z]", cleaned_norm))
 
 
 def _entries_from_start_times(rows: list[dict]) -> list[dict]:

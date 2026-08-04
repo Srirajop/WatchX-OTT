@@ -39,12 +39,14 @@ import re
 # ─── CATEGORY KEYWORDS ─────────────────────────────────────────────────────────
 
 # Phrases that prove a rule is a DIALOGUE-TEXT rule (stays in `text` bucket).
+# NOTE: "reading speed", "cps", "characters per second" are intentionally NOT here —
+# they also appear in _TIMING_KEYWORDS, and timing wins in classify_rule().
+# Keeping them here too caused ambiguity; timing/CPS belongs in the timing bucket.
 _TEXT_PHRASES = [
     "character", "line", "subtitle", "dialogue", "word", "punctuation",
     "capital", "case", "spell", "profanity", "italic", "hyphen", "speaker",
     "acronym", "ellipsis", "quotation", "apostrophe", "number", "digit",
-    "symbol", "ampersand", "reading speed", "cps", "characters per second",
-    "second per", "remove", "strip", "hoh", "emt", "music", "laughter",
+    "symbol", "ampersand", "remove", "strip", "hoh", "emt", "music", "laughter",
     "stage direction", "filler", "slang", "foreign", "song lyric", "voice",
     "max char", "maximum character", "characters per line", "max line",
     "maximum line", "line length", "line limit",

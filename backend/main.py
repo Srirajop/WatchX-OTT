@@ -1,5 +1,5 @@
 # main.py — SubtitleAI V2 Backend
-# FastAPI + Groq (LLaMA 3.1 8B Instant) + MySQL
+# FastAPI + Groq (LLaMA 3.1 8B Instant) + MySQL (Reloaded)
 
 import sys
 import os
@@ -28,6 +28,7 @@ from cleaner import clean_subtitle_chunk, extract_platform_rules_with_ai
 from quality_checker import check_quality
 from platform_rules import get_platform, get_platform_list
 from timecoded_subtitles import ensure_srt_timings, parse_timecoded_subtitles, prepare_for_platform, subtitles_to_srt, normalize_timecode
+import auth
 
 load_dotenv()
 
@@ -41,6 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router, prefix="/auth")
 
 @app.on_event("startup")
 def startup():
@@ -72,22 +74,21 @@ def health():
 
 # ─── CLEAN ───────────────────────────────────────────────────────
 
-def chunk_text(text: str, max_chunk_size: int = 7000) -> list[str]:
-    lines = text.splitlines()
+def chunk_list(items: list[str], max_chunk_size: int = 7000) -> list[list[str]]:
     chunks = []
     current_chunk = []
     current_size = 0
-    for line in lines:
-        line_len = len(line) + 1
-        if current_size + line_len > max_chunk_size and current_chunk:
-            chunks.append("\n".join(current_chunk))
-            current_chunk = [line]
-            current_size = line_len
+    for item in items:
+        item_len = len(item) + 1
+        if current_size + item_len > max_chunk_size and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = [item]
+            current_size = item_len
         else:
-            current_chunk.append(line)
-            current_size += line_len
+            current_chunk.append(item)
+            current_size += item_len
     if current_chunk:
-        chunks.append("\n".join(current_chunk))
+        chunks.append(current_chunk)
     return chunks
 
 
@@ -128,87 +129,30 @@ async def clean_file_endpoint(
     platform_dict = get_platform(platform)
     timecoded_subtitles = parse_timecoded_subtitles(raw_text)
 
-    if timecoded_subtitles and "--- OCR SUBTITLES" not in raw_text:
-        async def timecoded_event_generator():
-            yield f"data: {json.dumps({'status': 'starting', 'progress': 0, 'message': 'Converting to SRT with original timecodes...'})}\n\n"
-            await asyncio.sleep(0.05)
-
-            from quality_checker import auto_fix_subtitles
-            for sub in timecoded_subtitles:
-                if "original_text" not in sub:
-                    sub["original_text"] = sub.get("text", "")
-            fixed_subtitles = auto_fix_subtitles(timecoded_subtitles, platform)
-            fixed_subtitles = ensure_srt_timings(fixed_subtitles)
-            fixed_subtitles = prepare_for_platform(fixed_subtitles, platform, filename)
-            for s_idx, sub in enumerate(fixed_subtitles, start=1):
-                sub["id"] = s_idx
-                sub["start_time"] = normalize_timecode(sub.get("start_time", ""))
-                sub["end_time"] = normalize_timecode(sub.get("end_time", ""))
-
-            total_lines = len(fixed_subtitles)
-            flagged_lines = sum(1 for s in fixed_subtitles if s.get("flagged"))
-            changed_lines = sum(
-                1 for s in fixed_subtitles
-                if s.get("original_text", s.get("text", "")).strip() != s.get("text", "").strip()
-            )
-
-            try:
-                log_job(filename, file_ext, platform, structure, total_lines, flagged_lines, 0)
-            except Exception as e:
-                print(f"Failed to log job: {e}")
-
-            final_result = {
-                "subtitles": fixed_subtitles,
-                "stats": {
-                    "total_lines": total_lines,
-                    "flagged_lines": flagged_lines,
-                    "changed_lines": changed_lines,
-                    "platform": platform,
-                    "detected_structure": "srt_timecoded",
-                    "original_format": filename
-                }
-            }
-
-            yield f"data: {json.dumps({'status': 'completed', 'progress': 100, 'result': final_result})}\n\n"
-
-        return StreamingResponse(
-            timecoded_event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-            }
-        )
-
     groq_key = os.getenv("GROQ_API_KEY", "")
     if not groq_key or groq_key == "your_groq_api_key_here":
         raise HTTPException(500, "GROQ_API_KEY not configured. Get free key at https://console.groq.com")
 
-    pre_extracted = pre_extract_dialogue(raw_text, structure, file_bytes, filename, platform_dict)
-
-    if pre_extracted:
-        # Join extracted lines — LLM only needs to polish punctuation/spelling
-        # Much shorter input → much faster LLM response
-        clean_input = "\n".join(pre_extracted)
-        print(f"[EXTRACT] Pre-extracted {len(pre_extracted)} lines via Python (structure: {structure})")
+    if timecoded_subtitles and "--- OCR SUBTITLES" not in raw_text:
+        pre_extracted = [sub.get("text", "") for sub in timecoded_subtitles]
+        print(f"[EXTRACT] Found {len(pre_extracted)} timecoded subtitles, sending to LLM for cleaning.")
     else:
-        # Fallback: send raw text if extractor found nothing (unusual format)
-        clean_input = raw_text
-        print(f"[EXTRACT] No pre-extraction, sending raw text to LLM")
+        pre_extracted = pre_extract_dialogue(raw_text, structure, file_bytes, filename, platform_dict)
+
+    if not pre_extracted:
+        pre_extracted = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        print(f"[EXTRACT] No pre-extraction, sending {len(pre_extracted)} raw lines to LLM")
 
     provider = os.getenv("LLM_PROVIDER", "gemini").lower()
-    # With pre-extraction, input is already clean dialogue.
-    # We use optimized chunking to balance TPM limits and throughput.
     lmstudio_chunk = int(os.getenv("LM_STUDIO_CHUNK_SIZE", "1500"))
     chunk_size = lmstudio_chunk if provider == "lmstudio" else 8000 if provider == "gemini" else 3000
-    chunks = chunk_text(clean_input, max_chunk_size=chunk_size)
+    chunks = chunk_list(pre_extracted, max_chunk_size=chunk_size)
     total_chunks = len(chunks)
     
     # Process fewer chunks in parallel with larger sizes to prevent exceeding Groq TPM.
-    parallel = int(os.getenv("LM_STUDIO_PARALLEL", "1")) if provider == "lmstudio" else 2
+    parallel = int(os.getenv("LM_STUDIO_PARALLEL", "1")) if provider == "lmstudio" else (1 if provider == "groq" else 2)
 
-    async def process_chunk(idx: int, chunk: str):
+    async def process_chunk(idx: int, chunk: list[str]):
         loop = asyncio.get_running_loop()
         return idx, await loop.run_in_executor(
             None,
@@ -227,6 +171,10 @@ async def clean_file_endpoint(
 
         # Process in parallel batches to match LM Studio's parallel slot count
         for batch_start in range(0, total_chunks, parallel):
+            if provider == "groq" and batch_start > 0:
+                yield f"data: {json.dumps({'status': 'processing', 'progress': int((batch_start / total_chunks) * 100), 'message': f'Groq Pacing: Waiting 21s to clear 6k TPM bucket...'})}\n\n"
+                await asyncio.sleep(21.0)
+                
             batch = list(enumerate(chunks[batch_start:batch_start + parallel], start=batch_start))
             done = batch_start + len(batch)
             progress_pct = int((batch_start / total_chunks) * 100)
@@ -245,7 +193,38 @@ async def clean_file_endpoint(
                 return
 
         # Re-index all subtitles contiguously and assign sequential placeholder timecodes if missing
-        from timecoded_subtitles import _from_seconds, _to_seconds
+        from timecoded_subtitles import _from_seconds, _to_seconds, ensure_srt_timings, prepare_for_platform, normalize_timecode
+        
+        # 1. Restore timecodes if we had them!
+        if timecoded_subtitles and "--- OCR SUBTITLES" not in raw_text:
+            for i, sub in enumerate(all_subtitles):
+                if i < len(timecoded_subtitles):
+                    sub["start_time"] = timecoded_subtitles[i].get("start_time", "")
+                    sub["end_time"] = timecoded_subtitles[i].get("end_time", "")
+                    
+        # 2. Filter out [DELETE] / empty rows!
+        all_subtitles = [sub for sub in all_subtitles if not sub.get("deleted", False)]
+
+        # PAC is a complete, already-timed subtitle format.  An LLM response
+        # that is cut short or omits an item must never turn a 500-cue PAC
+        # into a shorter SRT.  Fall back to the native PAC cues when the LLM
+        # does not return a strict one-for-one result; deterministic platform
+        # formatting below still runs on every preserved cue.
+        if file_ext == "pac" and timecoded_subtitles and len(all_subtitles) != len(timecoded_subtitles):
+            print(
+                f"[PAC] LLM returned {len(all_subtitles)} of "
+                f"{len(timecoded_subtitles)} cues; preserving native PAC cues instead."
+            )
+            all_subtitles = [
+                {
+                    **source_sub,
+                    "original_text": source_sub.get("text", ""),
+                    "text": source_sub.get("text", ""),
+                    "deleted": False,
+                }
+                for source_sub in timecoded_subtitles
+            ]
+        
         tc = 0.0
         for s_idx, sub in enumerate(all_subtitles, start=1):
             sub["id"] = s_idx
@@ -267,6 +246,14 @@ async def clean_file_endpoint(
         from quality_checker import auto_fix_subtitles
         from platform_rules import get_platform as _get_platform
         all_subtitles = auto_fix_subtitles(all_subtitles, platform)
+        
+        if timecoded_subtitles and "--- OCR SUBTITLES" not in raw_text:
+            all_subtitles = ensure_srt_timings(all_subtitles)
+            all_subtitles = prepare_for_platform(all_subtitles, platform, filename)
+            for s_idx, sub in enumerate(all_subtitles, start=1):
+                sub["id"] = s_idx
+                sub["start_time"] = normalize_timecode(sub.get("start_time", ""))
+                sub["end_time"] = normalize_timecode(sub.get("end_time", ""))
 
         # Re-evaluate flagged status after auto_fix.
         # auto_fix resolves most issues (line splitting, profanity, formatting).
@@ -685,7 +672,11 @@ async def get_track_changes(data: dict):
         if sub.get("flagged"):
             g["flagged"] = True
 
+    # A professional audit must retain unchanged cues in their original order;
+    # otherwise the report looks as though those lines were skipped.
     changes = []
+    entries = []
+    changed_count = 0
     unchanged_count = 0
 
     for orig_text in group_order:
@@ -693,11 +684,7 @@ async def get_track_changes(data: dict):
         new_text = "\n".join(g["cleaned_lines"])
         applied_rules = deduce_change_rules(orig_text, new_text, plat_rules, g["rule_hints"])
 
-        if not applied_rules:
-            unchanged_count += len(g["ids"])
-            continue
-
-        changes.append({
+        entry = {
             "id": g["ids"][0],
             "ids": g["ids"],
             "original_text": orig_text,
@@ -705,12 +692,21 @@ async def get_track_changes(data: dict):
             "rules_applied": applied_rules,
             "flagged": g["flagged"],
             "flag_reason": g["flag_reason"],
-        })
+            "changed": bool(applied_rules),
+        }
+        entries.append(entry)
+
+        if not applied_rules:
+            unchanged_count += len(g["ids"])
+            continue
+        changed_count += len(g["ids"])
+        changes.append(entry)
 
     return {
         "changes": changes,
+        "entries": entries,
         "total_lines": total_lines,
-        "changed_lines": len(changes),
+        "changed_lines": changed_count,
         "unchanged_lines": unchanged_count,
         "platform": platform_dict.get("name", platform_key)
     }
@@ -738,9 +734,12 @@ async def export_track_changes_pdf(data: dict):
     platform_dict = get_platform(platform_key)
 
     # ── Determine source of changes ──────────────────────────────────────────
-    precomputed = data.get("changes")          # list of change dicts from /track-changes
+    # ``entries`` contains the full, ordered audit; retain the changed-only
+    # field as a compatibility fallback for older browser sessions.
+    precomputed = data.get("entries") or data.get("changes")
     total_lines = data.get("total_lines", 0)
     unchanged_count = data.get("unchanged_lines", 0)
+    changed_count = data.get("changed_lines")
 
     if precomputed is None:
         # Slow-path fallback: recompute from raw subtitles
@@ -781,6 +780,10 @@ async def export_track_changes_pdf(data: dict):
                     "rules_applied": rules,
                 })
         unchanged_count = total_lines - len(precomputed)
+        changed_count = len(precomputed)
+
+    if changed_count is None:
+        changed_count = sum(1 for entry in precomputed if entry.get("changed", True))
 
     # ── Build PDF ─────────────────────────────────────────────────────────────
     buf = io.BytesIO()
@@ -822,7 +825,7 @@ async def export_track_changes_pdf(data: dict):
     Story.append(Paragraph(
         f"Platform: <b>{platform_dict.get('name', platform_key)}</b> &nbsp;|&nbsp; "
         f"Total lines: <b>{total_lines}</b> &nbsp;|&nbsp; "
-        f"Changed: <b>{len(precomputed)}</b> &nbsp;|&nbsp; "
+        f"Changed: <b>{changed_count}</b> &nbsp;|&nbsp; "
         f"Unchanged: <b>{unchanged_count}</b>",
         summary_style
     ))
@@ -1217,14 +1220,30 @@ def get_platforms():
 
 
 def _extract_text_from_upload(file_bytes: bytes, filename: str, sheet_name: str = "") -> str:
-    """Return guideline text for one upload, OCR-inclusive (see file_reader)."""
+    """Return guideline text for one upload, OCR-inclusive (see file_reader).
+    
+    When sheet_name is given (bulk Excel import), reads only that sheet's cells
+    AND appends any OCR text from embedded images in the whole workbook — since
+    Excel stores all images globally (xl/media/), not per-sheet.
+    """
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
     if ext in ("png", "jpg", "jpeg", "webp", "bmp", "gif"):
         from ocr_reader import ocr_image_bytes
         return ocr_image_bytes(file_bytes).strip()
     if sheet_name.strip() and ext in ("xlsx", "xls"):
         from file_reader import read_excel_sheet
-        return read_excel_sheet(file_bytes, sheet_name.strip()).strip()
+        cell_text = read_excel_sheet(file_bytes, sheet_name.strip()).strip()
+        # Also OCR embedded images from workbook (images are stored globally, not per-sheet)
+        try:
+            from ocr_reader import ocr_fallback_for_xlsx, ocr_fallback_for_xls
+            # Always run OCR regardless of cell text length — images may have rules
+            ocr_fn = ocr_fallback_for_xlsx if ext == "xlsx" else ocr_fallback_for_xls
+            ocr_text = ocr_fn(file_bytes, 0)  # pass 0 to always trigger OCR check
+            if ocr_text and ocr_text.strip():
+                return (cell_text + "\n\n=== EMBEDDED IMAGE CONTENT (OCR) ===\n" + ocr_text).strip()
+        except Exception as _e:
+            print(f"[extract] OCR pass failed for sheet '{sheet_name}': {_e}")
+        return cell_text
     from file_reader import read_file
     return read_file(file_bytes, filename, force_ocr=True)["raw_text"].strip()
 
@@ -1276,6 +1295,7 @@ async def add_platform_stream(
     platform_name: str = Form(default=""),
     version_label: str = Form(default="Current"),
     sheet_name: str = Form(default=""),
+    selected_sheets: str = Form(default=""),  # JSON array of sheet names to import
     guidelines_files: list[UploadFile] = File(default=[]),
     guidelines_text: str = Form(default="")
 ):
@@ -1292,6 +1312,12 @@ async def add_platform_stream(
     p_name = platform_name.strip()
     v_label = version_label.strip() or "Current"
     s_name = sheet_name.strip()
+    # Parse the list of sheets the user explicitly checked in the UI
+    import json as _json_
+    try:
+        selected_sheets_list = _json_.loads(selected_sheets) if selected_sheets.strip() else []
+    except Exception:
+        selected_sheets_list = []
 
     if not p_name and file_snapshots:
         fname = file_snapshots[0][0]
@@ -1337,7 +1363,10 @@ async def add_platform_stream(
                 total = 0
                 try:
                     for _, fb in excel_files:
-                        total += len(list_excel_sheets(fb) or [])
+                        sheets_all = list_excel_sheets(fb) or []
+                        if selected_sheets_list:
+                            sheets_all = [s for s in sheets_all if (s["name"] if isinstance(s, dict) else s) in selected_sheets_list]
+                        total += len(sheets_all)
                 except Exception:
                     total = len(excel_files)
                 done = 0
@@ -1351,15 +1380,25 @@ async def add_platform_stream(
                     if not sheets:
                         results.append({"filename": fname, "status": "skipped", "reason": "No sheets found"})
                         continue
+                    # Filter to only user-checked sheets if a subset was specified
+                    if selected_sheets_list:
+                        sheets = [s for s in sheets if (s["name"] if isinstance(s, dict) else s) in selected_sheets_list]
                     for sh in sheets:
                         sname = sh["name"] if isinstance(sh, dict) else sh
-                        pname = p_name or sname
+                        # ALWAYS use the sheet name as the platform name in bulk mode.
+                        # The manually-typed platform_name is intentionally ignored here
+                        # to prevent all sheets from being saved under the same name.
+                        pname = sname
                         done += 1
                         prog = int(10 + (done / max(total, 1)) * 85)
                         q.put({"status": "extracting", "progress": prog,
-                               "message": f'OCR + extracting rules — sheet "{sname}" ({done}/{total})',
+                               "message": f'Reading sheet "{sname}" + OCR images ({done}/{total})',
                                "sheet": sname})
                         sheet_text = _extract_text_from_upload(fb, fname, sname)
+                        if not sheet_text.strip():
+                            results.append({"filename": fname, "sheet_name": sname,
+                                            "status": "skipped", "reason": "Sheet appears empty"})
+                            continue
                         res = _save_one_platform(pname, v_label, sheet_text, source_files)
                         res["filename"] = fname
                         res["sheet_name"] = sname
@@ -1595,6 +1634,19 @@ async def bulk_add_platforms(
         "results": results,
         "message": f"Imported {len(ok)} of {len(mapping_list)} platforms from '{guidelines_file.filename}'"
     }
+
+
+@app.delete("/platforms")
+def delete_all_platforms():
+    from database import get_connection
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM platforms")
+    affected = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return {"success": True, "deleted": affected}
 
 
 @app.delete("/platforms/{platform_key}")
@@ -1916,35 +1968,30 @@ async def transcribe_audio(file: UploadFile = File(...)):
         
         def worker():
             try:
-                from faster_whisper import WhisperModel
+                from transcription_engine import transcribe_with_stable_timestamps
 
-                q.put({"type": "status", "message": "Loading Faster-Whisper AI model...", "progress": 10})
-                model = WhisperModel("small", device="cpu", compute_type="int8")
+                q.put({"type": "status", "message": "Loading stable-ts Whisper timestamp engine...", "progress": 10})
 
-                q.put({"type": "status", "message": "Analyzing audio stream...", "progress": 20})
-                segments_gen, info = model.transcribe(
-                    tmp_path,
-                    beam_size=5,
-                    word_timestamps=True,
-                    vad_filter=True
-                )
+                def report_progress(done, total):
+                    total = total or 1.0
+                    pct = min(95, max(20, int(20 + (float(done) / float(total)) * 75)))
+                    q.put({"type": "status", "message": f"Stabilizing word timecodes ({pct}%)...", "progress": pct})
 
-                duration = getattr(info, "duration", 0) or 1.0
+                q.put({"type": "status", "message": "Analyzing audio and stabilizing speech boundaries...", "progress": 20})
+                segments, engine = transcribe_with_stable_timestamps(tmp_path, report_progress)
                 whisper_subs = []
 
-                for i, seg in enumerate(segments_gen, start=1):
-                    pct = min(95, max(20, int(20 + (seg.end / duration) * 75)))
-                    q.put({"type": "status", "message": f"Transcribing dialogue ({pct}%)...", "progress": pct})
+                for i, seg in enumerate(segments, start=1):
                     whisper_subs.append({
                         "id": i,
-                        "start_time": _from_seconds(seg.start),
-                        "end_time": _from_seconds(seg.end),
-                        "text": seg.text.strip(),
+                        "start_time": _from_seconds(seg["start"]),
+                        "end_time": _from_seconds(seg["end"]),
+                        "text": seg["text"],
                         "flagged": False,
                         "flag_reason": ""
                     })
 
-                q.put({"type": "done", "subtitles": whisper_subs})
+                q.put({"type": "done", "subtitles": whisper_subs, "engine": engine})
 
             except Exception as e:
                 print(f"[Transcribe Error] {e}")
@@ -1972,7 +2019,8 @@ async def transcribe_audio(file: UploadFile = File(...)):
                         "total_lines": len(msg["subtitles"]),
                         "flagged_lines": 0,
                         "platform": "none",
-                        "detected_structure": "local_whisper_audio",
+                        "detected_structure": "stable_ts_whisper_audio",
+                        "transcription_engine": msg.get("engine", "stable-ts"),
                         "original_format": filename
                     }
                 }
@@ -2055,30 +2103,25 @@ async def transcribe_and_align_endpoint(
         
         def worker():
             try:
-                from faster_whisper import WhisperModel
+                from transcription_engine import transcribe_with_stable_timestamps
 
-                q.put({"type": "status", "message": "Loading Faster-Whisper AI model...", "progress": 10})
-                model = WhisperModel("small", device="cpu", compute_type="int8")
+                q.put({"type": "status", "message": "Loading stable-ts Whisper timestamp engine...", "progress": 10})
 
-                q.put({"type": "status", "message": "Analyzing audio stream...", "progress": 20})
-                segments_gen, info = model.transcribe(
-                    tmp_path,
-                    beam_size=5,
-                    word_timestamps=True,
-                    vad_filter=True
-                )
+                def report_progress(done, total):
+                    total = total or 1.0
+                    pct = min(85, max(20, int(20 + (float(done) / float(total)) * 65)))
+                    q.put({"type": "status", "message": f"Stabilizing word timecodes ({pct}%)...", "progress": pct})
 
-                duration = getattr(info, "duration", 0) or 1.0
+                q.put({"type": "status", "message": "Analyzing audio and stabilizing speech boundaries...", "progress": 20})
+                segments, engine = transcribe_with_stable_timestamps(tmp_path, report_progress)
                 whisper_subs = []
 
-                for i, seg in enumerate(segments_gen, start=1):
-                    pct = min(85, max(20, int(20 + (seg.end / duration) * 65)))
-                    q.put({"type": "status", "message": f"Extracting timecodes ({pct}%)...", "progress": pct})
+                for i, seg in enumerate(segments, start=1):
                     whisper_subs.append({
                         "id": i,
-                        "start_time": _from_seconds(seg.start),
-                        "end_time": _from_seconds(seg.end),
-                        "text": seg.text.strip(),
+                        "start_time": _from_seconds(seg["start"]),
+                        "end_time": _from_seconds(seg["end"]),
+                        "text": seg["text"],
                         "flagged": False,
                         "flag_reason": ""
                     })
@@ -2089,7 +2132,7 @@ async def transcribe_and_align_endpoint(
                 else:
                     final_subs = whisper_subs
 
-                q.put({"type": "done", "subtitles": final_subs})
+                q.put({"type": "done", "subtitles": final_subs, "engine": engine})
 
             except Exception as e:
                 print(f"[ForcedAlign Error] {e}")
@@ -2117,7 +2160,8 @@ async def transcribe_and_align_endpoint(
                         "total_lines": len(msg["subtitles"]),
                         "flagged_lines": sum(1 for s in msg["subtitles"] if s.get("flagged")),
                         "platform": platform,
-                        "detected_structure": "aligned_script" if script_subs else "whisper_audio",
+                        "detected_structure": "aligned_script" if script_subs else "stable_ts_whisper_audio",
+                        "transcription_engine": msg.get("engine", "stable-ts"),
                         "original_format": filename
                     }
                 }

@@ -194,7 +194,12 @@ def read_file(file_bytes: bytes, filename: str, force_ocr: bool = False) -> dict
     # OCR MUST run on every page / every embedded image of the document so no
     # rule that lives inside an image is ever missed. Tesseract is required; if
     # it isn't installed we degrade gracefully and keep the native text.
-    raw_text = _run_universal_ocr(ext, file_bytes, raw_text)
+    # Native text is the authoritative source for script files.  Appending OCR
+    # to a document that already has usable text creates a second, noisier copy
+    # of every cue and, importantly, prevents the timecoded parser from being
+    # used by the cleaning endpoint.  OCR is therefore a fallback for empty
+    # native extraction, or an explicit user request (``force_ocr``).
+    raw_text = _run_universal_ocr(ext, file_bytes, raw_text, force=force_ocr)
 
     structure = detect_structure(raw_text, ext)
 
@@ -277,12 +282,14 @@ def _tesseract_available() -> bool:
         return False
 
 
-def _run_universal_ocr(ext: str, file_bytes: bytes, native_text: str) -> str:
+def _run_universal_ocr(
+    ext: str, file_bytes: bytes, native_text: str, force: bool = False
+) -> str:
     """
-    Production-grade OCR pass that runs on EVERY page / embedded image of the
-    document, for every supported guideline format. Guideline docs always mix
-    real text with screenshots (pasted rule tables, scanned spec pages, etc.)
-    so OCR must not be conditional on whether native text 'looked empty'.
+    OCR fallback for scanned/embedded-image documents.  It runs when native
+    extraction produced no text, or when the caller explicitly requests OCR.
+    Native script text must not be combined with OCR by default: that duplicates
+    cues and makes table/timecode selection unreliable.
 
     Strategy per format:
       - pdf  : render EVERY page to an image and OCR it (catches both fully
@@ -298,6 +305,9 @@ def _run_universal_ocr(ext: str, file_bytes: bytes, native_text: str) -> str:
     Returns the original text plus any OCR content, never less than what the
     native reader produced.
     """
+    if native_text and native_text.strip() and not force:
+        return native_text
+
     if not _tesseract_available():
         return native_text
 
@@ -578,12 +588,17 @@ def read_docx(file_bytes: bytes) -> str:
 
                 start_row = 0 if roles.get("no_header") else 1
                 for row in table.rows[start_row:]:
-                    # Deduplicate merged cells (python-docx repeats merged cell text)
-                    cells_raw = [c.text.strip() for c in row.cells]
-                    cells = []
-                    for c in cells_raw:
-                        if not cells or c != cells[-1]:
-                            cells.append(c)
+                    # Keep the physical Word-column positions intact.  A
+                    # continuation row in a normal three-column script table
+                    # is commonly ["", "", "dialogue"].  Collapsing adjacent
+                    # empty cells turns that into ["", "dialogue"] and moves
+                    # the dialogue out of its header-derived column index.
+                    # This was why the CAR SOS document yielded only the few
+                    # cues whose timecode and dialogue appeared on one row.
+                    # ``row.cells`` intentionally retains those positions;
+                    # merged cells are harmless here because the header and
+                    # every data row use the same physical grid.
+                    cells = [c.text.strip() for c in row.cells]
 
                     if time_col >= len(cells) or dlg_col >= len(cells):
                         continue
@@ -753,6 +768,10 @@ def read_legacy_doc(file_bytes: bytes) -> str:
 
 
 def read_pdf(file_bytes: bytes) -> str:
+    spatial_text = _read_pdf_spatial(file_bytes)
+    if spatial_text and ' | ' in spatial_text:
+        return spatial_text
+
     sections = []
     try:
         import fitz

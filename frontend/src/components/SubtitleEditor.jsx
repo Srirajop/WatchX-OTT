@@ -119,6 +119,7 @@ const st = {
   txtArea: { width: '100%', minHeight: 42, border: '1px solid #e2e8f0', borderRadius: 7, padding: '7px 9px',
     fontSize: 13.5, fontFamily: 'inherit', resize: 'vertical', outline: 'none', boxSizing: 'border-box', lineHeight: 1.45 },
   delBtn: { background: '#fee2e2', border: 'none', color: '#dc2626', borderRadius: 6, padding: '3px 8px', cursor: 'pointer', fontSize: 11, fontWeight: 700 },
+  insBtn: { background: '#e0e7ff', border: 'none', color: '#4338ca', borderRadius: 6, padding: '3px 7px', cursor: 'pointer', fontSize: 10.5, fontWeight: 700, whiteSpace: 'nowrap' },
   // controls
   controls: { display: 'grid', gridTemplateColumns: '360px 1fr', gap: 12, alignItems: 'start' },
   panel: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16 },
@@ -337,7 +338,7 @@ const TlBlock = memo(({ s, active, pxPerSec, isEditorFullscreen, onBlockPointerD
   )
 })
 
-const SubRow = memo(({ s, active, updateSub, removeSub, seekTo, rowRefs, st }) => {
+const SubRow = memo(({ s, active, updateSub, removeSub, insertSubBefore, insertSubAfter, seekTo, rowRefs, st }) => {
   const [localText, setLocalText] = useState(s.text)
   const [localStart, setLocalStart] = useState(s.start_time)
   const [localEnd, setLocalEnd] = useState(s.end_time)
@@ -361,7 +362,9 @@ const SubRow = memo(({ s, active, updateSub, removeSub, seekTo, rowRefs, st }) =
           onChange={e => setLocalEnd(e.target.value)} 
           onBlur={() => { if (localEnd !== s.end_time) updateSub(s.id, 'end_time', localEnd) }}
           onClick={e => e.stopPropagation()} />
-        <button style={st.delBtn} onClick={e => { e.stopPropagation(); removeSub(s.id) }}>✕</button>
+        <button style={st.insBtn} onClick={e => { e.stopPropagation(); insertSubBefore(s.id) }} title="Insert subtitle line before this subtitle">+▲ Before</button>
+        <button style={st.insBtn} onClick={e => { e.stopPropagation(); insertSubAfter(s.id) }} title="Insert subtitle line after this subtitle">+▼ After</button>
+        <button style={st.delBtn} onClick={e => { e.stopPropagation(); removeSub(s.id) }} title="Delete subtitle">✕</button>
       </div>
       <textarea style={st.txtArea} value={localText}
         onChange={e => setLocalText(e.target.value)}
@@ -456,6 +459,17 @@ function SubtitleEditor() {
   const [translateProgress, setTranslateProgress] = useState({ done: 0, total: 0 })
   const [translateLog, setTranslateLog] = useState([])
 
+  // Timecode Adjuster State
+  const [tcMode, setTcMode] = useState('offset')
+  const [tcValue, setTcValue] = useState('')
+  const [tcEndValue, setTcEndValue] = useState('')
+  const [tcTargetId, setTcTargetId] = useState('')
+  const [tcRangeEndId, setTcRangeEndId] = useState('')
+  const [tcShiftMode, setTcShiftMode] = useState('ripple')
+  const [tcAdjusting, setTcAdjusting] = useState(false)
+  const [tcError, setTcError] = useState('')
+  const [tcSuccess, setTcSuccess] = useState('')
+  const [tcCollision, setTcCollision] = useState(null)
   // video transport & workspace fullscreen state
   const [isPlaying, setIsPlaying] = useState(false)
   const [fps, setFps] = useState(25)
@@ -579,6 +593,7 @@ function SubtitleEditor() {
   const [fpsTarget, setFpsTarget] = useState('25')
   const [durWorking, setDurWorking] = useState('')
   const [durTarget, setDurTarget] = useState('')
+  const [syncVideoSpeed, setSyncVideoSpeed] = useState(true)
   const [pointId, setPointId] = useState('')
   const [pointStart, setPointStart] = useState('')
   const [pointId2, setPointId2] = useState('')
@@ -843,6 +858,13 @@ function SubtitleEditor() {
       } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyF') {
         e.preventDefault()
         toggleEditorFullscreen()
+      } else if (e.code === 'Insert') {
+        e.preventDefault()
+        if (activeId != null) {
+          insertSubAfter(activeId)
+        } else {
+          insertSubAtPlayhead()
+        }
       }
     }
     window.addEventListener('keydown', handleKeyDown)
@@ -1134,6 +1156,12 @@ function SubtitleEditor() {
     if (isNaN(w) || isNaN(t) || w <= 0 || t <= 0) return flash('err', 'Enter valid FPS numbers')
     const factor = w / t
     doSync({ mode: 'scale', factor: factor, ...syncRangePayload() })
+    if (syncVideoSpeed && videoRef.current) {
+      const newRate = t / w
+      videoRef.current.playbackRate = newRate
+      setPlaybackRate(newRate)
+      flash('ok', `Video playback speed changed to ${newRate.toFixed(3)}x to match new timings.`)
+    }
     setModal(null)
   }
   function applyDurationConversion() {
@@ -1149,6 +1177,12 @@ function SubtitleEditor() {
     if (isNaN(w) || isNaN(t) || w <= 0 || t <= 0) return flash('err', 'Enter valid durations (e.g. 44:54)')
     const factor = t / w
     doSync({ mode: 'scale', factor: factor, ...syncRangePayload() })
+    if (syncVideoSpeed && videoRef.current) {
+      const newRate = w / t
+      videoRef.current.playbackRate = newRate
+      setPlaybackRate(newRate)
+      flash('ok', `Video playback speed changed to ${newRate.toFixed(3)}x to match new timings.`)
+    }
     setModal(null)
   }
   function nudgeSelected(delta) {
@@ -1272,15 +1306,146 @@ function SubtitleEditor() {
   }
 
   const updateSub = useCallback((id, field, value) => { setSubs(prev => prev.map(s => sameId(s.id, id) ? { ...s, [field]: value } : s)) }, [])
+  
   const addSub = useCallback(() => {
     setSubs(prev => {
       const last = prev[prev.length - 1]
       const start = last ? secToTc(tcToSec(last.end_time || last.start_time) + 0.2) : '00:00:00,000'
-      const nextId = prev.length ? Math.max(...prev.map(s => s.id)) + 1 : 1
-      return [...prev, { id: nextId, start_time: start, end_time: secToTc(tcToSec(start) + 2), text: '' }]
+      const newSub = { id: prev.length + 1, start_time: start, end_time: secToTc(tcToSec(start) + 2), text: '' }
+      const updated = [...prev, newSub]
+      const renumbered = updated.map((item, i) => ({ ...item, id: i + 1 }))
+      setTimeout(() => setActiveId(renumbered.length), 0)
+      return renumbered
     })
   }, [])
-  const removeSub = useCallback((id) => { setSubs(prev => prev.filter(s => !sameId(s.id, id))) }, [])
+
+  const insertSubBefore = useCallback((targetId) => {
+    setSubs(prev => {
+      const idx = prev.findIndex(s => sameId(s.id, targetId))
+      if (idx === -1) return prev
+      const targetSub = prev[idx]
+      const prevSub = idx > 0 ? prev[idx - 1] : null
+      
+      const targetStart = tcToSec(targetSub.start_time)
+      let startSec, endSec
+      
+      if (prevSub) {
+        const prevEnd = tcToSec(prevSub.end_time) || tcToSec(prevSub.start_time)
+        if (targetStart - prevEnd >= 0.2) {
+          startSec = prevEnd + 0.05
+          endSec = Math.min(targetStart - 0.05, startSec + 2.0)
+        } else {
+          startSec = Math.max(0, targetStart - 1.5)
+          endSec = Math.max(startSec + 0.1, targetStart - 0.05)
+        }
+      } else {
+        startSec = Math.max(0, targetStart - 2.0)
+        endSec = Math.max(startSec + 0.1, targetStart - 0.05)
+        if (targetStart <= 0.05) {
+          startSec = 0
+          endSec = 1.5
+        }
+      }
+      
+      const newSub = {
+        id: 0,
+        start_time: secToTc(startSec),
+        end_time: secToTc(endSec),
+        text: ''
+      }
+      
+      const updated = [...prev]
+      updated.splice(idx, 0, newSub)
+      const renumbered = updated.map((item, i) => ({ ...item, id: i + 1 }))
+      
+      const newId = idx + 1
+      setTimeout(() => setActiveId(newId), 0)
+      return renumbered
+    })
+  }, [])
+
+  const insertSubAfter = useCallback((targetId) => {
+    setSubs(prev => {
+      const idx = prev.findIndex(s => sameId(s.id, targetId))
+      if (idx === -1) return prev
+      const targetSub = prev[idx]
+      const nextSub = idx < prev.length - 1 ? prev[idx + 1] : null
+      
+      const targetEnd = tcToSec(targetSub.end_time) || tcToSec(targetSub.start_time)
+      let startSec, endSec
+      
+      if (nextSub) {
+        const nextStart = tcToSec(nextSub.start_time)
+        if (nextStart - targetEnd >= 0.2) {
+          startSec = targetEnd + 0.05
+          endSec = Math.min(nextStart - 0.05, startSec + 2.0)
+        } else {
+          startSec = targetEnd + 0.05
+          endSec = startSec + 1.0
+        }
+      } else {
+        startSec = targetEnd + 0.2
+        endSec = startSec + 2.0
+      }
+      
+      const newSub = {
+        id: 0,
+        start_time: secToTc(startSec),
+        end_time: secToTc(endSec),
+        text: ''
+      }
+      
+      const updated = [...prev]
+      updated.splice(idx + 1, 0, newSub)
+      const renumbered = updated.map((item, i) => ({ ...item, id: i + 1 }))
+      
+      const newId = idx + 2
+      setTimeout(() => setActiveId(newId), 0)
+      return renumbered
+    })
+  }, [])
+
+  const insertSubAtPlayhead = useCallback(() => {
+    const curTime = videoRef.current ? videoRef.current.currentTime : 0
+    const startSec = Math.max(0, curTime)
+    
+    setSubs(prev => {
+      let idx = prev.findIndex(s => tcToSec(s.start_time) > startSec)
+      if (idx === -1) idx = prev.length
+      
+      const nextSub = idx < prev.length ? prev[idx] : null
+      let endSec = startSec + 2.0
+      if (nextSub) {
+        const nextStart = tcToSec(nextSub.start_time)
+        if (nextStart > startSec) {
+          endSec = Math.min(nextStart - 0.05, startSec + 2.0)
+        }
+      }
+      if (endSec <= startSec) endSec = startSec + 1.0
+      
+      const newSub = {
+        id: 0,
+        start_time: secToTc(startSec),
+        end_time: secToTc(endSec),
+        text: ''
+      }
+      
+      const updated = [...prev]
+      updated.splice(idx, 0, newSub)
+      const renumbered = updated.map((item, i) => ({ ...item, id: i + 1 }))
+      
+      const newId = idx + 1
+      setTimeout(() => setActiveId(newId), 0)
+      return renumbered
+    })
+  }, [])
+
+  const removeSub = useCallback((id) => {
+    setSubs(prev => {
+      const filtered = prev.filter(s => !sameId(s.id, id))
+      return filtered.map((item, i) => ({ ...item, id: i + 1 }))
+    })
+  }, [])
   function clearSubs() {
     setSubs([]); setRefSubs([])
     setPointId(''); setPointId2(''); setPointStart(''); setPointStart2(''); setMainIdx(''); setRefIdx(''); setMainIdx2(''); setRefIdx2('')
@@ -1304,6 +1469,83 @@ function SubtitleEditor() {
   const ticks = []
   if (tickStep > 0 && safeDur < 86400) {
     for (let t = 0; t <= safeDur; t += tickStep) ticks.push(t)
+  }
+
+  function handleTcTargetIdChange(val) {
+    setTcTargetId(val)
+    setTcRangeEndId('')
+    setTcSuccess(''); setTcError(''); setTcCollision(null)
+    if (val.trim()) {
+      const found = subs.find(s => s.id === parseInt(val, 10))
+      if (found) {
+        setTcValue(found.start_time || '')
+        setTcEndValue(found.end_time || '')
+      }
+    }
+  }
+
+  async function handleAdjustTimecodes() {
+    if (!subs.length) { setTcError('No subtitles to adjust.'); return }
+    setTcAdjusting(true); setTcError(''); setTcSuccess(''); setTcCollision(null)
+    try {
+      let payload, r
+      if (tcMode === 'offset') {
+        if (!tcValue.trim()) { setTcError('Enter an offset value.'); setTcAdjusting(false); return }
+        payload = { subtitles: subs, mode: 'offset', value: tcValue.trim() }
+        r = await axios.post(`${API}/adjust-timecodes`, payload)
+        setSubs(normalizeSubs(r.data.subtitles || []))
+        setTcSuccess(`✅ All ${r.data.total} subtitles shifted by ${r.data.value}.`)
+        setTcValue('')
+      } else if (tcMode === 'sync_target') {
+        if (!tcTargetId.trim()) { setTcError('Enter the subtitle ID to sync (usually 1).'); setTcAdjusting(false); return }
+        if (!tcValue.trim() && !tcEndValue.trim()) { setTcError('Enter a new start or end timecode.'); setTcAdjusting(false); return }
+        payload = { subtitles: subs, mode: 'sync_target', target_id: parseInt(tcTargetId, 10), new_start: tcValue.trim(), new_end: tcEndValue.trim(), shift_mode: tcShiftMode === 'only_this' ? 'only_this' : 'all' }
+        r = await axios.post(`${API}/adjust-timecodes`, payload)
+        setSubs(normalizeSubs(r.data.subtitles || []))
+        if (r.data.warning) {
+          setTcError(r.data.warning)
+        } else if (r.data.collision) {
+          setTcCollision(r.data.collision_detail)
+          setTcSuccess(`⚠️ Sync applied — but collision detected! Check warning below.`)
+        } else {
+          setTcSuccess(`✅ Sync applied based on subtitle #${tcTargetId}.`)
+        }
+      } else {
+        // edit_single
+        if (!tcTargetId.trim()) { setTcError('Enter the subtitle ID to edit.'); setTcAdjusting(false); return }
+        if (!tcValue.trim()) { setTcError('Enter the new start timecode.'); setTcAdjusting(false); return }
+        if (tcShiftMode === 'only_this') {
+          if (!tcEndValue.trim()) { setTcError('Enter the new end timecode.'); setTcAdjusting(false); return }
+          payload = { subtitles: subs, mode: 'shift_only_this', target_id: parseInt(tcTargetId, 10), new_start: tcValue.trim(), new_end: tcEndValue.trim() }
+          r = await axios.post(`${API}/adjust-timecodes`, payload)
+          setSubs(normalizeSubs(r.data.subtitles || []))
+          if (r.data.collision) {
+            setTcCollision(r.data.collision_detail)
+            setTcSuccess(`⚠️ Subtitle #${tcTargetId} updated — but collision detected! Check warning below.`)
+          } else {
+            setTcSuccess(`✅ Subtitle #${tcTargetId} timecode updated. No collision.`)
+          }
+        } else if (tcShiftMode === 'range') {
+          if (!tcRangeEndId.trim()) { setTcError('Enter the last subtitle ID the fix should apply up to.'); setTcAdjusting(false); return }
+          payload = { subtitles: subs, mode: 'fix_range', target_id: parseInt(tcTargetId, 10), range_end_id: parseInt(tcRangeEndId, 10), value: tcValue.trim() }
+          r = await axios.post(`${API}/adjust-timecodes`, payload)
+          setSubs(normalizeSubs(r.data.subtitles || []))
+          if (r.data.warning) {
+            setTcError(r.data.warning)
+          } else {
+            setTcSuccess(`✅ Subtitles #${tcTargetId} through #${tcRangeEndId} shifted (${r.data.touched_ids.length} line${r.data.touched_ids.length===1?'':'s'}). Everything outside that range is untouched.`)
+          }
+        } else {
+          // ripple — to the end of the file
+          payload = { subtitles: subs, mode: 'fix_from_index', target_id: parseInt(tcTargetId, 10), value: tcValue.trim() }
+          r = await axios.post(`${API}/adjust-timecodes`, payload)
+          setSubs(normalizeSubs(r.data.subtitles || []))
+          setTcSuccess(`✅ Subtitle #${tcTargetId} + all ${r.data.total} subsequent subtitles shifted.`)
+        }
+      }
+    } catch (e) {
+      setTcError(e.response?.data?.detail || 'Adjustment failed')
+    } finally { setTcAdjusting(false) }
   }
 
   return (
@@ -1338,12 +1580,23 @@ function SubtitleEditor() {
         <button style={st.tbBtn} onClick={() => setModal('subs')}>📄 Open Subtitles</button>
         <button style={{ ...st.tbBtn, background: '#7f1d1d', borderColor: '#991b1b' }} onClick={clearSubs} disabled={!subs.length}>🗑 Clear Subs</button>
         <button style={st.tbBtn} onClick={() => setModal('sync')}>⏱ Synchronize</button>
+        <button style={{ ...st.tbBtn, background: '#0f766e', borderColor: '#115e59', color: '#ccfbf1' }} onClick={() => {
+          setModal('adjust')
+          if (activeId != null) handleTcTargetIdChange(String(activeId))
+        }}>⏱ Adjust TC</button>
         <button style={{ ...st.tbBtn, background: '#0f766e', borderColor: '#115e59', color: '#ccfbf1' }} onClick={() => setModal('fps')}>🎞 FPS Converter</button>
         <button style={st.tbBtn} onClick={() => setModal('translate')}>🌐 Auto-Translate</button>
         <button style={st.tbBtn} onClick={() => setModal('export')}>⬇ Export</button>
         <div style={{ flex: 1 }} />
         {videoSrc && <button style={{ ...st.tbBtn, background: '#7f1d1d', borderColor: '#991b1b' }} onClick={removeVideo}>✕ Remove Video</button>}
-        <button style={st.tbBtn} onClick={addSub}>+ Add line</button>
+        <button style={st.tbBtn} onClick={addSub} title="Add a line at the end of subtitles">+ Add line (End)</button>
+        <button style={{ ...st.tbBtn, background: '#312e81', borderColor: '#6366f1', color: '#e0e7ff' }} onClick={insertSubAtPlayhead} title="Insert a new line at current video position (Playhead)">📍 + At Playhead</button>
+        {activeId != null && (
+          <>
+            <button style={{ ...st.tbBtn, background: '#1e3a8a', borderColor: '#3b82f6', color: '#dbeafe' }} onClick={() => insertSubBefore(activeId)} title={`Insert line before #${activeId}`}>+▲ Before #{activeId}</button>
+            <button style={{ ...st.tbBtn, background: '#1e3a8a', borderColor: '#3b82f6', color: '#dbeafe' }} onClick={() => insertSubAfter(activeId)} title={`Insert line after #${activeId}`}>+▼ After #{activeId}</button>
+          </>
+        )}
         <button
           style={{
             ...st.tbBtn,
@@ -1626,7 +1879,11 @@ function SubtitleEditor() {
         <div style={isEditorFullscreen ? { ...st.listCard, height: '100%' } : st.listCard}>
           <div style={st.listHead}>
             <span style={st.listTitle}>🗂 Subtitles ({subs.length})</span>
-            <span ref={clockRef} style={{ fontSize: 11, color: '#64748b', fontFamily: 'monospace' }}>00:00 / 00:00</span>
+            <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
+              <button style={st.insBtn} onClick={insertSubAtPlayhead} title="Insert line at playhead position">📍 + Playhead</button>
+              <button style={st.insBtn} onClick={addSub} title="Add line at end">+ End</button>
+              <span ref={clockRef} style={{ fontSize: 11, color: '#64748b', fontFamily: 'monospace', marginLeft: 4 }}>00:00 / 00:00</span>
+            </div>
           </div>
           <div style={st.list} ref={listRef}>
             {subs.length === 0 ? (
@@ -1635,8 +1892,9 @@ function SubtitleEditor() {
               </div>
             ) : subs.map(s => (
               <SubRow key={s.id} s={s} active={sameId(s.id, activeId)} 
-                updateSub={updateSub} removeSub={removeSub} seekTo={seekTo} 
-                rowRefs={rowRefs} st={st} />
+                updateSub={updateSub} removeSub={removeSub}
+                insertSubBefore={insertSubBefore} insertSubAfter={insertSubAfter}
+                seekTo={seekTo} rowRefs={rowRefs} st={st} />
             ))}
           </div>
         </div>
@@ -1712,7 +1970,12 @@ function SubtitleEditor() {
             </button>
           </div>
 
-          <div style={{ marginTop: 16, padding: 12, background: '#f1f5f9', borderRadius: 8, border: '1px solid #e2e8f0', fontSize: 11.5, color: '#475569', lineHeight: 1.5 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 16, padding: '8px 4px', fontSize: 13, color: '#0f172a', fontWeight: 600, cursor: 'pointer', borderTop: '1px solid #e2e8f0' }}>
+            <input type="checkbox" checked={syncVideoSpeed} onChange={e => setSyncVideoSpeed(e.target.checked)} />
+            Also change video playback speed so I can preview the sync
+          </label>
+
+          <div style={{ marginTop: 12, padding: 12, background: '#f1f5f9', borderRadius: 8, border: '1px solid #e2e8f0', fontSize: 11.5, color: '#475569', lineHeight: 1.5 }}>
             <strong>💡 Tip: How to find FPS?</strong><br/>
             <strong>Pirated Video:</strong> Open the video in VLC Media Player and press <code>Ctrl + J</code> to see the exact Frame Rate.<br/>
             <strong>Client Video:</strong> Check the GTS Pro project settings. If unknown, you can often guess based on the region (US TV/Movies = 23.976 or 24, Europe/India/Australia TV = 25).
@@ -1918,6 +2181,264 @@ function SubtitleEditor() {
             </select>
           </div>
           <button style={{ ...st.primBtn, width: '100%', marginTop: 8 }} onClick={applyPointViaOther} disabled={busy}>Sync against reference</button>
+        </Modal>
+      )}
+
+      {modal === 'adjust' && (
+        <Modal title="⏱️ Timecode Adjuster" onClose={() => setModal(null)} maxWidth={800}>
+          <div style={{fontSize:11, color:'#6366f1', marginBottom:18}}>
+            Fix subtitles that are slightly off from the video.
+          </div>
+          
+          <div style={{display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, marginBottom:20}}>
+            <div style={{background:'#ffffff', border:`2px solid ${tcMode==='offset'?'#4338ca':'#e2e8f0'}`, borderRadius:10, padding:'14px 16px', cursor:'pointer'}}
+              onClick={()=>{setTcMode('offset');setTcValue('');setTcEndValue('');setTcTargetId('');setTcRangeEndId('');setTcSuccess('');setTcError('');setTcCollision(null)}}>
+              <div style={{fontSize:13, fontWeight:700, color:tcMode==='offset'?'#6366f1':'#334155', marginBottom:4}}>± Shift All</div>
+              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>
+                Move <strong style={{color:'#64748b'}}>every</strong> subtitle forward or backward by the same amount.
+              </div>
+            </div>
+            <div style={{background:'#ffffff', border:`2px solid ${tcMode==='sync_target'?'#059669':'#e2e8f0'}`, borderRadius:10, padding:'14px 16px', cursor:'pointer'}}
+              onClick={()=>{
+                setTcMode('sync_target');
+                setTcTargetId('1');
+                setTcValue('');setTcEndValue('');setTcRangeEndId('');setTcSuccess('');setTcError('');setTcCollision(null);
+                setTcShiftMode('ripple');
+                const first = subs.find(s=>s.id===1);
+                if (first) { setTcValue(first.start_time||''); setTcEndValue(first.end_time||''); }
+              }}>
+              <div style={{fontSize:13, fontWeight:700, color:tcMode==='sync_target'?'#059669':'#334155', marginBottom:4}}>🎯 Sync First Line</div>
+              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>
+                Set the exact start/end for the first subtitle and auto-shift everything else to match.
+              </div>
+            </div>
+            <div style={{background:'#ffffff', border:`2px solid ${tcMode==='edit_single'?'#d97706':'#e2e8f0'}`, borderRadius:10, padding:'14px 16px', cursor:'pointer'}}
+              onClick={()=>{setTcMode('edit_single');setTcValue('');setTcEndValue('');setTcTargetId('');setTcRangeEndId('');setTcSuccess('');setTcError('');setTcCollision(null)}}>
+              <div style={{fontSize:13, fontWeight:700, color:tcMode==='edit_single'?'#d97706':'#334155', marginBottom:4}}>✏️ Edit Line & Ripple</div>
+              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>
+                Pick a subtitle, edit timecodes, and ripple the fix forwards.
+              </div>
+            </div>
+          </div>
+
+          {tcMode === 'offset' && (
+            <div style={{marginBottom:14}}>
+              <div style={{fontSize:11, color:'#64748b', marginBottom:8}}>
+                Enter offset — positive pushes subtitles later, negative pulls them earlier:
+              </div>
+              <input style={{...st.input, fontFamily:'monospace', fontSize:15, letterSpacing:1, marginBottom:0, borderColor:'#4338ca'}}
+                placeholder='+2.5  or  -00:00:01:12  or  +00:00:02,500'
+                value={tcValue}
+                onChange={e=>{setTcValue(e.target.value);setTcSuccess('');setTcError('')}}
+                onKeyDown={e=>e.key==='Enter'&&handleAdjustTimecodes()}
+              />
+              <div style={{fontSize:10, color:'#64748b', marginTop:6}}>
+                Formats: plain seconds (+2.5), HH:MM:SS:FF frame TC (+00:00:02:12), SRT (+00:00:02,500)
+              </div>
+            </div>
+          )}
+
+          {tcMode === 'sync_target' && (
+            <>
+              <div style={{marginBottom:12}}>
+                <div style={{fontSize:11, color:'#64748b', marginBottom:6}}>
+                  Target Subtitle # (Defaults to 1):
+                </div>
+                <input style={{...st.input, fontFamily:'monospace', fontSize:15, marginBottom:0, borderColor: tcTargetId ? '#059669' : '#cbd5e1', width:130}}
+                  placeholder='e.g. 1'
+                  type='number' min='1'
+                  value={tcTargetId}
+                  onChange={e=>handleTcTargetIdChange(e.target.value)}
+                />
+                {tcTargetId && (() => {
+                  const found = subs.find(s=>s.id===parseInt(tcTargetId,10))
+                  return found ? (
+                    <div style={{marginTop:6, padding:'8px 12px', background:'#ecfdf5', border:'1px solid #05966930', borderRadius:6, fontSize:11, fontFamily:'monospace', color:'#059669', lineHeight:1.6}}>
+                      <span style={{color:'#64748b'}}>#{found.id}</span>{'  '}
+                      {found.start_time} → {found.end_time}
+                      {'  '}<span style={{color:'#047857', fontFamily:'inherit'}}>"{found.text?.substring(0,55)}{found.text?.length>55?'...':''}"</span>
+                    </div>
+                  ) : tcTargetId ? (
+                    <div style={{marginTop:4, fontSize:10, color:'#dc2626'}}>Subtitle #{tcTargetId} not found</div>
+                  ) : null
+                })()}
+              </div>
+
+              <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:14}}>
+                <div>
+                  <div style={{fontSize:10, color:'#64748b', marginBottom:5, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>New In Timecode (start)</div>
+                  <input style={{...st.input, fontFamily:'monospace', fontSize:13, marginBottom:0, borderColor:'#059669'}}
+                    placeholder='00:01:05,000'
+                    value={tcValue}
+                    onChange={e=>{setTcValue(e.target.value);setTcSuccess('');setTcError('');setTcCollision(null)}}
+                  />
+                </div>
+                <div>
+                  <div style={{fontSize:10, color:'#64748b', marginBottom:5, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>
+                    New Out Timecode (end)
+                  </div>
+                  <input style={{...st.input, fontFamily:'monospace', fontSize:13, marginBottom:0, borderColor:'#059669'}}
+                    placeholder='00:01:07,500'
+                    value={tcEndValue}
+                    onChange={e=>{setTcEndValue(e.target.value);setTcSuccess('');setTcError('');setTcCollision(null)}}
+                  />
+                </div>
+              </div>
+
+              <div style={{fontSize:10, color:'#64748b', marginBottom:6, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>Apply to:</div>
+              <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:14}}>
+                <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='ripple'?'#059669':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
+                  onClick={()=>setTcShiftMode('ripple')}>
+                  <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='ripple'?'#059669':'#334155', marginBottom:3}}>🔁 All Subsequent Subtitles</div>
+                  <div style={{fontSize:10, color:'#64748b'}}>Calculates the difference and shifts this and everything after it.</div>
+                </div>
+                <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='only_this'?'#dc2626':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
+                  onClick={()=>setTcShiftMode('only_this')}>
+                  <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='only_this'?'#dc2626':'#334155', marginBottom:3}}>📌 This Line Only</div>
+                  <div style={{fontSize:10, color:'#64748b'}}>Only updates this subtitle. Does not move anything else.</div>
+                </div>
+              </div>
+            </>
+          )}
+
+          {tcMode === 'edit_single' && (
+            <>
+              <div style={{marginBottom:12}}>
+                <div style={{fontSize:11, color:'#64748b', marginBottom:6}}>
+                  Subtitle # — type an ID and both timecodes below auto-fill:
+                </div>
+                <input style={{...st.input, fontFamily:'monospace', fontSize:15, marginBottom:0, borderColor: tcTargetId ? '#d97706' : '#cbd5e1', width:130}}
+                  placeholder='e.g. 42'
+                  type='number' min='1'
+                  value={tcTargetId}
+                  onChange={e=>handleTcTargetIdChange(e.target.value)}
+                />
+                {tcTargetId && (() => {
+                  const found = subs.find(s=>s.id===parseInt(tcTargetId,10))
+                  return found ? (
+                    <div style={{marginTop:6, padding:'8px 12px', background:'#fef3c7', border:'1px solid #d9770630', borderRadius:6, fontSize:11, fontFamily:'monospace', color:'#d97706', lineHeight:1.6}}>
+                      <span style={{color:'#64748b'}}>#{found.id}</span>{'  '}
+                      {found.start_time} → {found.end_time}
+                      {'  '}<span style={{color:'#a08050', fontFamily:'inherit'}}>"{found.text?.substring(0,55)}{found.text?.length>55?'...':''}"</span>
+                    </div>
+                  ) : tcTargetId ? (
+                    <div style={{marginTop:4, fontSize:10, color:'#dc2626'}}>Subtitle #{tcTargetId} not found</div>
+                  ) : null
+                })()}
+              </div>
+
+              <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:14}}>
+                <div>
+                  <div style={{fontSize:10, color:'#64748b', marginBottom:5, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>In Timecode (start)</div>
+                  <input style={{...st.input, fontFamily:'monospace', fontSize:13, marginBottom:0, borderColor:'#d97706'}}
+                    placeholder='00:01:05,000'
+                    value={tcValue}
+                    onChange={e=>{setTcValue(e.target.value);setTcSuccess('');setTcError('');setTcCollision(null)}}
+                  />
+                </div>
+                <div>
+                  <div style={{fontSize:10, color:'#64748b', marginBottom:5, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>
+                    Out Timecode (end) {tcShiftMode!=='only_this' && <span style={{color:'#64748b', fontStyle:'italic', fontWeight:400}}> — auto-adjusted</span>}
+                  </div>
+                  <input style={{...st.input, fontFamily:'monospace', fontSize:13, marginBottom:0,
+                    borderColor: tcShiftMode==='only_this' ? '#dc2626' : '#e2e8f0',
+                    opacity: tcShiftMode!=='only_this' ? 0.45 : 1,
+                    cursor: tcShiftMode!=='only_this' ? 'not-allowed' : 'text'}}
+                    placeholder='00:01:07,500'
+                    value={tcEndValue}
+                    onChange={e=>{setTcEndValue(e.target.value);setTcSuccess('');setTcError('');setTcCollision(null)}}
+                    readOnly={tcShiftMode!=='only_this'}
+                  />
+                </div>
+              </div>
+
+              <div style={{fontSize:10, color:'#64748b', marginBottom:6, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>How far should this fix reach?</div>
+              <div style={{display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, marginBottom:14}}>
+                <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='ripple'?'#d97706':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
+                  onClick={()=>setTcShiftMode('ripple')}>
+                  <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='ripple'?'#d97706':'#334155', marginBottom:3}}>🔁 Ripple to End</div>
+                  <div style={{fontSize:10, color:'#64748b'}}>Shifts this line and every line AFTER it.</div>
+                </div>
+                <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='range'?'#0ea5e9':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
+                  onClick={()=>setTcShiftMode('range')}>
+                  <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='range'?'#0ea5e9':'#334155', marginBottom:3}}>📐 Ripple to a Stopping Point</div>
+                  <div style={{fontSize:10, color:'#64748b'}}>Shifts this line and lines after it, ONLY up to a subtitle #.</div>
+                </div>
+                <div style={{background:'#ffffff', border:`2px solid ${tcShiftMode==='only_this'?'#dc2626':'#e2e8f0'}`, borderRadius:8, padding:'10px 12px', cursor:'pointer'}}
+                  onClick={()=>setTcShiftMode('only_this')}>
+                  <div style={{fontSize:11, fontWeight:700, color:tcShiftMode==='only_this'?'#dc2626':'#334155', marginBottom:3}}>📌 This Line Only</div>
+                  <div style={{fontSize:10, color:'#64748b'}}>Changes IN and OUT for just this one line.</div>
+                </div>
+              </div>
+
+              {tcShiftMode === 'range' && (
+                <div style={{marginBottom:14}}>
+                  <div style={{fontSize:10, color:'#64748b', marginBottom:6, fontWeight:700, textTransform:'uppercase', letterSpacing:0.6}}>
+                    Stop the ripple at subtitle # (inclusive)
+                  </div>
+                  <input style={{...st.input, fontFamily:'monospace', fontSize:15, marginBottom:0, borderColor:'#0ea5e9', width:130}}
+                    placeholder='e.g. 80'
+                    type='number' min={tcTargetId || 1}
+                    value={tcRangeEndId}
+                    onChange={e=>{setTcRangeEndId(e.target.value);setTcSuccess('');setTcError('')}}
+                  />
+                  <div style={{fontSize:10, color:'#64748b', marginTop:6}}>
+                    Everything from #{tcTargetId || '?'} up to and including #{tcRangeEndId || '?'} will shift by the same amount. Subtitle #{tcRangeEndId ? parseInt(tcRangeEndId,10)+1 : '(end+1)'} onward stays exactly where it is.
+                  </div>
+                </div>
+              )}
+
+              {tcTargetId && subs.find(s=>s.id===parseInt(tcTargetId,10)) && (
+                <div style={{marginBottom:14}}>
+                  <div style={{fontSize:10, color:'#64748b', marginBottom:6, textTransform:'uppercase', letterSpacing:0.8}}>Context — surrounding subtitles</div>
+                  {subs.filter(s=>s.id>=Math.max(1,parseInt(tcTargetId,10)-1)&&s.id<=parseInt(tcTargetId,10)+1).map((s,i)=>(
+                    <div key={i} style={{
+                      background: s.id===parseInt(tcTargetId,10) ? '#fef3c7' : '#ffffff',
+                      border: s.id===parseInt(tcTargetId,10) ? '1px solid #d9770640' : '1px solid #e2e8f0',
+                      borderRadius:6, padding:'7px 11px', marginBottom:5, display:'flex', gap:10, alignItems:'center'
+                    }}>
+                      <span style={{fontFamily:'monospace', fontSize:10, color: s.id===parseInt(tcTargetId,10)?'#d97706':'#94a3b8', minWidth:30}}>#{s.id}</span>
+                      <span style={{fontFamily:'monospace', fontSize:10, color: s.id===parseInt(tcTargetId,10)?'#d97706':'#4338ca', minWidth:210}}>
+                        {s.start_time} → {s.end_time}
+                      </span>
+                      <span style={{fontSize:10, color: s.id===parseInt(tcTargetId,10)?'#b45309':'#64748b', flex:1}}>{s.text?.substring(0,60)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {(() => {
+            const disabled = tcAdjusting || !subs.length ||
+              (tcMode==='offset' && !tcValue.trim()) ||
+              (tcMode==='sync_target' && (!tcTargetId.trim() || (!tcValue.trim() && !tcEndValue.trim()))) ||
+              (tcMode==='edit_single' && (
+                !tcTargetId.trim() || !tcValue.trim() ||
+                (tcShiftMode==='only_this' && !tcEndValue.trim()) ||
+                (tcShiftMode==='range' && !tcRangeEndId.trim())
+              ))
+            const label = tcAdjusting ? 'Applying...'
+              : tcMode==='offset' ? '⏱️ Shift All Subtitles'
+              : tcMode==='sync_target' ? '🎯 Sync Timecodes'
+              : tcShiftMode==='ripple' ? '🔁 Apply Ripple Shift'
+              : tcShiftMode==='range' ? '📐 Apply Ripple to Stopping Point'
+              : '📌 Update This Line Only'
+            return (
+              <button style={{...st.primBtn, width: '100%', ...(disabled ? { opacity: 0.5, cursor: 'not-allowed' } : {})}} onClick={handleAdjustTimecodes} disabled={disabled}>
+                {label}
+              </button>
+            )
+          })()}
+
+          {tcSuccess && <div style={{marginTop:12, background: tcCollision?'#fef3c7':'#ecfdf5', border:`1px solid ${tcCollision?'#d9770630':'#05966930'}`, borderRadius:8, padding:'10px 14px', fontSize:12, color: tcCollision?'#d97706':'#059669'}}>{tcSuccess}</div>}
+          {tcCollision && (
+            <div style={{marginTop:8, background:'#fef2f2', border:'1px solid #dc262640', borderRadius:8, padding:'10px 14px', fontSize:11, color:'#dc2626'}}>
+              ⚠️ <strong>Collision Warning:</strong> {tcCollision}
+              <div style={{marginTop:6, color:'#64748b', fontSize:10}}>The subtitle was updated anyway. Use Ripple Shift to avoid collisions, or manually adjust the neighboring subtitle.</div>
+            </div>
+          )}
+          {tcError && <div style={{marginTop:12, padding:12, background:'#fef2f2', border:'1px solid #f87171', borderRadius:8}}><div style={{fontSize:12,color:'#dc2626'}}>{tcError}</div></div>}
         </Modal>
       )}
 

@@ -108,6 +108,26 @@ def init_db():
         )
     """)
 
+    # Users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            reset_token VARCHAR(255) DEFAULT NULL,
+            reset_token_expires TIMESTAMP NULL DEFAULT NULL,
+            is_verified BOOLEAN DEFAULT FALSE,
+            verification_token VARCHAR(255) DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN is_verified BOOLEAN DEFAULT FALSE")
+        cursor.execute("ALTER TABLE users ADD COLUMN verification_token VARCHAR(255) DEFAULT NULL")
+    except Exception:
+        pass # Columns probably already exist
+
     # Delete old built-in platforms (is_custom = False)
     cursor.execute("DELETE FROM platforms WHERE is_custom = 0")
 

@@ -47,7 +47,7 @@ _BRACKETS = re.compile(
     r'\(speaking\s+\w+\)\s*'           # (speaking Spanish)
     r'|\(through\s+\w+\)\s*'           # (through telephone)
     r'|\(into\s+\w+\)\s*'              # (into phone) (into radio)
-    r'|\(to\s+[^)]+\)\s*'              # (to himself) (to Maria)
+    r'|\(to\s+[^)]{1,30}\)\s*'         # (to himself) (to Maria) - limited to 30 chars to avoid swallowing missing parenthesis
     r'|\(whispering[^)]*\)\s*'         # (whispering in Spanish)
     r'|\(overlaps?\)\s*'               # (overlaps)
     r'|\(Archive\)\s*'                 # (Archive)
@@ -563,7 +563,7 @@ def extract_ccsl_footage(text: str) -> list[str]:
 
             dialogue = _clean_line(dialogue)
             dialogue = _SPEAKER_LABEL.sub('', dialogue).strip()
-            dialogue = re.sub(r'\([^)]{1,80}:[^)]{1,80}\)', '', dialogue).strip()
+            dialogue = re.sub(r'\([^)]{1,80}:[^)]{1,250}\)', '', dialogue).strip()
 
             if not dialogue or not _is_valid(dialogue):
                 continue
@@ -643,7 +643,9 @@ def pre_extract_dialogue(raw_text: str, structure: str, file_bytes: bytes = None
     for line in result:
         # If fillers should be removed
         if "fillers" in remove_elements:
-            line = re.sub(r'\b(ugh|hmm|erm|ah|oh)\b', '', line, flags=re.IGNORECASE)
+            # Keep written interjections such as "Oh" and "Ah".  The
+            # platform filler rule is limited to uh/hmm/er/um.
+            line = re.sub(r'\b(?:uh|hmm+|erm|er|um)\b', '', line, flags=re.IGNORECASE)
             line = re.sub(r'\s+', ' ', line).strip()
             
         # Optional: remove purely uppercase lines if they are not dialogue but scene descriptions

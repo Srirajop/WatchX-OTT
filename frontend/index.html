@@ -4,6 +4,14 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>SubtitleAI — Cleaning & Quality Check</title>
+  <script>
+    window.addEventListener('error', function(e) {
+      document.body.innerHTML += '<div style="color:red;font-size:24px;padding:20px;background:white;position:fixed;top:0;left:0;z-index:999999;border-bottom:5px solid red;width:100%;box-shadow:0 10px 30px rgba(0,0,0,0.5);"><strong>REACT CRASH:</strong> ' + e.message + '<br><br><small>' + e.filename + ':' + e.lineno + '</small></div>';
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+      document.body.innerHTML += '<div style="color:red;font-size:24px;padding:20px;background:white;position:fixed;top:0;left:0;z-index:999999;border-bottom:5px solid red;width:100%;box-shadow:0 10px 30px rgba(0,0,0,0.5);"><strong>PROMISE REJECTION:</strong> ' + (e.reason && e.reason.message ? e.reason.message : e.reason) + '</div>';
+    });
+  </script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
     * { box-sizing: border-box; margin: 0; padding: 0; } 

@@ -94,8 +94,14 @@ def _capitalize_line(line: str) -> str:
     stripped = line.lstrip('-').lstrip()
     if stripped.startswith('...'):
         return line
-    # Find the first alphabetic character and capitalize it if it's lower
-    m = re.search(r'[a-zA-Z]', line)
+    # Find the first *content* character, never the ``i`` / ``b`` inside an
+    # SRT formatting tag.  The previous pattern found the ``i`` in ``<i>``
+    # first and changed the opening tag to ``<I>``.  That invalid tag then
+    # survived into track changes (or was stripped by a later cleaner), making
+    # it look as if actual dialogue words had been removed and re-added.
+    # Tags are intentionally case-insensitive here so an old ``<I>`` value is
+    # also repaired on the next clean.
+    m = re.search(r'(?<![</])[a-zA-Z]', line)
     if m:
         idx = m.start()
         prefix = line[:idx]
@@ -228,7 +234,9 @@ def _derive_hints(orig: str, new: str, max_chars: int) -> list:
         hints.append("char_name_removed")
 
     # 3. Filler words removed
-    filler_pat = r'\b(u+gh+|h+mm+|erm+|a+h+|o+h+|u+m+|u+h+)\b'
+    # Only explicitly listed delivery fillers are removable.  Written
+    # interjections such as "oh", "ah", and "ugh" must be preserved.
+    filler_pat = r'\b(?:uh|hmm+|erm|er|um)\b'
     if re.findall(filler_pat, orig, re.I) and len(re.findall(filler_pat, new, re.I)) < len(re.findall(filler_pat, orig, re.I)):
         hints.append("filler_removed")
 
@@ -349,6 +357,14 @@ def auto_fix_subtitles(subtitles: list, platform_key: str) -> list:
             fixed.append(sub)
             continue
 
+        # Canonicalise supported SRT markup before any text rule runs.  This
+        # preserves valid formatting and repairs legacy ``<I>`` / ``<B>`` tags
+        # produced by the old sentence-case step.
+        text = re.sub(r'<\s*i\s*>', '<i>', text, flags=re.IGNORECASE)
+        text = re.sub(r'<\s*/\s*i\s*>', '</i>', text, flags=re.IGNORECASE)
+        text = re.sub(r'<\s*b\s*>', '<b>', text, flags=re.IGNORECASE)
+        text = re.sub(r'<\s*/\s*b\s*>', '</b>', text, flags=re.IGNORECASE)
+
         # 1. Remove HOH/EMT elements
         if "HOH" in remove_elements or "EMT" in remove_elements:
             text = re.sub(r'\[MUSIC[^\]]*\]', '', text, flags=re.IGNORECASE)
@@ -421,7 +437,7 @@ def auto_fix_subtitles(subtitles: list, platform_key: str) -> list:
 
         # 4. Remove fillers
         if "fillers" in remove_elements:
-            text = re.sub(r'\b(u+gh+|h+mm+|erm+|a+h+|o+h+|u+m+|u+h+)\b[\.,]?\s*', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'\b(?:uh|hmm+|erm|er|um)\b[\.,]?\s*', '', text, flags=re.IGNORECASE)
 
         # 5. Replace profanity per platform table
         for word, replacement in profanity_table.items():
@@ -1172,7 +1188,7 @@ def deduce_change_rules(orig: str, new: str, platform_rules: list, rule_hints: l
         add_hint("number_to_word")
 
     # ── 12. Filler words removed ─────────────────────────────────────────────
-    filler_pat = r'\b(u+gh+|h+mm+|erm+|a+h+|o+h+|u+m+|u+h+)\b'
+    filler_pat = r'\b(?:uh|hmm+|erm|er|um)\b'
     orig_f = _re.findall(filler_pat, orig, _re.IGNORECASE)
     new_f  = _re.findall(filler_pat, new,  _re.IGNORECASE)
     if orig_f and len(new_f) < len(orig_f):

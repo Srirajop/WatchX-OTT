@@ -30,10 +30,31 @@ def read_pac(file_bytes: bytes) -> str:
         
     paragraphs = []
     index = 15
+    seen_time_starts = set()
+
+    def _next_cue_start(after_index: int) -> int | None:
+        """Return the next PAC cue header after ``after_index``.
+
+        PAC stores a line-break/control marker (0xFE) in the text as well as
+        at cue headers.  The reliable header signature is the timecode control
+        byte 12 or 15 bytes before that marker.  We use the next header as a
+        safety boundary when a producer has written a bad length field.
+        """
+        for candidate in range(after_index + 1, len(file_bytes)):
+            if file_bytes[candidate] != 0xFE:
+                continue
+            for offset in (15, 12):
+                start = candidate - offset
+                if start >= 0 and 0x60 <= file_bytes[start] <= 0x67:
+                    return start
+        return len(file_bytes)
     
     while True:
         index += 1
-        if index + 20 >= len(file_bytes):
+        # A final PAC cue can be shorter than 20 bytes after its 0xFE marker.
+        # Do not stop scanning early; the header/text bounds below validate
+        # every candidate safely.
+        if index >= len(file_bytes):
             break
             
         if file_bytes[index] == 0xFE:
@@ -49,6 +70,13 @@ def read_pac(file_bytes: bytes) -> str:
                 time_start_index = fe_index - 12
                 
             if time_start_index >= 0:
+                # A corrupt/overlong cue used to make the reader jump to its
+                # declared end, skipping every genuine cue in between.  Read
+                # each header only once but keep scanning the complete file.
+                if time_start_index in seen_time_starts:
+                    continue
+                seen_time_starts.add(time_start_index)
+
                 # We found a paragraph
                 if file_bytes[time_start_index] == 0x60:
                     start_time = get_timecode(file_bytes, time_start_index + 1)
@@ -68,10 +96,13 @@ def read_pac(file_bytes: bytes) -> str:
                     continue
                     
                 text_len = file_bytes[time_start_index + 9] + file_bytes[time_start_index + 10] * 256
-                if text_len > 500:
-                    continue
-                    
-                max_index = time_start_index + 10 + text_len
+                declared_end = time_start_index + 10 + text_len
+                # Do not discard a cue merely because its length is malformed.
+                # Subtitle Edit scans all headers; cap decoding at the next
+                # real cue instead, which prevents one bad record from
+                # swallowing or hiding the following dialogues.
+                next_cue_start = _next_cue_start(fe_index)
+                max_index = min(declared_end, next_cue_start - 1, len(file_bytes) - 1)
                 
                 # vertical_alignment = file_bytes[time_start_index + 11]
                 alignment = file_bytes[fe_index + 1] & 0x03
@@ -131,7 +162,10 @@ def read_pac(file_bytes: bytes) -> str:
                     'text': text_str.strip()
                 })
                 
-                index = max_index
+                # Intentionally do not jump to ``max_index``.  PAC length
+                # fields are not reliable enough to use as an iterator; doing
+                # so was the direct cause of missing dialogue records.
+                index = fe_index
                 
     srt_out = []
     for i, p in enumerate(paragraphs, 1):

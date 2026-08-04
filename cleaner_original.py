@@ -8,12 +8,12 @@ import time
 from dotenv import load_dotenv
 from platform_rules import get_platform
 
-load_dotenv(override=True)
+load_dotenv()
 
 
-# ΓöÇΓöÇΓöÇ SUBTITLER-OPERATIONAL RULE FILTER ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ─── SUBTITLER-OPERATIONAL RULE FILTER ────────────────────────────────────────
 # This tool does MORE than text cleaning. The "subtitler_rules" bucket is NOT a
-# "human-only / discard" pile ΓÇö it is fed to the OPERATIONAL ENGINE
+# "human-only / discard" pile — it is fed to the OPERATIONAL ENGINE
 # (rule_segregation.segregate_rules + timecoded_subtitles.prepare_for_platform),
 # which MACHINE-APPLIES timing/reading-speed/duration/gap/zero-subtitle work.
 #
@@ -25,7 +25,7 @@ load_dotenv(override=True)
 # they mention seconds/frames, and only move rules that clearly describe
 # timing/position/font/file/delivery work.
 
-# Phrases that prove a rule is a SCRIPT-CLEANING (text) rule ΓåÆ always keep in script.
+# Phrases that prove a rule is a SCRIPT-CLEANING (text) rule → always keep in script.
 _SCRIPT_TEXT_PHRASES = [
     "character", "line", "subtitle", "dialogue", "word", "punctuation",
     "capital", "case", "spell", "profanity", "italic", "hyphen", "speaker",
@@ -71,9 +71,9 @@ def _filter_script_rules(script_rules: list, subtitler_rules: list) -> tuple[lis
     Goal: the Subtitler (Human) bucket must contain ONLY genuine subtitler /
     operational tasks (timing, duration, gap, positioning, font, file/delivery,
     zero-subtitle, credits). ANY rule that touches the WORDS or PUNCTUATION of
-    the dialogue ΓÇö characters per line, max lines, casing, spelling, profanity,
+    the dialogue — characters per line, max lines, casing, spelling, profanity,
     ellipsis, acronyms, italics, HOH/sound removal, reading-speed/CPS expressed
-    as a text limit, etc. ΓÇö belongs in script_rules even if it mentions
+    as a text limit, etc. — belongs in script_rules even if it mentions
     seconds/frames. This is enforced in BOTH directions so the LLM can't leak a
     text-cleaning rule into the human bucket (or vice-versa).
     """
@@ -185,7 +185,7 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
         + do_not_list +
         " STRICT ANTI-HALLUCINATION RULES: "
         "(1) NEVER add formatting that is not explicitly required by the listed rules. "
-        "(2) NEVER add <b> or </b> bold tags ΓÇö bold is NEVER used in OTT subtitles. "
+        "(2) NEVER add <b> or </b> bold tags — bold is NEVER used in OTT subtitles. "
         "(3) NEVER change the meaning or content of the dialogue. "
         "(4) NEVER invent words, remove dialogue, or rewrite sentences. DO NOT \"fix\" grammar if it changes spoken words. "
         "(5) Only apply italics (<i>...</i>) when a specific rule explicitly requires it. "
@@ -217,10 +217,10 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
         instructions.append(dyn)
         
     instructions.insert(0,
-        "PLAIN TEXT DEFAULT ΓÇö CRITICAL: The dialogue text must remain PLAIN unless a specific rule "
+        "PLAIN TEXT DEFAULT — CRITICAL: The dialogue text must remain PLAIN unless a specific rule "
         "below explicitly requires formatting. DO NOT add <i>, <b>, or any HTML tags unless "
         "a numbered rule below specifically mandates it. "
-        "NEVER add <b>bold</b> tags ΓÇö bold formatting does NOT exist in OTT subtitles. "
+        "NEVER add <b>bold</b> tags — bold formatting does NOT exist in OTT subtitles. "
         "NEVER rewrite, paraphrase or change the meaning of any dialogue. "
         "ONLY fix what the rules explicitly say to fix."
     )
@@ -231,7 +231,7 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
 
     user = f"""Platform for delivery: {platform_name} | Max characters per line: {max_chars}
 
-MANDATORY FORMATTING RULES ΓÇö APPLY ALL OF THEM:
+MANDATORY FORMATTING RULES — APPLY ALL OF THEM:
 {instructions_str}
 
 OUTPUT INSTRUCTIONS:
@@ -243,8 +243,8 @@ OUTPUT INSTRUCTIONS:
 - If an entire entry is ONLY a sound effect or HOH element to delete, skip it entirely.
 - Do NOT add any commentary, headers, notes, or explanation.
 - ACTUALLY write <i>text</i> tags in your output ONLY when a rule above says to use italics.
-- NEVER write <b>text</b> bold tags ΓÇö these are NEVER allowed in OTT subtitles.
-- NEVER change the spoken words ΓÇö only fix formatting, punctuation, and style.
+- NEVER write <b>text</b> bold tags — these are NEVER allowed in OTT subtitles.
+- NEVER change the spoken words — only fix formatting, punctuation, and style.
 - ACTUALLY write -Word (or - Word) for two-speaker lines when the rule requires it.
 - When in doubt: output plain text.
 
@@ -338,19 +338,19 @@ def clean_subtitle_chunk(
                 # Rule: a BULLET is "- text" (dash-space-word).
                 #       a TWO-SPEAKER line is "-Word" or "-Word\n-Word" (dash immediately touching word).
                 if line.startswith("* "):
-                    # Markdown bullet with asterisk ΓÇö always a bullet marker
+                    # Markdown bullet with asterisk — always a bullet marker
                     cleaned_line = line[2:].strip()
                 elif line.startswith("- "):
                     # Dash-space: strip the bullet, but check if the content itself
                     # starts with another dash (two-speaker nested under a bullet).
                     content = line[2:].strip()
-                    # Keep as-is ΓÇö content may be "-Speaker1\n-Speaker2"
+                    # Keep as-is — content may be "-Speaker1\n-Speaker2"
                     cleaned_line = content
                 elif line.startswith("-") and len(line) > 1 and line[1] not in (' ', '-'):
-                    # No space after dash: this IS a two-speaker prefix ΓÇö keep whole line
+                    # No space after dash: this IS a two-speaker prefix — keep whole line
                     cleaned_line = line
                 elif line.startswith("**") or line.startswith("--"):
-                    # Double marker ΓÇö strip outer markers
+                    # Double marker — strip outer markers
                     cleaned_line = re.sub(r'^[*-]{2}\s*', '', line).strip()
                 else:
                     cleaned_line = line
@@ -467,7 +467,7 @@ def _normalize_rule_text(rule: str) -> str:
     # Remove wrapping quotes / brackets
     text = text.strip('"\'`{}[] ')
     # Strip a leading bullet or ordinal like "1." / "- " / "* "
-    text = re.sub(r'^[\-\*ΓÇó]\s*', '', text)
+    text = re.sub(r'^[\-\*•]\s*', '', text)
     text = re.sub(r'^\d+[\.\)]\s*', '', text)
     # Remove any stray trailing quote fragments
     text = text.strip('"\'` ')
@@ -512,11 +512,15 @@ def _normalize_rule_list(rules: list) -> list:
 def _repair_truncated_json(text: str) -> str:
     """
     Attempt to close a JSON object/array that was cut off by a token limit.
-    Uses a stack to properly close braces and brackets in reverse order.
+    Closes any unclosed strings, arrays, and objects so json.loads can succeed.
     """
+    # Count open/close braces and brackets
     in_string = False
     escape_next = False
-    stack = []
+    depth_brace = 0
+    depth_bracket = 0
+    result = list(text)
+
     for ch in text:
         if escape_next:
             escape_next = False
@@ -529,149 +533,177 @@ def _repair_truncated_json(text: str) -> str:
             continue
         if not in_string:
             if ch == '{':
-                stack.append('{')
+                depth_brace += 1
             elif ch == '}':
-                if stack and stack[-1] == '{': stack.pop()
+                depth_brace -= 1
             elif ch == '[':
-                stack.append('[')
+                depth_bracket += 1
             elif ch == ']':
-                if stack and stack[-1] == '[': stack.pop()
+                depth_bracket -= 1
 
-    # If we're not inside a string, remove trailing commas or spaces before closing
-    if not in_string:
-        text = text.rstrip(" ,\n\t\r")
-
+    # If we're still inside a string, close it
     suffix = ''
     if in_string:
         suffix += '"'
-
-    # Close based on stack (reverse order)
-    for char in reversed(stack):
-        if char == '{': suffix += '}'
-        elif char == '[': suffix += ']'
-
+    # Close open arrays and objects
+    suffix += ']' * depth_bracket
+    suffix += '}' * depth_brace
     return text + suffix
 
 
 def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str) -> dict:
     """
     Call LLM for a single chunk of guidelines text.
-    Returns a dict with extracted script_rules and subtitler_rules.
-    Includes automatic retry with exponential backoff on 429 rate-limit errors.
+    Returns a dict with extracted script and subtitler rules.
     """
+    import json
     import re as _re
-    import time as _time
 
-    prompt = (
-        f'Read this section of subtitle guidelines for "{platform_name}".\n\n'
-        'YOUR TASK:\n'
-        'Extract EVERY distinct rule or instruction you can find, '
-        'and classify each into EXACTLY ONE of two groups.\n\n'
-        'GROUP 1 -> "script_rules" (AI text cleaner applies these automatically)\n'
-        'Rules that change the WORDS, PUNCTUATION, or TEXT FORMATTING of the dialogue:\n'
-        '  * Maximum characters per line / maximum lines per subtitle\n'
-        '  * Remove HOH/SDH sound elements: [MUSIC], [LAUGHTER], (applause), etc.\n'
-        '  * Remove stage directions, scene descriptions, script annotations\n'
-        '  * Remove character/speaker name labels\n'
-        '  * Remove filler words (uh, hmm, er, um)\n'
-        '  * Replace or mask profanity (per platform table or asterisks ****)\n'
-        '  * Punctuation fixes: double spaces, space-before-punctuation, mixed punctuation\n'
-        '  * Ellipsis normalisation (three dots, no leading space)\n'
-        '  * Two-speaker hyphen format (- Word vs -Word)\n'
-        '  * Quotation mark style\n'
-        '  * Acronyms without periods (F.B.I. -> FBI)\n'
-        '  * Numbers spelled out in words (e.g. 1-10 as words)\n'
-        '  * Capitalisation / sentence case\n'
-        '  * US / UK English spelling normalisation\n'
-        '  * Italics: song lyrics, foreign words, narration/VO, phone/radio dialogue\n'
-        '  * Removal of forbidden symbols (& < > degree copyright)\n'
-        '  * Line-splitting to fit character/line limits\n\n'
-        'GROUP 2 -> "subtitler_rules" (timing engine + human GTS Pro / IYUNO tasks)\n'
-        '  A. TIMING: CPS limit, min/max duration, frame gap, zero-subtitle field\n'
-        '  B. HUMAN TASKS: positioning, font, file naming, spellcheck, credits\n\n'
-        'HARD RULES:\n'
-        '* Words/punctuation/formatting -> script_rules.\n'
-        '* CPS/duration/gap/zero-subtitle -> subtitler_rules.\n'
-        '* Positioning/font/file/delivery/credits -> subtitler_rules.\n'
-        '* Extract EVERY rule. Each must be one complete self-contained sentence.\n'
-        '* You MUST provide a verbatim_quote for every rule (exact words from text).\n'
-        '* If you cannot find a direct quote, DO NOT include the rule.\n\n'
-        'Return ONLY a raw JSON object -- no markdown, no explanation:\n'
-        '{{\n'
-        '    "script_rules": [\n'
-        '        {{ "rule": "Maximum 42 characters per line", "verbatim_quote": "no more than 42 characters on a single line" }}\n'
-        '    ],\n'
-        '    "subtitler_rules": [\n'
-        '        {{ "rule": "Minimum gap of 2 frames between subtitles", "verbatim_quote": "ensure a 2-frame gap between subtitles" }}\n'
-        '    ]\n'
-        '}}\n\n'
-        'GUIDELINES SECTION:\n'
-        '---\n'
-        f'{chunk}\n'
-        '---'
-    )
+    prompt = f"""Read this section of subtitle guidelines for "{platform_name}".
 
-    MAX_RETRIES = 4
-    BASE_DELAY = 20   # seconds
+YOUR TASK:
+Extract EVERY distinct rule or instruction you can find, and categorize each into EXACTLY ONE of two groups based on what the tool's SCRIPT CLEANER can actually DO.
 
-    for attempt in range(MAX_RETRIES):
+This tool's script cleaner is an AUTOMATED text formatter. It ONLY changes the DIALOGUE
+TEXT of subtitles. Its actual, verified capabilities are:
+
+SCRIPT-CLEANING CAPABILITIES (→ put these in "script_rules"):
+  - Maximum characters per line / maximum number of lines per subtitle
+  - Remove HOH / SDH / sound elements: [MUSIC], [LAUGHTER], (applause), etc.
+  - Remove stage directions, scene descriptions, script annotations, (OPTIONAL) notes
+  - Remove character / speaker name labels
+  - Remove filler words (uh, hmm, er, um)
+  - Replace profanity (per a profanity word list) or mask with asterisks (****)
+  - Punctuation: fix double spaces, space-before-punctuation, double/mixed punctuation
+  - Ellipsis normalised to three dots; leading ellipsis without a space
+  - Two-speaker hyphen format (-Word vs "- Word")
+  - Use quotation marks instead of apostrophes for quotes
+  - No periods in acronyms (F.B.I. -> FBI)
+  - Numbers spelled out in words (1-10, 0-9, or 1-9)
+  - Sentence-case capitalisation
+  - US / UK English spelling normalisation
+  - Split long lines to fit the character / line limit
+  - Italics for song lyrics, foreign words, narration / voice-over, phone / radio
+  - Characters per second (CPS) / reading-speed LIMIT expressed as a text constraint
+  - Removal of forbidden symbols (& < > degree copyright)
+
+OPERATIONAL ENGINE (the tool MACHINE-APPLIES these — extract them as rules, do NOT
+treat them as human-only):
+  - Reading-speed / CPS → re-times subtitles so dialogue is readable at the limit
+  - Minimum / maximum DURATION per subtitle
+  - Minimum GAP / frame interval between subtitles
+  - ZERO-SUBTITLE field (STORY: / LANG:) auto-inserted when required
+
+  SUBTITLER / OPERATIONAL TASKS (→ put these in "subtitler_rules"):
+  Our tool performs MORE than text cleaning — it also runs an operational engine
+  that MACHINE-APPLIES the following, so they are NOT human-only:
+  - Reading-speed / CPS limits, characters-per-second: the engine re-times each
+    subtitle so the dialogue is readable at the required CPS.
+  - Minimum / maximum DURATION of each subtitle (e.g. "min 5/6 second", "max 6s").
+  - Minimum GAP / frame interval between consecutive subtitles (e.g. "2-frame gap").
+  - ZERO-SUBTITLE field (STORY: / LANG:): the engine auto-inserts it when required.
+  These TIMING rules must still be extracted (into subtitler_rules) — they are fed
+  to the operational engine automatically; they are NOT discarded.
+
+  Genuinely HUMAN-ONLY tasks (capture as notes, not text changes):
+  - Positioning: top/bottom/centre justification, raising subtitles, overlap handling
+    (placement in the NLE — recorded as a delivery note).
+  - Font size / colour / type / face (a visual property of the deliverable).
+  - File naming convention, file format (PAC, etc. — unless it also states a text rule).
+  - Repo file / repositioning, end-credit file.
+  - Translator / subtitling credit subtitles (the actual credit line).
+  - Spellcheck pass.
+
+  IMPORTANT — DO NOT put text-cleaning rules in subtitler_rules. Anything about
+  the WORDS or PUNCTUATION of the dialogue (maximum characters per line, maximum
+  number of lines, capitalisation/case, spelling, profanity, ellipsis, acronyms,
+  italics, removal of [MUSIC]/[LAUGHTER]/HOH/sound cues, filler words, speaker
+  labels, two-speaker hyphen format, numbers spelled out, US/UK spelling) is ALWAYS
+  a script rule, even if it mentions seconds or frames. Only TIMING / DURATION /
+  GAP / POSITIONING / FONT / FILE / DELIVERY / CREDIT rules go to subtitler_rules.
+
+When in doubt, ask: "Does this change the WORDS or PUNCTUATION of the dialogue?" If YES
+→ script_rules. If it is a TIMING / READING-SPEED / DURATION / GAP / ZERO-SUBTITLE rule
+→ subtitler_rules (the operational engine applies it). If it is positioning/font/file/
+delivery → subtitler_rules (recorded as a human checklist note).
+
+HARD RULE: maximum characters per line, maximum number of lines, capitalisation/case,
+spelling, profanity, ellipsis, acronyms, italics, sound/HOH removal, filler words,
+speaker labels, number formatting, and US/UK spelling ALWAYS go to script_rules — never
+to subtitler_rules.
+
+Return a JSON object with two arrays of objects:
+
+{{
+    "script_rules": [
+        {{ "rule": "Maximum 42 characters per line", "verbatim_quote": "no more than 42 characters on a single line" }}
+    ],
+    "subtitler_rules": [
+        {{ "rule": "Frame gap must be 2 frames", "verbatim_quote": "ensure a 2-frame gap between subtitles" }}
+    ]
+}}
+
+RULES FOR EXTRACTION:
+- Extract EVERY distinct rule you can find — do not skip any.
+- Classify using the capability lists above. Text/punctuation/format changes go to
+  script_rules; timing/positioning/font/file/delivery go to subtitler_rules.
+- Each item must be one complete, self-contained rule sentence.
+- You MUST provide a 'verbatim_quote' for every rule — exact consecutive words copied
+  directly from the text.
+- If you cannot find a direct quote in the text for a rule, DO NOT include the rule.
+  (This is strictly to prevent hallucination.)
+- Do not include markdown code blocks. Return ONLY the raw JSON object.
+
+GUIDELINES SECTION:
+---
+{chunk}
+---"""
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=3000,
+        )
+        result_text = (response.choices[0].message.content or "").strip()
+        # Strip markdown code fences
+        result_text = _re.sub(r"```(?:json)?\s*", "", result_text).strip().rstrip("`")
+        
+        parsed = None
+        # Try direct parse first
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=3500,
-            )
-            result_text = (response.choices[0].message.content or "").strip()
-            print(f"[RULES DEBUG] Raw LLM Output (first 500 chars): {result_text[:500]}")
-            result_text = _re.sub(r"```(?:json)?\s*", "", result_text).strip().rstrip("`")
-            parsed = None
+            parsed = json.loads(result_text)
+        except json.JSONDecodeError:
+            # Try repairing truncated JSON
             try:
-                parsed = json.loads(result_text)
-            except Exception as e:
-                print(f"[RULES ERROR] Initial JSON parse failed: {e}")
-                try:
-                    repaired = _repair_truncated_json(result_text)
-                    parsed = json.loads(repaired)
-                except Exception as ex:
-                    print(f"[RULES ERROR] Repaired JSON parse failed: {ex}")
-                    # If all fails, fall back to empty
-                    pass
-            if isinstance(parsed, dict):
-                def _extract_valid_rules(rule_objs):
-                    valid = []
-                    for obj in (rule_objs or []):
-                        if isinstance(obj, str):
-                            valid.append(obj)
-                        elif isinstance(obj, dict):
-                            rule = obj.get("rule", "")
-                            quote = obj.get("verbatim_quote", "")
-                            if rule and quote and len(quote.strip().split()) >= 1:
-                                valid.append(rule)
-                    return valid
-                return {
-                    "script_rules": _extract_valid_rules(parsed.get("script_rules", [])),
-                    "subtitler_rules": _extract_valid_rules(parsed.get("subtitler_rules", []))
-                }
-            break  # Got response but could not parse JSON -- don't retry
+                repaired = _repair_truncated_json(result_text)
+                parsed = json.loads(repaired)
+            except Exception:
+                pass
+        
+        if isinstance(parsed, dict):
+            # Map object array back to string array, discarding hallucinated rules without quotes
+            def _extract_valid_rules(rule_objs):
+                valid = []
+                for obj in (rule_objs or []):
+                    if isinstance(obj, str): 
+                        valid.append(obj)
+                    elif isinstance(obj, dict):
+                        rule = obj.get("rule", "")
+                        quote = obj.get("verbatim_quote", "")
+                        # Simple anti-hallucination validation: require a quote with at least 1 word
+                        if rule and quote and len(quote.strip().split()) >= 1:
+                            valid.append(rule)
+                return valid
 
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
-                if attempt < MAX_RETRIES - 1:
-                    delay = BASE_DELAY
-                    m = _re.search(r'retryDelay.*?(\d+)', err_str)
-                    if m:
-                        delay = max(int(m.group(1)) + 5, BASE_DELAY)
-                    print(f"[RULES] Rate-limited (429). Waiting {delay}s before retry {attempt+2}/{MAX_RETRIES}...")
-                    _time.sleep(delay)
-                    continue
-                else:
-                    print(f"[RULES ERROR] LLM call failed after {MAX_RETRIES} retries (429): {e}")
-            else:
-                print(f"[RULES ERROR] LLM call failed: {e}")
-            break
+            return {
+                "script_rules": _extract_valid_rules(parsed.get("script_rules", [])),
+                "subtitler_rules": _extract_valid_rules(parsed.get("subtitler_rules", []))
+            }
 
+    except Exception as e:
+        print(f"[RULES ERROR] LLM call failed: {e}")
     return {"script_rules": [], "subtitler_rules": []}
 
 
@@ -706,12 +738,12 @@ FIELD GUIDANCE:
   "stage_directions" (parenthetical actions/notes), "character_names" (speaker labels),
   "scene_descriptions", "fillers" (uh/hmm/er). Omit any not mentioned.
 - "two_speaker_format": "hyphen_no_space" (-Word), "hyphen_with_space" (- Word), or "" if unspecified.
-- "italics": describe what gets italics ΓÇö e.g. "song_lyrics", "foreign_words",
+- "italics": describe what gets italics — e.g. "song_lyrics", "foreign_words",
   "narration_vo", "none" (platform forbids italics), or "all_common".
 - "profanity_handling": "replace" (swap per word list), "asterisks" (mask as ****),
   "none", or "both".
 - Numeric fields: characters per line, max lines, and reading-speed (CPS) limits that
-  are stated as TEXT constraints on the subtitle. Leave timing/frame values out ΓÇö those
+  are stated as TEXT constraints on the subtitle. Leave timing/frame values out — those
   are subtitler tasks, not cleaner metadata.
 
 DOCUMENT EXCERPT:
@@ -740,24 +772,20 @@ DOCUMENT EXCERPT:
     return {}
 
 
-
-
 def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> dict:
     """
     Extract ALL rules from a custom platform guidelines document.
-    Uses 8000-char chunks and 5s inter-chunk pacing to stay under Gemini 15 RPM limit.
+
+    Strategy:
+    1. Split the document into ~6000-char chunks (no arbitrary 4000-char cutoff).
+    2. Run each chunk through the LLM independently to extract a flat rules array.
+    3. De-duplicate and merge all rules from all chunks.
+    4. Run a second LLM pass on the first chunk to extract numeric metadata
+       (char limits, duration, CPS, file format, etc.).
+    5. Combine metadata + merged rules into the final platform dict.
     """
-    CHUNK_SIZE = 7000  # Groq 8B TPM limits are very low (6000 TPM)
-    from groq import Groq
-    import os
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    model_name = "llama-3.1-8b-instant" # 6,000 TPM limit
-    
-    # Rate Limit Protection for Groq's aggressive TPM limit (6,000 Tokens Per Minute)
-    # We must wait 61 seconds between platforms to clear the token bucket
-    print(f"[RULES] Groq Pacing: Waiting 61s before processing '{platform_name}' to clear 6k TPM limit...")
-    import time
-    time.sleep(61.0)
+    CHUNK_SIZE = 3000
+    client, model_name, _ = _get_client_and_model()
 
     default = {
         "name": platform_name, "max_chars_per_line": 42, "max_lines": 2,
@@ -772,12 +800,13 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
     if not guidelines_text or not guidelines_text.strip():
         return default
 
-    # Step 1: chunk the document
+    # ── Step 1: chunk the document ──────────────────────────────────────────
     text = guidelines_text.strip()
     chunks = []
     start = 0
     while start < len(text):
         end = start + CHUNK_SIZE
+        # Try to break at a newline boundary to avoid mid-sentence splits
         if end < len(text):
             nl = text.rfind('\n', start, end)
             if nl > start:
@@ -787,21 +816,17 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
 
     print(f"[RULES] Extracting rules from {len(chunks)} chunk(s) for '{platform_name}'")
 
-    # Step 2: extract rules with pacing to avoid RPM limit
-    import time as _chunk_time
-    inter_chunk_delay = 61.0
-
+    # ── Step 2: extract rules from each chunk ───────────────────────────────
     all_script_rules = []
     all_subtitler_rules = []
     for i, chunk in enumerate(chunks):
-        if i > 0 and inter_chunk_delay > 0:
-            print(f"[RULES] Pacing: waiting {inter_chunk_delay}s to stay under Groq TPM limit...")
-            _chunk_time.sleep(inter_chunk_delay)
         print(f"[RULES] Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
         chunk_res = _call_llm_for_rules(client, model_name, platform_name, chunk)
-
+        
         s_rules = chunk_res.get("script_rules", [])
         m_rules = chunk_res.get("subtitler_rules", [])
+        # Post-process: move any subtitler-operational rules that the 8B model
+        # misclassified as script rules into the correct bucket.
         if isinstance(s_rules, list) and isinstance(m_rules, list):
             s_rules, m_rules = _filter_script_rules(s_rules, list(m_rules))
         print(f"[RULES] Chunk {i+1} yielded {len(s_rules)} script rules, {len(m_rules)} subtitler rules")
@@ -809,25 +834,28 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
         if isinstance(s_rules, list): all_script_rules.extend(s_rules)
         if isinstance(m_rules, list): all_subtitler_rules.extend(m_rules)
 
-    # Step 3: normalize + de-duplicate
+    # ── Step 3: normalize + de-duplicate into clean rule sentences ─────────
     unique_script_rules = _normalize_rule_list(all_script_rules)
     unique_subtitler_rules = _normalize_rule_list(all_subtitler_rules)
 
     print(f"[RULES] Total unique script rules: {len(unique_script_rules)}, subtitler rules: {len(unique_subtitler_rules)}")
 
     if not unique_script_rules and not unique_subtitler_rules:
+        # Fallback: return defaults so the platform is still saved
         return default
 
-    # Step 4: extract numeric metadata
-    print(f"[RULES] Groq Pacing: Waiting 61s before metadata extraction to clear TPM bucket...")
-    _chunk_time.sleep(61.0)
+    # ── Step 4: extract numeric metadata from the first chunk ───────────────
     metadata = _call_llm_for_metadata(client, model_name, platform_name, chunks[0])
 
-    # Step 5: merge
+    # ── Step 5: merge ────────────────────────────────────────────────────────
+    # Derive canonical script-cleaning rule phrases from the structured metadata
+    # so the cleaner's phrase-matchers (auto_fix_subtitles / italic_formatter /
+    # quality_checker) actually fire. The verbatim extracted rules already carry
+    # the platform's own wording; these ensure the engine knobs are always set.
     derived_script = []
     italics = (metadata.get("italics") or "").lower()
     if "none" in italics:
-        derived_script.append("No italics -- plain text only")
+        derived_script.append("No italics — plain text only")
     if "song" in italics:
         derived_script.append("Song lyrics in italics")
     if "foreign" in italics:
@@ -840,6 +868,7 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
     elif "replace" in prof or "both" in prof:
         derived_script.append("Profanity replaced per platform profanity table")
 
+    # Merge derived phrases into the script rules, de-duplicating (case-insensitive).
     merged_script = unique_script_rules[:]
     seen = {r.lower() for r in merged_script}
     for d in derived_script:
