@@ -870,7 +870,7 @@ async def adjust_timecodes_endpoint(data: dict):
       fix_from_index    — fix one subtitle, ripple the same shift to EVERY subtitle after it (to the end of the file)
       fix_range         — fix one subtitle, ripple the same shift only up to a chosen end ID (a bounded section, not the whole rest of the file) — use this when drift only affects a stretch of the file that re-syncs correctly later on
     """
-    from timecode_adjuster import shift_timecodes, fix_from_index, fix_range_from_index, shift_only_this, parse_offset_input, sync_target
+    from timecode_adjuster import shift_timecodes, fix_from_index, fix_range_from_index, shift_only_this, parse_offset_input, sync_target, proportional_stretch
 
     subtitles = data.get("subtitles", [])
     mode = data.get("mode", "offset")
@@ -928,8 +928,23 @@ async def adjust_timecodes_endpoint(data: dict):
             "warning": result["warning"]
         }
 
+    elif mode == "stretch":
+        p_start = data.get("stretch_p_start", "")
+        p_end = data.get("stretch_p_end", "")
+        c_start = data.get("stretch_c_start", "")
+        c_end = data.get("stretch_c_end", "")
+        
+        if not all([p_start, p_end, c_start, c_end]):
+            raise HTTPException(400, "All 4 timecodes are required for stretch mode (pirate start/end, client start/end).")
+            
+        result = proportional_stretch(subtitles, p_start, p_end, c_start, c_end)
+        
+        if result.get("warning"):
+            return {"subtitles": result["subtitles"], "warning": result["warning"]}
+        return {"subtitles": result["subtitles"], "warning": ""}
+
     else:
-        raise HTTPException(400, f"Unknown mode '{mode}'. Use offset, shift_only_this, fix_from_index, or fix_range.")
+        raise HTTPException(400, f"Unknown mode '{mode}'. Use offset, shift_only_this, fix_from_index, fix_range, or stretch.")
 
 
 
@@ -2154,20 +2169,30 @@ async def transcribe_and_align_endpoint(
                 yield f"data: {json.dumps({'status': 'error', 'error': msg['error']})}\n\n"
                 break
             elif msg["type"] == "done":
+                _aligned = msg["subtitles"]
+                _matched = sum(
+                    1 for s in _aligned
+                    if s.get("start_time") and not s.get("manual_placement")
+                )
                 result = {
-                    "subtitles": msg["subtitles"],
+                    "subtitles": _aligned,
                     "stats": {
-                        "total_lines": len(msg["subtitles"]),
-                        "flagged_lines": sum(1 for s in msg["subtitles"] if s.get("flagged")),
+                        "total_lines": len(_aligned),
+                        "flagged_lines": sum(1 for s in _aligned if s.get("flagged")),
                         "platform": platform,
                         "detected_structure": "aligned_script" if script_subs else "stable_ts_whisper_audio",
                         "transcription_engine": msg.get("engine", "stable-ts"),
-                        "original_format": filename
+                        "original_format": filename,
+                        "alignStats": {
+                            "mode": "aligned",
+                            "matched": _matched,
+                            "total": len(_aligned),
+                        },
                     }
                 }
                 yield f"data: {json.dumps({'status': 'completed', 'progress': 100, 'result': result})}\n\n"
                 break
-                
+
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
@@ -2227,6 +2252,10 @@ async def align_scripts_endpoint(
 
     final_subs = align_transcription_to_script(ts_subs, script_subs, mode=mode)
 
+    _matched = sum(
+        1 for s in final_subs
+        if s.get("start_time") and not s.get("manual_placement")
+    )
     return {
         "subtitles": final_subs,
         "stats": {
@@ -2234,7 +2263,12 @@ async def align_scripts_endpoint(
             "flagged_lines": sum(1 for s in final_subs if s.get("flagged")),
             "platform": "generic",
             "detected_structure": "aligned_scripts",
-            "original_format": script_name
+            "original_format": script_name,
+            "alignStats": {
+                "mode": "aligned",
+                "matched": _matched,
+                "total": len(final_subs),
+            },
         }
     }
 
@@ -2810,6 +2844,11 @@ class TranslateRequest(BaseModel):
     model: str | None = None
     base_url: str | None = None
     custom_prompt: str | None = None
+
+@app.get("/editor/formats")
+def get_editor_formats():
+    from editor import IMPORT_FORMATS, EXPORT_FORMATS
+    return {"import": IMPORT_FORMATS, "export": EXPORT_FORMATS}
 
 @app.post("/editor/import")
 async def editor_import_file(file: UploadFile = File(...)):

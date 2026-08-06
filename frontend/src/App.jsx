@@ -1676,7 +1676,7 @@ export default function App() {
                 )}
               </div>
 
-              {timestampsFile && scriptFile ? (
+              {scriptFile ? (
                   <div style={{marginBottom:14}}>
                     <div style={{fontSize:11, fontWeight:700, color:'#475569', marginBottom:6}}>🎚️ Mapping mode</div>
                     <div style={{display:'flex', gap:8}}>
@@ -1687,7 +1687,7 @@ export default function App() {
                           background: alignMode==='full' ? '#e11d48' : '#f8fafc',
                           color: alignMode==='full' ? '#fff' : '#64748b',
                           border: `1px solid ${alignMode==='full' ? '#e11d48' : '#e2e8f0'}`}}>
-                        🔄 Full Map<br/><span style={{fontWeight:400,fontSize:10}}>Adopt both in &amp; out cues from timestamps</span>
+                        🔄 Full Map<br/><span style={{fontWeight:400,fontSize:10}}>Adopt both in &amp; out cues from Whisper</span>
                       </button>
                       <button
                         type="button"
@@ -1697,6 +1697,15 @@ export default function App() {
                           color: alignMode==='preserve_duration' ? '#fff' : '#64748b',
                           border: `1px solid ${alignMode==='preserve_duration' ? '#d97706' : '#e2e8f0'}`}}>
                         🔒 Preserve Duration<br/><span style={{fontWeight:400,fontSize:10}}>Keep original dialogue duration</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={()=>setAlignMode('ai')}
+                        style={{flex:1, padding:'8px 10px', borderRadius:8, fontSize:11, fontWeight:700, cursor:'pointer',
+                          background: alignMode==='ai' ? '#4f46e5' : '#f8fafc',
+                          color: alignMode==='ai' ? '#fff' : '#64748b',
+                          border: `1px solid ${alignMode==='ai' ? '#4f46e5' : '#e2e8f0'}`}}>
+                        🤖 AI (Llama 3.1)<br/><span style={{fontWeight:400,fontSize:10}}>Refine weak lines with Groq</span>
                       </button>
                     </div>
                   </div>

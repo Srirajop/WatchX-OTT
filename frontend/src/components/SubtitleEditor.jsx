@@ -470,6 +470,12 @@ function SubtitleEditor() {
   const [tcError, setTcError] = useState('')
   const [tcSuccess, setTcSuccess] = useState('')
   const [tcCollision, setTcCollision] = useState(null)
+  
+  // Stretch variables
+  const [tcStretchPStart, setTcStretchPStart] = useState('')
+  const [tcStretchPEnd, setTcStretchPEnd] = useState('')
+  const [tcStretchCStart, setTcStretchCStart] = useState('')
+  const [tcStretchCEnd, setTcStretchCEnd] = useState('')
   // video transport & workspace fullscreen state
   const [isPlaying, setIsPlaying] = useState(false)
   const [fps, setFps] = useState(25)
@@ -1510,7 +1516,7 @@ function SubtitleEditor() {
         } else {
           setTcSuccess(`✅ Sync applied based on subtitle #${tcTargetId}.`)
         }
-      } else {
+      } else if (tcMode === 'edit_single') {
         // edit_single
         if (!tcTargetId.trim()) { setTcError('Enter the subtitle ID to edit.'); setTcAdjusting(false); return }
         if (!tcValue.trim()) { setTcError('Enter the new start timecode.'); setTcAdjusting(false); return }
@@ -1541,6 +1547,22 @@ function SubtitleEditor() {
           r = await axios.post(`${API}/adjust-timecodes`, payload)
           setSubs(normalizeSubs(r.data.subtitles || []))
           setTcSuccess(`✅ Subtitle #${tcTargetId} + all ${r.data.total} subsequent subtitles shifted.`)
+        }
+      } else if (tcMode === 'stretch') {
+        if (!tcStretchPStart.trim() || !tcStretchPEnd.trim() || !tcStretchCStart.trim() || !tcStretchCEnd.trim()) {
+          setTcError('Enter all 4 timecodes.'); setTcAdjusting(false); return
+        }
+        payload = {
+          subtitles: subs, mode: 'stretch',
+          stretch_p_start: tcStretchPStart.trim(), stretch_p_end: tcStretchPEnd.trim(),
+          stretch_c_start: tcStretchCStart.trim(), stretch_c_end: tcStretchCEnd.trim()
+        }
+        r = await axios.post(`${API}/adjust-timecodes`, payload)
+        setSubs(normalizeSubs(r.data.subtitles || []))
+        if (r.data.warning) {
+          setTcError(r.data.warning)
+        } else {
+          setTcSuccess(`✅ Proportional stretch applied to all subtitles.`)
         }
       }
     } catch (e) {
@@ -2190,13 +2212,16 @@ function SubtitleEditor() {
             Fix subtitles that are slightly off from the video.
           </div>
           
-          <div style={{display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, marginBottom:20}}>
+          <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:20}}>
             <div style={{background:'#ffffff', border:`2px solid ${tcMode==='offset'?'#4338ca':'#e2e8f0'}`, borderRadius:10, padding:'14px 16px', cursor:'pointer'}}
               onClick={()=>{setTcMode('offset');setTcValue('');setTcEndValue('');setTcTargetId('');setTcRangeEndId('');setTcSuccess('');setTcError('');setTcCollision(null)}}>
               <div style={{fontSize:13, fontWeight:700, color:tcMode==='offset'?'#6366f1':'#334155', marginBottom:4}}>± Shift All</div>
-              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>
-                Move <strong style={{color:'#64748b'}}>every</strong> subtitle forward or backward by the same amount.
-              </div>
+              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>Move every subtitle.</div>
+            </div>
+            <div style={{background:'#ffffff', border:`2px solid ${tcMode==='stretch'?'#6366f1':'#e2e8f0'}`, borderRadius:10, padding:'14px 16px', cursor:'pointer'}}
+              onClick={()=>{setTcMode('stretch');setTcSuccess('');setTcError('');setTcCollision(null)}}>
+              <div style={{fontSize:13, fontWeight:700, color:tcMode==='stretch'?'#6366f1':'#334155', marginBottom:4}}>📏 2-Point Sync</div>
+              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>Stretch proportionally.</div>
             </div>
             <div style={{background:'#ffffff', border:`2px solid ${tcMode==='sync_target'?'#059669':'#e2e8f0'}`, borderRadius:10, padding:'14px 16px', cursor:'pointer'}}
               onClick={()=>{
@@ -2208,16 +2233,12 @@ function SubtitleEditor() {
                 if (first) { setTcValue(first.start_time||''); setTcEndValue(first.end_time||''); }
               }}>
               <div style={{fontSize:13, fontWeight:700, color:tcMode==='sync_target'?'#059669':'#334155', marginBottom:4}}>🎯 Sync First Line</div>
-              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>
-                Set the exact start/end for the first subtitle and auto-shift everything else to match.
-              </div>
+              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>Set first subtitle.</div>
             </div>
             <div style={{background:'#ffffff', border:`2px solid ${tcMode==='edit_single'?'#d97706':'#e2e8f0'}`, borderRadius:10, padding:'14px 16px', cursor:'pointer'}}
               onClick={()=>{setTcMode('edit_single');setTcValue('');setTcEndValue('');setTcTargetId('');setTcRangeEndId('');setTcSuccess('');setTcError('');setTcCollision(null)}}>
               <div style={{fontSize:13, fontWeight:700, color:tcMode==='edit_single'?'#d97706':'#334155', marginBottom:4}}>✏️ Edit Line & Ripple</div>
-              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>
-                Pick a subtitle, edit timecodes, and ripple the fix forwards.
-              </div>
+              <div style={{fontSize:10, color:'#64748b', lineHeight:1.5}}>Pick a subtitle & edit.</div>
             </div>
           </div>
 
@@ -2409,10 +2430,27 @@ function SubtitleEditor() {
             </>
           )}
 
+          {tcMode === 'stretch' && (
+            <div style={{marginBottom:14, display:'grid', gridTemplateColumns:'1fr 1fr', gap:10}}>
+              <div>
+                <div style={{fontSize:11, fontWeight:700, color:'#334155', marginBottom:6, textTransform:'uppercase'}}>Pirate Video (Original)</div>
+                <input style={{...st.input, fontFamily:'monospace', marginBottom:8}} placeholder="First Word TC (e.g. 00:00:10,000)" value={tcStretchPStart} onChange={e=>setTcStretchPStart(e.target.value)} />
+                <input style={{...st.input, fontFamily:'monospace'}} placeholder="Last Word TC (e.g. 00:46:00,000)" value={tcStretchPEnd} onChange={e=>setTcStretchPEnd(e.target.value)} />
+              </div>
+              <div>
+                <div style={{fontSize:11, fontWeight:700, color:'#334155', marginBottom:6, textTransform:'uppercase'}}>Client Video (Target)</div>
+                <input style={{...st.input, fontFamily:'monospace', marginBottom:8}} placeholder="First Word TC (e.g. 00:00:05,000)" value={tcStretchCStart} onChange={e=>setTcStretchCStart(e.target.value)} />
+                <input style={{...st.input, fontFamily:'monospace'}} placeholder="Last Word TC (e.g. 00:45:30,000)" value={tcStretchCEnd} onChange={e=>setTcStretchCEnd(e.target.value)} />
+              </div>
+            </div>
+          )}
+
+
           {(() => {
             const disabled = tcAdjusting || !subs.length ||
               (tcMode==='offset' && !tcValue.trim()) ||
               (tcMode==='sync_target' && (!tcTargetId.trim() || (!tcValue.trim() && !tcEndValue.trim()))) ||
+              (tcMode==='stretch' && (!tcStretchPStart.trim() || !tcStretchPEnd.trim() || !tcStretchCStart.trim() || !tcStretchCEnd.trim())) ||
               (tcMode==='edit_single' && (
                 !tcTargetId.trim() || !tcValue.trim() ||
                 (tcShiftMode==='only_this' && !tcEndValue.trim()) ||
@@ -2421,6 +2459,7 @@ function SubtitleEditor() {
             const label = tcAdjusting ? 'Applying...'
               : tcMode==='offset' ? '⏱️ Shift All Subtitles'
               : tcMode==='sync_target' ? '🎯 Sync Timecodes'
+              : tcMode==='stretch' ? '📏 Apply 2-Point Sync'
               : tcShiftMode==='ripple' ? '🔁 Apply Ripple Shift'
               : tcShiftMode==='range' ? '📐 Apply Ripple to Stopping Point'
               : '📌 Update This Line Only'

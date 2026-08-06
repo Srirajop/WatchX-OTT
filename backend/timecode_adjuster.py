@@ -443,3 +443,48 @@ def parse_offset_input(value: str) -> float | None:
         return sign * secs
 
     return None
+
+def proportional_stretch(subtitles: list[dict], p_start: str, p_end: str, c_start: str, c_end: str) -> dict:
+    """
+    2-Point Sync (Proportional Stretch)
+    Takes 4 anchors: Pirate Start/End and Client Start/End.
+    Calculates the ratio between durations, then mathematically scales 
+    and shifts EVERY subtitle timestamp.
+    """
+    if not subtitles:
+        return {"subtitles": subtitles, "warning": "No subtitles provided."}
+
+    ps = _tc_to_seconds(p_start)
+    pe = _tc_to_seconds(p_end)
+    cs = _tc_to_seconds(c_start)
+    ce = _tc_to_seconds(c_end)
+
+    if None in (ps, pe, cs, ce):
+        return {"subtitles": subtitles, "warning": "One or more timecodes could not be parsed."}
+
+    pirate_dur = pe - ps
+    client_dur = ce - cs
+
+    if pirate_dur <= 0:
+        return {"subtitles": subtitles, "warning": "Original (Pirate) duration must be greater than 0."}
+
+    ratio = client_dur / pirate_dur
+    result = []
+    
+    for sub in subtitles:
+        item = dict(sub)
+        old_start = _tc_to_seconds(sub.get("start_time", ""))
+        old_end = _tc_to_seconds(sub.get("end_time", ""))
+
+        if old_start is not None:
+            new_start = cs + ((old_start - ps) * ratio)
+            item["start_time"] = _seconds_to_srt(new_start)
+            
+        if old_end is not None:
+            new_end = cs + ((old_end - ps) * ratio)
+            item["end_time"] = _seconds_to_srt(new_end)
+
+        result.append(item)
+
+    return {"subtitles": result, "warning": ""}
+
