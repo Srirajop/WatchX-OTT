@@ -1,44 +1,19 @@
-import os
-import openai
+import os, sys, requests
 from dotenv import load_dotenv
-
 load_dotenv('backend/.env')
-client = openai.OpenAI(
-    api_key=os.getenv('GEMINI_API_KEY'),
-    base_url='https://generativelanguage.googleapis.com/v1beta/openai/'
-)
 
-print("Checking key:", os.getenv('GEMINI_API_KEY')[:10] + "...")
+headers={'Authorization': 'Bearer ' + os.environ['GROQ_API_KEY'], 'Content-Type': 'application/json'}
+payload = {
+    'messages': [{'role': 'user', 'content': 'Hello, just reply with a JSON object { "status": "ok" }'}],
+    'model': 'llama-3.1-8b-instant'
+}
 
-try:
-    print('Testing gemini-2.0-flash...')
-    response = client.chat.completions.create(
-        model='gemini-2.0-flash',
-        messages=[{'role': 'user', 'content': 'Hello!'}],
-        max_tokens=10
-    )
-    print('SUCCESS 2.0-flash:', response.choices[0].message.content)
-except Exception as e:
-    print('FAILED 2.0-flash:', str(e))
-
-try:
-    print('Testing gemini-1.5-flash...')
-    response = client.chat.completions.create(
-        model='gemini-1.5-flash',
-        messages=[{'role': 'user', 'content': 'Hello!'}],
-        max_tokens=10
-    )
-    print('SUCCESS 1.5-flash:', response.choices[0].message.content)
-except Exception as e:
-    print('FAILED 1.5-flash:', str(e))
-
-try:
-    print('Testing gemini-2.5-flash-lite...')
-    response = client.chat.completions.create(
-        model='gemini-2.5-flash-lite',
-        messages=[{'role': 'user', 'content': 'Hello!'}],
-        max_tokens=10
-    )
-    print('SUCCESS 2.5-flash-lite:', response.choices[0].message.content)
-except Exception as e:
-    print('FAILED 2.5-flash-lite:', str(e))
+for m in ['llama-3.1-8b-instant', 'llama-3.3-70b-versatile', 'openai/gpt-oss-120b', 'allam-2-7b']:
+    payload['model'] = m
+    try:
+        r = requests.post('https://api.groq.com/openai/v1/chat/completions', headers=headers, json=payload)
+        print(f'{m}: {r.status_code}')
+        if r.status_code != 200:
+            print(r.json())
+    except Exception as e:
+        print(f'{m}: Error {e}')

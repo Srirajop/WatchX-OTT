@@ -26,6 +26,12 @@ _SYSTEM = (
     "dialogue. If unsure, pick the cue range that contains the most of the line."
 )
 
+# This is an explicit manual-placement action.  It may work through a larger
+# set of unresolved lines, but remains bounded so a failed provider cannot
+# leave the UI waiting forever.
+MAX_AI_REFINEMENTS = 50
+AI_REFINEMENT_TIME_BUDGET_SECONDS = 90.0
+
 
 def _whisper_cues(whisper_subs: list[dict]) -> list[dict]:
     cues = []
@@ -65,6 +71,7 @@ def refine_alignment_with_llm(
     whisper_subs: list[dict],
     aligned_subs: list[dict],
     mode: str = "ai",
+    progress_callback=None,
 ) -> list[dict]:
     from cleaner import _get_client_and_model
 
@@ -93,8 +100,24 @@ def refine_alignment_with_llm(
             good_bounds.append((i, _to_seconds(s["start_time"]), _to_seconds(s["end_time"])))
 
     result = [dict(s) for s in aligned_subs]
-    for idx in weak:
+    preserve_duration = mode == "preserve_duration"
+    started_at = time.monotonic()
+    targets = weak[:MAX_AI_REFINEMENTS]
+    for position, idx in enumerate(targets, start=1):
+        if progress_callback:
+            progress_callback(position - 1, len(targets), result, result[idx])
+        remaining = AI_REFINEMENT_TIME_BUDGET_SECONDS - (time.monotonic() - started_at)
+        if remaining <= 0:
+            print("[llm_align] AI review time budget reached; returning partial review.")
+            break
         sub = result[idx]
+        existing_start = _to_seconds(sub.get("start_time", ""))
+        existing_end = _to_seconds(sub.get("end_time", ""))
+        existing_duration = (
+            existing_end - existing_start
+            if existing_start is not None and existing_end is not None and existing_end > existing_start
+            else None
+        )
         # Previous/next good boundaries relative to this weak line.
         prev_end = None
         next_start = None
@@ -126,6 +149,7 @@ def refine_alignment_with_llm(
                 ],
                 temperature=0.0,
                 max_tokens=120,
+                timeout=min(8.0, remaining),
             )
             content = (response.choices[0].message.content or "").strip()
         except Exception as exc:
@@ -156,11 +180,16 @@ def refine_alignment_with_llm(
         if start < lo - 0.5 or end > hi + 0.5:
             continue
 
+        if preserve_duration and existing_duration is not None:
+            end = start + existing_duration
         sub["start_time"] = _tc_to_str(start)
         sub["end_time"] = _tc_to_str(end)
         sub["flagged"] = False
         sub["flag_reason"] = ""
+        sub["manual_placement"] = False
         sub["align_source"] = "llm_whisper"
         sub["align_method"] = "ai"
 
+    if progress_callback:
+        progress_callback(len(targets), len(targets), result, None)
     return result

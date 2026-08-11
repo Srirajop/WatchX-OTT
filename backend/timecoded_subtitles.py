@@ -507,8 +507,19 @@ def subtitles_to_srt(subtitles: list[dict]) -> str:
     return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
-def prepare_for_platform(subtitles: list[dict], platform_key: str | dict, filename: str = "") -> list[dict]:
-    """Apply deterministic platform delivery rules that do not require rewriting timings by AI."""
+def prepare_for_platform(
+    subtitles: list[dict],
+    platform_key: str | dict,
+    filename: str = "",
+    regenerate_timings: bool = False,
+) -> list[dict]:
+    """Apply deterministic platform delivery rules.
+
+    When ``regenerate_timings`` is enabled, source timing is deliberately
+    ignored.  This is useful for scripts spotted only at scene headings: text
+    is split into delivery-sized cues and receives a continuous timeline with
+    consistent platform gaps instead of being constrained by those headings.
+    """
     if isinstance(platform_key, dict):
         platform = platform_key
     else:
@@ -535,6 +546,14 @@ def prepare_for_platform(subtitles: list[dict], platform_key: str | dict, filena
         item["text"] = text
         cleaned.append(item)
 
+    if regenerate_timings:
+        cleaned = _regenerate_timed_cues(
+            cleaned, max_chars, max_lines, min_duration, max_duration,
+            min_gap, max_cps,
+            start_offset=(max(min_duration, 1.08) + min_gap)
+            if platform.get("zero_subtitle_required", False) else 0.0,
+        )
+
     # If any subtitles are missing start_time (e.g. from paragraph_with_speaker
     # scripts with no embedded timecodes), assign sequential placeholders so
     # _repair_timing_windows does not silently drop the entire file.
@@ -559,6 +578,83 @@ def prepare_for_platform(subtitles: list[dict], platform_key: str | dict, filena
         sub.setdefault("flag_reason", "")
 
     return cleaned
+
+
+def _regenerate_timed_cues(
+    subtitles: list[dict], max_chars: int, max_lines: int,
+    min_duration: float, max_duration: float, min_gap: float, max_cps: float,
+    start_offset: float = 0.0,
+) -> list[dict]:
+    """Create rule-sized cues and an evenly-gapped sequential timeline.
+
+    Durations still scale with readable character speed; the *gaps* are kept
+    even.  This avoids a scene-heading timecode turning an entire scene into
+    one cue while retaining SRT-safe, monotonic timing.
+    """
+    result = []
+    cursor = max(0.0, start_offset)
+    gap = max(min_gap, 1 / 25)
+    for sub in subtitles:
+        # Scene-heading scripts often put a whole sequence of turns in one
+        # timestamped paragraph ("TIM SHAW: ... NARRATOR: ...").  Do not let
+        # the generic line wrapper split through a name or at an arbitrary
+        # point in a spoken sentence.
+        chunks = _regenerated_dialogue_chunks(sub.get("text", ""), max_chars, max_lines)
+        for chunk in chunks or [sub.get("text", "")]:
+            item = dict(sub)
+            item["text"] = chunk
+            chars = len(re.sub(r"\s", "", re.sub(r"<[^>]+>", "", chunk)))
+            duration = max(min_duration, chars / max_cps if max_cps > 0 else min_duration)
+            duration = min(duration, max_duration)
+            item["start_time"] = _from_seconds(cursor)
+            item["end_time"] = _from_seconds(cursor + duration)
+            result.append(item)
+            cursor += duration + gap
+    return result
+
+
+_INLINE_SPEAKER_TURN = re.compile(
+    r"(?<!^)\b([A-Z][A-Z0-9'’\-]{1,}(?:\s+[A-Z][A-Z0-9'’\-]{1,}){0,3})\s*:\s*"
+)
+
+
+def _regenerated_dialogue_chunks(text: str, max_chars: int, max_lines: int) -> list[str]:
+    """Split scene-paragraph dialogue at speaker turns and sentence ends."""
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if not text:
+        return []
+
+    turns = []
+    last = 0
+    for match in _INLINE_SPEAKER_TURN.finditer(text):
+        before = text[last:match.start()].strip()
+        if before:
+            turns.append(before)
+        last = match.end()
+    if text[last:].strip():
+        turns.append(text[last:].strip())
+    if not turns:
+        turns = [text]
+
+    chunks = []
+    for turn in turns:
+        # Prefer entire sentences. Only a single overlong sentence falls back
+        # to wrapping, which is unavoidable without rewriting the dialogue.
+        sentences = re.split(r"(?<=[.!?…])\s+", turn)
+        current = ""
+        for sentence in sentences:
+            candidate = f"{current} {sentence}".strip()
+            if current and not _text_fits(candidate, max_chars, max_lines):
+                chunks.append(current)
+                current = sentence
+            else:
+                current = candidate
+            if current and not _text_fits(current, max_chars, max_lines):
+                chunks.extend(_chunk_wrapped_groups(current, max_chars, max_lines))
+                current = ""
+        if current:
+            chunks.append(current)
+    return chunks
 
 
 # Speaker name pattern: ALL-CAPS word(s) 1-4 words long with NO lowercase following on same token
@@ -648,7 +744,15 @@ def clean_delivery_text(text: str) -> str:
     text = re.sub(r'\[(?:MUSIC|APPLAUSE|LAUGHTER|CHEERING|GUNSHOT|EXPLOSION|SINGING)[^\]]*\]', '', text, flags=re.IGNORECASE)
 
     # ── 3. Remove truly spurious HTML tags but NOT i/b placeholders ──
-    text = re.sub(r'<(?!/?i>|/?b>)[^>]+>', '', text)
+    # Only strip *recognised* markup tags (font/span/div/...).  Dialogue that
+    # merely happens to be wrapped in angle brackets (e.g. a PAC line stored as
+    # "<Vale.>") must be preserved, otherwise the whole subtitle text is wiped
+    # and the cue is lost during conversion.
+    text = re.sub(
+        r'</?(?:font|span|div|p|br|sub|sup|small|big|ruby|rt|table|tr|td|center|html|body)[^>]*>',
+        '',
+        text,
+    )
 
     # ── 4. Restore italic/bold tags ──
     text = text.replace('__ITALIC_OPEN__', '<i>')
@@ -788,6 +892,15 @@ def _repair_timing_windows(subtitles: list[dict], min_duration: float, max_durat
 
 
 def _split_long_subtitles(subtitles: list[dict], max_chars: int, max_lines: int) -> list[dict]:
+    """Keep exactly ONE output cue per input subtitle.
+
+    Professional tools such as Subtitle Edit preserve the cue count on format
+    conversion (e.g. a 509-cue PAC file yields 509 SRT cues).  Only the *text*
+    is wrapped onto multiple lines *within the same cue* — a source cue is
+    never exploded into several cues.  Splitting one cue into many silently
+    changes the programme's spotting and the exported cue count, which is why a
+    509-line PAC was previously becoming 565 lines in the SRT.
+    """
     def mark_line_limit(item: dict):
         hints = list(item.get("rule_hints", []))
         if "line_limit" not in hints:
@@ -797,49 +910,12 @@ def _split_long_subtitles(subtitles: list[dict], max_chars: int, max_lines: int)
     split = []
     for sub in subtitles:
         text = sub.get("text", "")
-        if _text_fits(text, max_chars, max_lines):
-            item = dict(sub)
-            item["text"] = _wrap_chunk(text, max_chars)
-            if item["text"] != text:
-                mark_line_limit(item)
-            split.append(item)
-            continue
-
-        chunks = _chunk_wrapped_groups(text, max_chars, max_lines)
-        if len(chunks) <= 1:
-            item = dict(sub)
-            item["text"] = _wrap_chunk(text, max_chars)
-            if item["text"] != text:
-                mark_line_limit(item)
-            split.append(item)
-            continue
-
-        start = _to_seconds(sub.get("start_time", ""))
-        end = _to_seconds(sub.get("end_time", ""))
-        if start is None or end is None or end <= start:
-            for chunk in chunks:
-                item = dict(sub)
-                item["text"] = _wrap_chunk(chunk, max_chars)
-                mark_line_limit(item)
-                split.append(item)
-            continue
-
-        duration = end - start
-        weights = [max(1, len(re.sub(r"\s+", "", chunk))) for chunk in chunks]
-        total = sum(weights)
-        cursor = start
-        for idx, chunk in enumerate(chunks):
-            item = dict(sub)
-            if idx == len(chunks) - 1:
-                chunk_end = end
-            else:
-                chunk_end = cursor + duration * (weights[idx] / total)
-            item["start_time"] = _from_seconds(cursor)
-            item["end_time"] = _from_seconds(chunk_end)
-            item["text"] = chunk
+        item = dict(sub)
+        wrapped = _wrap_chunk(text, max_chars)
+        if wrapped != text:
+            item["text"] = wrapped
             mark_line_limit(item)
-            split.append(item)
-            cursor = chunk_end
+        split.append(item)
 
     return split
 
@@ -1083,8 +1159,11 @@ def _renumber(entries: list[dict], gap: float = 0.0) -> list[dict]:
     This guarantees no dialogue is silently lost during conversion.
     """
     result = []
-    # Filter to keep entries that have usable text and a start time.
-    kept = [e for e in entries if e.get("text", "").strip() and e.get("start_time")]
+    # Keep every entry that carries a timecode.  For already-timed formats
+    # (SRT / PAC / VTT / TTML) this preserves a strict 1:1 cue count with the
+    # source — including blank/colour cues — exactly like Subtitle Edit.  Plain
+    # text (no timecodes) is still filtered out upstream.
+    kept = [e for e in entries if e.get("start_time")]
     for i, entry in enumerate(kept, start=1):
         item = dict(entry)
         start = entry.get("start_time")

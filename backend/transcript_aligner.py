@@ -204,7 +204,12 @@ def align_transcription_to_script(
         return []
 
     preserve = (mode == "preserve_duration")
-    use_ai = (mode == "ai")
+    # "ai" was the old third UI option; keep it working as Full Map.
+    if mode == "ai":
+        mode = "full"
+    # Mapping must return promptly for manual review. AI is an explicit review
+    # action after the result is shown, not a blocking part of mapping.
+    use_ai = False
 
     timeline = _build_timeline(whisper_subs)
     script_lines = [_tokens(sub.get("text", "")) for sub in cleaned_subs]
@@ -255,7 +260,7 @@ def align_transcription_to_script(
     if use_ai:
         try:
             from llm_aligner import refine_alignment_with_llm
-            result = refine_alignment_with_llm(whisper_subs, result, mode="ai")
+            result = refine_alignment_with_llm(whisper_subs, result, mode=mode)
         except Exception as exc:  # AI is a best-effort enhancement only.
             print(f"[align] AI refinement skipped: {exc}")
 

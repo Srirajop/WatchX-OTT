@@ -420,7 +420,7 @@ def extract_guidelines_with_ai(raw_text: str, client: str, ott_platform: str, ye
 
     client_api = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-    CHUNK_SIZE = 3000
+    CHUNK_SIZE = int(os.getenv("GROQ_GUIDELINES_CHUNK_SIZE", "2500"))
     text = raw_text.strip()
     chunks = []
     start = 0
@@ -462,12 +462,29 @@ GUIDELINES DOCUMENT TEXT:
 ---"""
 
         try:
-            response = client_api.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=3000,
-            )
+            response = None
+            for attempt in range(3):
+                try:
+                    response = client_api.chat.completions.create(
+                        model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.1,
+                        reasoning_effort=os.getenv("GROQ_REASONING_EFFORT", "low"),
+                        max_completion_tokens=int(os.getenv("GROQ_GUIDELINES_MAX_OUTPUT", "2000")),
+                    )
+                    break
+                except Exception as exc:
+                    if attempt == 2:
+                        raise
+                    wait = getattr(getattr(exc, "response", None), "headers", {}).get("retry-after", "20")
+                    try: wait = max(5.0, min(float(wait), 90.0))
+                    except (TypeError, ValueError): wait = 20.0
+                    print(f"[GUIDELINES] Rate/API retry {attempt + 1}/2 in {wait:.0f}s: {exc}")
+                    import time as _retry_time
+                    _retry_time.sleep(wait)
+
+            if response is None:
+                raise RuntimeError("Groq returned no response")
 
             result_text = response.choices[0].message.content.strip()
             result_text = re.sub(r"```(?:json)?\s*", "", result_text).strip().rstrip("`")

@@ -1,5 +1,5 @@
 # cleaner.py - AI subtitle cleaner
-# Supports: LM Studio (local, no limits) or Groq (cloud, free tier)
+# Uses Groq-hosted OpenAI GPT-OSS 20B.
 
 import os
 import json
@@ -117,28 +117,11 @@ def _filter_script_rules(script_rules: list, subtitler_rules: list) -> tuple[lis
 
 def _get_client_and_model():
     """Returns (client, model_name, is_local) based on LLM_PROVIDER env var."""
-    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
-
-    if provider == "lmstudio":
-        from openai import OpenAI
-        url = os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
-        model = os.getenv("LM_STUDIO_MODEL", "gemma-3-4b-it")
-        client = OpenAI(base_url=url, api_key="lm-studio")
-        print(f"[LLM] Using LM Studio: {url} | model: {model}")
-        return client, model, True
-    elif provider == "gemini":
-        from openai import OpenAI
-        client = OpenAI(
-            api_key=os.getenv("GEMINI_API_KEY"),
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-        )
-        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-        return client, model, False
-    else:
-        from groq import Groq
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-        return client, model, False
+    from groq import Groq
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    print(f"[LLM] Using Groq | model: {model}")
+    return client, model, False
 
 def _rules_to_instructions(platform: dict) -> list[str]:
     """
@@ -275,8 +258,8 @@ def clean_subtitle_chunk(
     client, model_name, is_local = _get_client_and_model()
     system_prompt, user_prompt = build_prompt(raw_text, structure, platform, max_chars)
 
-    max_output_tokens = 800 if is_local else (4000 if os.getenv("LLM_PROVIDER", "gemini").lower() == "gemini" else 1200)
-    retry_delay = 0.5 if is_local else 2
+    max_output_tokens = int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "4096"))
+    retry_delay = float(os.getenv("GROQ_RETRY_DELAY", "2"))
     last_error = None
 
     for attempt in range(3):
@@ -287,8 +270,9 @@ def clean_subtitle_chunk(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.0,   # lower temp = more deterministic rule following
-                max_tokens=max_output_tokens,
+                temperature=0.1,
+                reasoning_effort=os.getenv("GROQ_REASONING_EFFORT", "low"),
+                max_completion_tokens=max_output_tokens,
             )
             choice = response.choices[0]
             result_text = (choice.message.content or "").strip()
@@ -624,7 +608,11 @@ def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str)
             )
             result_text = (response.choices[0].message.content or "").strip()
             print(f"[RULES DEBUG] Raw LLM Output (first 500 chars): {result_text[:500]}")
+            
+            # Remove <think> tags for reasoning models
+            result_text = _re.sub(r"<think>.*?</think>", "", result_text, flags=_re.DOTALL).strip()
             result_text = _re.sub(r"```(?:json)?\s*", "", result_text).strip().rstrip("`")
+            
             parsed = None
             try:
                 parsed = json.loads(result_text)
@@ -635,7 +623,6 @@ def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str)
                     parsed = json.loads(repaired)
                 except Exception as ex:
                     print(f"[RULES ERROR] Repaired JSON parse failed: {ex}")
-                    # If all fails, fall back to empty
                     pass
             if isinstance(parsed, dict):
                 def _extract_valid_rules(rule_objs):
@@ -745,19 +732,15 @@ DOCUMENT EXCERPT:
 def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> dict:
     """
     Extract ALL rules from a custom platform guidelines document.
-    Uses 8000-char chunks and 5s inter-chunk pacing to stay under Gemini 15 RPM limit.
+    Uses free-tier-safe chunks and pacing for Groq GPT-OSS 20B.
     """
-    CHUNK_SIZE = 7000  # Groq 8B TPM limits are very low (6000 TPM)
-    from groq import Groq
     import os
+    CHUNK_SIZE = int(os.getenv("GROQ_RULES_CHUNK_SIZE", "2500"))
+    from groq import Groq
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    model_name = "llama-3.1-8b-instant" # 6,000 TPM limit
+    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
     
-    # Rate Limit Protection for Groq's aggressive TPM limit (6,000 Tokens Per Minute)
-    # We must wait 61 seconds between platforms to clear the token bucket
-    print(f"[RULES] Groq Pacing: Waiting 61s before processing '{platform_name}' to clear 6k TPM limit...")
     import time
-    time.sleep(61.0)
 
     default = {
         "name": platform_name, "max_chars_per_line": 42, "max_lines": 2,
@@ -789,7 +772,7 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
 
     # Step 2: extract rules with pacing to avoid RPM limit
     import time as _chunk_time
-    inter_chunk_delay = 61.0
+    inter_chunk_delay = float(os.getenv("GROQ_RULES_CHUNK_DELAY", "20"))
 
     all_script_rules = []
     all_subtitler_rules = []
@@ -819,8 +802,10 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
         return default
 
     # Step 4: extract numeric metadata
-    print(f"[RULES] Groq Pacing: Waiting 61s before metadata extraction to clear TPM bucket...")
-    _chunk_time.sleep(61.0)
+    metadata_delay = float(os.getenv("GROQ_RULES_METADATA_DELAY", "20"))
+    if metadata_delay > 0:
+        print(f"[RULES] Waiting {metadata_delay:.0f}s before metadata extraction")
+        _chunk_time.sleep(metadata_delay)
     metadata = _call_llm_for_metadata(client, model_name, platform_name, chunks[0])
 
     # Step 5: merge

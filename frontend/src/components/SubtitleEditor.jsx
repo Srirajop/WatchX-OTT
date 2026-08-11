@@ -48,10 +48,9 @@ const PROVIDERS_FALLBACK = [
   { value: 'google', name: 'Google Translate (free, no key)', needsKey: false, customEndpoint: false, models: [], default_model: '', default_base_url: '' },
   { value: 'openai', name: 'ChatGPT / OpenAI', needsKey: true, customEndpoint: false, models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-5-mini'], default_model: 'gpt-4o-mini', default_base_url: 'https://api.openai.com/v1' },
   { value: 'anthropic', name: 'Claude (Anthropic)', needsKey: true, customEndpoint: false, models: ['claude-3-5-haiku-latest', 'claude-3-7-sonnet-latest', 'claude-sonnet-4-0'], default_model: 'claude-3-5-haiku-latest', default_base_url: 'https://api.anthropic.com/v1' },
-  { value: 'gemini', name: 'Google Gemini', needsKey: true, customEndpoint: false, models: ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-2.5-pro'], default_model: 'gemini-2.0-flash', default_base_url: '' },
   { value: 'deepl', name: 'DeepL', needsKey: true, customEndpoint: true, models: [], default_model: '', default_base_url: 'https://api-free.deepl.com/v2' },
   { value: 'deepseek', name: 'DeepSeek', needsKey: true, customEndpoint: false, models: ['deepseek-chat', 'deepseek-reasoner'], default_model: 'deepseek-chat', default_base_url: 'https://api.deepseek.com/v1' },
-  { value: 'groq', name: 'Groq', needsKey: true, customEndpoint: false, models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'], default_model: 'llama-3.3-70b-versatile', default_base_url: 'https://api.groq.com/openai/v1' },
+  { value: 'groq', name: 'Groq (GPT-OSS 20B)', needsKey: true, customEndpoint: false, models: ['openai/gpt-oss-20b'], default_model: 'openai/gpt-oss-20b', default_base_url: 'https://api.groq.com/openai/v1' },
   { value: 'mistral', name: 'Mistral AI', needsKey: true, customEndpoint: false, models: ['mistral-small-latest', 'mistral-large-latest'], default_model: 'mistral-small-latest', default_base_url: 'https://api.mistral.ai/v1' },
   { value: 'openrouter', name: 'OpenRouter', needsKey: true, customEndpoint: false, models: ['openai/gpt-4o-mini', 'anthropic/claude-3.5-haiku'], default_model: 'openai/gpt-4o-mini', default_base_url: 'https://openrouter.ai/api/v1' },
   { value: 'perplexity', name: 'Perplexity', needsKey: true, customEndpoint: false, models: ['sonar', 'sonar-pro'], default_model: 'sonar', default_base_url: 'https://api.perplexity.ai' },
@@ -331,7 +330,7 @@ const TlBlock = memo(({ s, active, pxPerSec, isEditorFullscreen, onBlockPointerD
       onClick={e => { e.stopPropagation(); if (!movedRef.current) seekTo(a) }}>
       <div style={st.tlHandle} onPointerDown={e => onBlockPointerDown(e, s, 'left')} />
       <div style={st.tlBlockText} onPointerDown={e => onBlockPointerDown(e, s, 'move')}>
-        {s.text.split('\n')[0] || '(empty)'}
+        {s.id}. {s.text.split('\n')[0] || '(empty)'}
       </div>
       <div style={st.tlHandle} onPointerDown={e => onBlockPointerDown(e, s, 'right')} />
     </div>
@@ -1737,7 +1736,7 @@ function SubtitleEditor() {
                     padding: '8px 20px',
                     borderRadius: 10,
                     maxWidth: '90%',
-                  } : st.overlayText}>{activeSub.text}</span>
+                  } : st.overlayText}>{activeSub.id}. {activeSub.text}</span>
                 </div>
               )}
             </div>

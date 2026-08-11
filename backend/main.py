@@ -59,7 +59,7 @@ def startup():
 
 @app.get("/")
 def root():
-    return {"status": "running", "version": "2.0.0", "model": "llama-3.1-8b-instant"}
+    return {"status": "running", "version": "2.0.0", "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")}
 
 
 @app.get("/health")
@@ -68,7 +68,7 @@ def health():
     return {
         "status": "ok",
         "groq_configured": bool(groq_key and groq_key != "your_groq_api_key_here"),
-        "model": "llama-3.1-8b-instant (Groq)"
+        "model": f"{os.getenv('GROQ_MODEL', 'openai/gpt-oss-20b')} (Groq)"
     }
 
 
@@ -143,14 +143,12 @@ async def clean_file_endpoint(
         pre_extracted = [line.strip() for line in raw_text.splitlines() if line.strip()]
         print(f"[EXTRACT] No pre-extraction, sending {len(pre_extracted)} raw lines to LLM")
 
-    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
-    lmstudio_chunk = int(os.getenv("LM_STUDIO_CHUNK_SIZE", "1500"))
-    chunk_size = lmstudio_chunk if provider == "lmstudio" else 8000 if provider == "gemini" else 3000
+    chunk_size = int(os.getenv("GROQ_CHUNK_SIZE", "7000"))
     chunks = chunk_list(pre_extracted, max_chunk_size=chunk_size)
     total_chunks = len(chunks)
     
     # Process fewer chunks in parallel with larger sizes to prevent exceeding Groq TPM.
-    parallel = int(os.getenv("LM_STUDIO_PARALLEL", "1")) if provider == "lmstudio" else (1 if provider == "groq" else 2)
+    parallel = 1
 
     async def process_chunk(idx: int, chunk: list[str]):
         loop = asyncio.get_running_loop()
@@ -169,11 +167,12 @@ async def clean_file_endpoint(
         yield f"data: {json.dumps({'status': 'starting', 'progress': 0, 'message': f'Initializing — {total_chunks} parts, processing {parallel} at a time...'})}\n\n"
         await asyncio.sleep(0.05)
 
-        # Process in parallel batches to match LM Studio's parallel slot count
+        # Process one batch at a time to preserve order and protect API limits.
         for batch_start in range(0, total_chunks, parallel):
-            if provider == "groq" and batch_start > 0:
+            pacing = float(os.getenv("GROQ_CHUNK_DELAY", "0"))
+            if pacing > 0 and batch_start > 0:
                 yield f"data: {json.dumps({'status': 'processing', 'progress': int((batch_start / total_chunks) * 100), 'message': f'Groq Pacing: Waiting 21s to clear 6k TPM bucket...'})}\n\n"
-                await asyncio.sleep(21.0)
+                await asyncio.sleep(pacing)
                 
             batch = list(enumerate(chunks[batch_start:batch_start + parallel], start=batch_start))
             done = batch_start + len(batch)
@@ -1009,7 +1008,7 @@ async def clean_extracted_endpoint(data: dict):
     Deterministic platform-rule cleaning of already-extracted subtitles.
 
     Zero hallucination — uses ONLY Python rule engines, no LLM.
-    The AI (Groq/LM Studio) is for raw script → subtitle extraction only.
+    The AI (Groq GPT-OSS 20B) is for raw script → subtitle extraction only.
     For already-extracted subtitles the deterministic engine is MORE accurate
     because it applies every rule exactly, never changes dialogue meaning,
     and never alters line counts.
@@ -1026,6 +1025,7 @@ async def clean_extracted_endpoint(data: dict):
     subs = data.get("subtitles", [])
     platform_key = data.get("platform_key", "generic")
     filename = data.get("filename", "subtitles.txt")
+    regenerate_timings = bool(data.get("regenerate_timings", False))
 
     if not subs:
         raise HTTPException(400, "No subtitles provided to clean")
@@ -1079,7 +1079,10 @@ async def clean_extracted_endpoint(data: dict):
             yield f"data: {json.dumps({'status': 'processing', 'message': 'Applying timing and structural rules...', 'progress': 78})}\n\n"
             await asyncio.sleep(0.05)
 
-            cleaned = prepare_for_platform(pass3, platform_key, filename)
+            cleaned = prepare_for_platform(
+                pass3, platform_key, filename,
+                regenerate_timings=regenerate_timings,
+            )
 
             # ── Pass 5: Targeted flag — unfixable errors only ─────────────────
             # Only flag what genuinely could NOT be auto-fixed:
@@ -2176,6 +2179,7 @@ async def transcribe_and_align_endpoint(
                 )
                 result = {
                     "subtitles": _aligned,
+                    "reference_subtitles": whisper_subs,
                     "stats": {
                         "total_lines": len(_aligned),
                         "flagged_lines": sum(1 for s in _aligned if s.get("flagged")),
@@ -2258,6 +2262,7 @@ async def align_scripts_endpoint(
     )
     return {
         "subtitles": final_subs,
+        "reference_subtitles": ts_subs,
         "stats": {
             "total_lines": len(final_subs),
             "flagged_lines": sum(1 for s in final_subs if s.get("flagged")),
@@ -2271,6 +2276,65 @@ async def align_scripts_endpoint(
             },
         }
     }
+
+
+@app.post("/refine-alignment")
+async def refine_alignment_endpoint(data: dict):
+    """Run the optional, bounded AI review after manual mapping is visible."""
+    reference_subtitles = data.get("reference_subtitles", [])
+    subtitles = data.get("subtitles", [])
+    mode = data.get("mode", "full")
+    if not reference_subtitles or not subtitles:
+        raise HTTPException(400, "Mapped subtitles and their reference cues are required for AI review.")
+
+    from llm_aligner import refine_alignment_with_llm
+    refined = refine_alignment_with_llm(reference_subtitles, subtitles, mode=mode)
+    reviewed_count = sum(1 for sub in refined if sub.get("align_method") == "ai")
+    return {"subtitles": refined, "reviewed_count": reviewed_count}
+
+
+@app.post("/refine-alignment-stream")
+async def refine_alignment_stream_endpoint(data: dict):
+    """Optional AI placement with progress events for the manual-review panel."""
+    import queue
+    import threading
+    reference_subtitles = data.get("reference_subtitles", [])
+    subtitles = data.get("subtitles", [])
+    mode = data.get("mode", "full")
+    if not reference_subtitles or not subtitles:
+        raise HTTPException(400, "Mapped subtitles and their reference cues are required for AI placement.")
+
+    async def event_stream():
+        events = queue.Queue()
+        def worker():
+            try:
+                from llm_aligner import refine_alignment_with_llm
+                def report(done, total, current, sub):
+                    mapped = sum(1 for item in current if item.get("align_method") == "ai")
+                    events.put({"type":"progress", "done":done, "total":total, "mapped":mapped})
+                refined = refine_alignment_with_llm(reference_subtitles, subtitles, mode=mode, progress_callback=report)
+                events.put({"type":"done", "subtitles":refined})
+            except Exception as exc:
+                events.put({"type":"error", "error":str(exc)})
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            try:
+                event = events.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.15)
+                continue
+            if event["type"] == "progress":
+                total = max(1, event["total"])
+                pct = int((event["done"] / total) * 100)
+                message = f"AI mapping {event['done']} of {event['total']} remaining lines ({event['mapped']} placed)"
+                yield f"data: {json.dumps({'status':'processing','progress':pct,'message':message})}\n\n"
+            elif event["type"] == "done":
+                yield f"data: {json.dumps({'status':'completed','result':{'subtitles':event['subtitles']}})}\n\n"
+                break
+            else:
+                yield f"data: {json.dumps({'status':'error','error':event['error']})}\n\n"
+                break
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
 
 # ── SOURCE DOCUMENT HTML PREVIEW (DOC / DOCX / XLSX) ──────────────────────────
 import html as _html

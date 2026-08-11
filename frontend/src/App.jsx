@@ -533,6 +533,7 @@ export default function App() {
   const [subtitles, setSubtitles] = useState([])
   const [cleanStats, setCleanStats] = useState(null)
   const [cleanError, setCleanError] = useState('')
+  const [useSourceTimings, setUseSourceTimings] = useState(true)
   const fileRef = useRef()
 
   // Quality check tab
@@ -557,7 +558,7 @@ export default function App() {
   const [audioFile, setAudioFile] = useState(null)
   const [scriptFile, setScriptFile] = useState(null)  // optional script for alignment (Case 2)
   const [timestampsFile, setTimestampsFile] = useState(null) // optional timestamps file (Case 3)
-  const [alignMode, setAlignMode] = useState('full') // 'full' | 'preserve_duration'
+  const [alignMode, setAlignMode] = useState('full') // 'full' | 'preserve_duration'; both use AI refinement
   const [whisperSubs, setWhisperSubs] = useState([])  // raw whisper output
   const [recording, setRecording] = useState(false)
   const [screenRecording, setScreenRecording] = useState(false)
@@ -566,6 +567,7 @@ export default function App() {
   const [transcribeProgress, setTranscribeProgress] = useState({ pct: 0, msg: '' })
   const [transcribeError, setTranscribeError] = useState('')
   const [alignStats, setAlignStats] = useState(null)
+  const [aiReviewing, setAiReviewing] = useState(false)
   const scriptFileRef = useRef()
   const tsFileRef = useRef()
 
@@ -751,7 +753,12 @@ export default function App() {
     setCleaning(true); setCleanError(''); setCleanStats(null); setCleanProgress(0)
     try {
       setCleanText('Preparing text...')
-      const payload = { subtitles, platform_key: platform, filename: file?.name || 'subtitles.txt' }
+      const payload = {
+        subtitles,
+        platform_key: platform,
+        filename: file?.name || 'subtitles.txt',
+        regenerate_timings: !useSourceTimings,
+      }
       const response = await fetch(`${API}/clean-extracted`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1262,7 +1269,7 @@ export default function App() {
           } else if (data.status === 'completed') {
             const subs = data.result?.subtitles || []
             setSubtitles(subs)
-            setWhisperSubs(subs)
+            setWhisperSubs(data.result?.reference_subtitles || subs)
             setCleanStats(data.result?.stats || null)
             setAlignStats(data.result?.stats || null)
             // Stay on the Transcribe tab so the user can download / send to Clean
@@ -1297,7 +1304,7 @@ export default function App() {
       const finalSubs = data.subtitles || []
       const finalStats = data.stats || null
       setSubtitles(finalSubs)
-      setWhisperSubs(finalSubs)
+      setWhisperSubs(data.reference_subtitles || finalSubs)
       setCleanStats(finalStats)
       setAlignStats(finalStats)
       // Stay on the Transcribe tab so the user can download / send to Clean
@@ -1306,6 +1313,40 @@ export default function App() {
       setTranscribeError(e.response?.data?.detail || e.message || 'Alignment failed')
     } finally {
       setTranscribing(false)
+      setTranscribeProgress({ pct: 0, msg: '' })
+    }
+  }
+
+  async function handleAiReviewAlignment() {
+    if (!subtitles.length || !whisperSubs.length) return
+    setAiReviewing(true); setTranscribeError('')
+    setTranscribeProgress({ pct: 0, msg: 'Starting AI placement...' })
+    try {
+      const response = await fetch(`${API}/refine-alignment-stream`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subtitles, reference_subtitles: whisperSubs, mode: alignMode }),
+      })
+      if (!response.ok) throw new Error(`Server error: ${response.status}`)
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n'); buffer = lines.pop() || ''
+        for (const line of lines) {
+          if (!line.trim().startsWith('data: ')) continue
+          const data = JSON.parse(line.trim().substring(6))
+          if (data.status === 'processing') setTranscribeProgress({ pct: data.progress || 0, msg: data.message || 'AI mapping...' })
+          else if (data.status === 'completed') setSubtitles(data.result?.subtitles || subtitles)
+          else if (data.status === 'error') throw new Error(data.error || 'AI placement failed')
+        }
+      }
+    } catch (e) {
+      setTranscribeError(e.message || 'AI review failed')
+    } finally {
+      setAiReviewing(false)
       setTranscribeProgress({ pct: 0, msg: '' })
     }
   }
@@ -1437,6 +1478,16 @@ export default function App() {
                 </button>
               </div>
 
+              <label style={{display:'flex',alignItems:'flex-start',gap:9,marginTop:12,padding:'10px 12px',border:'1px solid #dbe4f0',borderRadius:9,background:'#f8fafc',cursor:'pointer'}}>
+                <input type="checkbox" checked={useSourceTimings} onChange={e=>setUseSourceTimings(e.target.checked)} style={{marginTop:2,accentColor:'#4f46e5'}} />
+                <span style={{fontSize:12,lineHeight:1.45,color:'#334155'}}>
+                  <strong>Use timestamps from the script</strong>
+                  <span style={{display:'block',color:'#64748b',marginTop:2}}>
+                    Uncheck for scene-heading-only scripts: the cleaner will split dialogue to the platform rules and create a new, evenly gapped SRT timeline.
+                  </span>
+                </span>
+              </label>
+
               {(cleaning || extracting) && (
                 <div style={S.progressContainer}>
                   <div style={S.progressBarOuter}>
@@ -1498,16 +1549,19 @@ export default function App() {
                   )}
                   <div style={S.subList}>
                     {subtitles.map((sub,i) => (
-                      <div key={i} style={{...S.subRow,...(sub.flagged?S.subFlagged:{})}}>
-                        {(sub.start_time || sub.end_time) && (
-                          <div style={S.timecode}>{`${sub.start_time} --> ${sub.end_time}`}</div>
-                        )}
-                        <div style={{...S.subText,...(sub.flagged?{color:'#dc2626'}:{})}}
-                          contentEditable suppressContentEditableWarning
-                          onBlur={e=>{const u=[...subtitles];u[i]={...u[i],text:e.target.innerHTML};setSubtitles(u)}}
-                          dangerouslySetInnerHTML={{ __html: (sub.text || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>') }}
-                        />
-                        {sub.flagged&&sub.flag_reason&&<div style={{fontSize:10,color:'#dc2626',marginTop:4}}>⚠ {sub.flag_reason}</div>}
+                      <div key={i} style={{...S.subRow,...(sub.flagged?S.subFlagged:{}), display: 'flex', gap: 16, alignItems: 'flex-start'}}>
+                        <div style={{fontSize: 14, fontWeight: 700, color: '#94a3b8', minWidth: 32, paddingTop: 2, textAlign: 'right'}}>{i + 1}.</div>
+                        <div style={{flex: 1}}>
+                          {(sub.start_time || sub.end_time) && (
+                            <div style={S.timecode}>{`${sub.start_time} --> ${sub.end_time}`}</div>
+                          )}
+                          <div style={{...S.subText,...(sub.flagged?{color:'#dc2626'}:{})}}
+                            contentEditable suppressContentEditableWarning
+                            onBlur={e=>{const u=[...subtitles];u[i]={...u[i],text:e.target.innerHTML};setSubtitles(u)}}
+                            dangerouslySetInnerHTML={{ __html: (sub.text || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>') }}
+                          />
+                          {sub.flagged&&sub.flag_reason&&<div style={{fontSize:10,color:'#dc2626',marginTop:4}}>⚠ {sub.flag_reason}</div>}
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -1701,12 +1755,15 @@ export default function App() {
                       <button
                         type="button"
                         onClick={()=>setAlignMode('ai')}
-                        style={{flex:1, padding:'8px 10px', borderRadius:8, fontSize:11, fontWeight:700, cursor:'pointer',
+                        style={{display:'none', flex:1, padding:'8px 10px', borderRadius:8, fontSize:11, fontWeight:700, cursor:'pointer',
                           background: alignMode==='ai' ? '#4f46e5' : '#f8fafc',
                           color: alignMode==='ai' ? '#fff' : '#64748b',
                           border: `1px solid ${alignMode==='ai' ? '#4f46e5' : '#e2e8f0'}`}}>
                         🤖 AI (Llama 3.1)<br/><span style={{fontWeight:400,fontSize:10}}>Refine weak lines with Groq</span>
                       </button>
+                    </div>
+                    <div style={{marginTop:7,fontSize:10,color:'#4f46e5',fontWeight:600}}>
+                      AI refinement is applied automatically to weak matches in both modes.
                     </div>
                   </div>
                 ) : null}
@@ -1721,7 +1778,7 @@ export default function App() {
                   </button>
               )}
 
-              {transcribing && (
+              {(transcribing || aiReviewing) && (
                 <div style={S.progressContainer}>
                   <div style={S.progressBarOuter}><div style={{...S.progressBarInner, width: `${transcribeProgress.pct}%`}} /></div>
                   <div style={S.progressMeta}>
@@ -1756,6 +1813,12 @@ export default function App() {
                       <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportTXT}>⬇ TXT</button>
                       <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportDOCX}>⬇ DOCX</button>
                       <button style={{...S.btnSm, background:'#059669', borderColor:'#059669', color:'#fff'}} onClick={exportPDF}>⬇ PDF</button>
+                      {alignStats && !subtitles.some(sub => (sub.manual_placement || !sub.start_time) && sub.text?.trim()) && (
+                        <button style={{...S.btnSm, background:'#4f46e5', borderColor:'#4f46e5', color:'#fff'}}
+                                onClick={handleAiReviewAlignment} disabled={aiReviewing}>
+                          {aiReviewing ? 'AI checking weak matches...' : 'AI Check Weak Matches'}
+                        </button>
+                      )}
                       <button style={{...S.btnSm, marginLeft:'auto', background:'#4f46e5', borderColor:'#4f46e5', color:'#fff'}}
                               onClick={()=>setTab('clean')}>🧹 Take to Cleaning →</button>
                     </div>
@@ -1765,6 +1828,13 @@ export default function App() {
                       <div style={{fontSize:12, fontWeight:700, color:'#c2410c', marginBottom:5}}>Manual timestamp placement required</div>
                       <div style={{fontSize:11, color:'#9a3412', marginBottom:8}}>
                         These original script dialogues need a subtitle editor's timing pass. Safe gaps are used where possible; anything without a safe gap remains in TXT/DOCX exports and Cleaning, because SRT cannot include a cue without timestamps.
+                      </div>
+                      <button style={{...S.btnSm, marginBottom:8, background:'#c2410c', borderColor:'#c2410c', color:'#fff'}}
+                              onClick={handleAiReviewAlignment} disabled={aiReviewing}>
+                        {aiReviewing ? 'AI is mapping the remaining lines...' : 'AI Map Remaining Lines'}
+                      </button>
+                      <div style={{fontSize:10, color:'#9a3412', marginBottom:6}}>
+                        AI uses the supplied timed cues to place the lines below. Any line it cannot match confidently stays flagged for manual timing.
                       </div>
                       {subtitles.filter(sub => (sub.manual_placement || !sub.start_time) && sub.text?.trim()).map((sub, index) => (
                         <div key={`${sub.id || index}-${index}`} style={{fontSize:11, color:'#7c2d12', padding:'6px 0', borderTop:index ? '1px solid #fed7aa' : 'none'}}>
