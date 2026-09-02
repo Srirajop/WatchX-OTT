@@ -40,3 +40,21 @@ backend/.env
 # OS
 .DS_Store
 Thumbs.db
+
+# Cache and model storage
+.cache/
+.models/
+backend/.cache/
+backend/.models/
+
+# Uploads and temporary user files
+backend/uploads/
+uploads/
+*.zip
+*.tar.gz
+
+# Local scratch / debug / patch scripts
+backend/debug_*.py
+backend/patch_*.py
+backend/_clean_ocr_patch.py
+fix.py

@@ -24,7 +24,7 @@ import json, io, re, asyncio
 from database import init_db, get_all_platforms, save_custom_platform, log_job
 from file_reader import read_file
 from extractor import pre_extract_dialogue
-from cleaner import clean_subtitle_chunk, extract_platform_rules_with_ai
+from cleaner import clean_subtitle_chunk, extract_platform_rules_with_ai, _preserve_as_broadcast_title
 from quality_checker import check_quality
 from platform_rules import get_platform, get_platform_list
 from timecoded_subtitles import ensure_srt_timings, parse_timecoded_subtitles, prepare_for_platform, subtitles_to_srt, normalize_timecode
@@ -70,6 +70,183 @@ def health():
         "groq_configured": bool(groq_key and groq_key != "your_groq_api_key_here"),
         "model": f"{os.getenv('GROQ_MODEL', 'openai/gpt-oss-20b')} (Groq)"
     }
+
+@app.get("/semantic-model/status")
+def semantic_model_status():
+    from semantic_matcher import model_status
+    return model_status()
+
+
+@app.get("/bridge/status")
+def bridge_status():
+    """Report local bridge availability without downloading language packs."""
+    from bridge_translator import status
+    return status()
+
+
+@app.post("/bridge/prepare")
+async def bridge_prepare(source_language: str = Form(...), target_language: str = Form(...)):
+    """Explicitly prepare one local Argos language pair."""
+    import asyncio
+    try:
+        from bridge_translator import prepare_language_pair
+        return await asyncio.to_thread(prepare_language_pair, source_language, target_language)
+    except Exception as exc:
+        raise HTTPException(503, str(exc))
+
+
+@app.post("/bridge/prepare-from-files")
+async def bridge_prepare_from_files(
+    script_file: UploadFile = File(...), timestamps_file: UploadFile = File(...)
+):
+    """Detect the two languages from the selected files, then prepare one pair."""
+    import asyncio
+    try:
+        from file_reader import read_file
+        from extractor import pre_extract_dialogue
+        from timecoded_subtitles import parse_timecoded_subtitles
+        from bridge_translator import detect_languages, prepare_language_pair
+
+        script_bytes = await script_file.read()
+        ts_bytes = await timestamps_file.read()
+        script_name = script_file.filename or "script.txt"
+        ts_name = timestamps_file.filename or "timestamps.srt"
+        sd = read_file(script_bytes, script_name)
+        parsed = parse_timecoded_subtitles(sd["raw_text"]) if sd["structure"] in ("srt", "vtt", "ttml") else []
+        if parsed:
+            client_subs = parsed
+        else:
+            raw_lines = pre_extract_dialogue(sd["raw_text"], sd["structure"], script_bytes, script_name, {}) or sd["raw_text"].splitlines()
+            client_subs = [{"text": line.strip()} for line in raw_lines if line.strip()]
+        td = read_file(ts_bytes, ts_name)
+        whisper_subs = parse_timecoded_subtitles(td["raw_text"])
+        if not client_subs or not whisper_subs:
+            raise ValueError("Both files must contain readable subtitle text.")
+        source, target = detect_languages(whisper_subs, client_subs)
+        result = await asyncio.to_thread(prepare_language_pair, source, target)
+        return result | {"source_language": source, "target_language": target}
+    except Exception as exc:
+        raise HTTPException(503, str(exc))
+
+
+@app.post("/bridge/prepare-from-files-stream")
+async def bridge_prepare_from_files_stream(
+    script_file: UploadFile = File(...), timestamps_file: UploadFile = File(...)
+):
+    """Streaming one-time bridge setup with explicit detection/download stages."""
+    import queue, threading, time
+    script_bytes = await script_file.read()
+    ts_bytes = await timestamps_file.read()
+    script_name = script_file.filename or "script.txt"
+    ts_name = timestamps_file.filename or "timestamps.srt"
+    events_queue: queue.Queue = queue.Queue()
+
+    def worker():
+        try:
+            from file_reader import read_file
+            from extractor import pre_extract_dialogue
+            from timecoded_subtitles import parse_timecoded_subtitles
+            from bridge_translator import detect_languages, prepare_language_pair
+            events_queue.put({"status": "processing", "progress": 10, "message": "Reading the selected subtitle files..."})
+            sd = read_file(script_bytes, script_name)
+            parsed = parse_timecoded_subtitles(sd["raw_text"]) if sd["structure"] in ("srt", "vtt", "ttml") else []
+            if parsed:
+                client_subs = parsed
+            else:
+                raw_lines = pre_extract_dialogue(sd["raw_text"], sd["structure"], script_bytes, script_name, {}) or sd["raw_text"].splitlines()
+                client_subs = [{"text": line.strip()} for line in raw_lines if line.strip()]
+            td = read_file(ts_bytes, ts_name)
+            whisper_subs = parse_timecoded_subtitles(td["raw_text"])
+            source, target = detect_languages(whisper_subs, client_subs)
+            events_queue.put({"status": "processing", "progress": 25, "message": f"Detected bridge: {source} → {target}."})
+            if source == target:
+                events_queue.put({"status": "completed", "progress": 100, "message": "The languages already match; no bridge pack is needed.", "result": {"ready": True, "source_language": source, "target_language": target}})
+                return
+            events_queue.put({"status": "processing", "progress": 35, "message": "Preparing the local language pack (one time)..."})
+            result = prepare_language_pair(source, target)
+            events_queue.put({"status": "completed", "progress": 100, "message": "Local language bridge ready.", "result": result | {"source_language": source, "target_language": target}})
+        except Exception as exc:
+            events_queue.put({"status": "error", "progress": 0, "error": str(exc)})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def event_stream():
+        last_heartbeat = time.monotonic()
+        last_progress = 35
+        while True:
+            try:
+                event = events_queue.get_nowait()
+            except queue.Empty:
+                if time.monotonic() - last_heartbeat >= 4:
+                    last_heartbeat = time.monotonic()
+                    yield f"data: {json.dumps({'status':'processing','progress':last_progress,'message':'Downloading/verifying the language pack... this is only needed once.'})}\n\n"
+                await asyncio.sleep(0.15)
+                continue
+            last_heartbeat = time.monotonic()
+            if event.get("status") == "processing":
+                last_progress = event.get("progress", last_progress)
+            yield f"data: {json.dumps(event)}\n\n"
+            if event.get("status") in ("completed", "error"):
+                break
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.post("/semantic-model/prepare")
+async def semantic_model_prepare():
+    """Explicit one-time download/cache action; never runs during alignment."""
+    import asyncio
+    try:
+        from semantic_matcher import prepare_model
+        return await asyncio.wait_for(asyncio.to_thread(prepare_model), timeout=180)
+    except Exception as exc:
+        raise HTTPException(503, f"Could not prepare multilingual model within the setup timeout. Check model download/network access and retry. Details: {exc}")
+
+
+@app.post("/semantic-model/prepare-stream")
+async def semantic_model_prepare_stream():
+    """Streaming prepare endpoint — emits SSE progress events while downloading/loading the model."""
+    import queue, threading, time
+    q: queue.Queue = queue.Queue()
+
+    def worker():
+        try:
+            from semantic_matcher import model_status, prepare_model
+            status = model_status()
+            q.put({"status": "processing", "progress": 10, "message": "Connecting to model repository…"})
+            # SentenceTransformer will download if not cached; we can't intercept
+            # granular download progress without monkey-patching, so we emit a
+            # steady heartbeat in the reader loop and report a final loaded step.
+            q.put({"status": "processing", "progress": 20, "message": "Downloading / verifying model weights (this may take a minute)…"})
+            prepare_model()
+            q.put({"status": "processing", "progress": 90, "message": "Model loaded into memory."})
+            q.put({"status": "completed", "progress": 100, "message": "Multilingual model ready.", "result": model_status()})
+        except Exception as exc:
+            q.put({"status": "error", "progress": 0, "error": str(exc)})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def events():
+        heartbeat_pct = 20
+        last_hb = time.monotonic()
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                if time.monotonic() - last_hb >= 4:
+                    last_hb = time.monotonic()
+                    heartbeat_pct = min(85, heartbeat_pct + 5)
+                    yield f"data: {json.dumps({'status':'processing','progress':heartbeat_pct,'message':'Downloading model weights… please wait.'})}\n\n"
+                await asyncio.sleep(0.2)
+                continue
+            yield f"data: {json.dumps(msg)}\n\n"
+            if msg["status"] in ("completed", "error"):
+                break
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ─── CLEAN ───────────────────────────────────────────────────────
@@ -380,6 +557,24 @@ async def extract_file_endpoint(
 
 # ─── QUALITY CHECK ───────────────────────────────────────────────
 
+@app.post("/align-client-timeline")
+async def align_client_timeline_endpoint(data: dict):
+    """Transform reference-timed mapped subtitles into client/GTS time."""
+    subtitles = data.get("subtitles", [])
+    anchors = data.get("anchors", [])
+    if not subtitles or not anchors:
+        raise HTTPException(400, "subtitles and at least two reference/client anchors are required")
+    try:
+        from timeline_alignment import align_subtitles_to_client
+        pairs = [(a.get("reference", a.get("ref")), a.get("client", a.get("gts"))) if isinstance(a, dict) else tuple(a) for a in anchors]
+        result, report = align_subtitles_to_client(
+            subtitles, pairs, data.get("reference_duration"), data.get("client_duration"),
+            data.get("client_fps"), data.get("reference_fps"))
+        return {"subtitles": result, "report": report}
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, str(exc))
+
+
 @app.post("/quality-check")
 async def quality_check_endpoint(data: dict):
     """
@@ -389,12 +584,13 @@ async def quality_check_endpoint(data: dict):
     subtitles = data.get("subtitles", [])
     platform_key = data.get("platform_key", "generic")
     filename = data.get("filename", "subtitles.srt")
+    fps = float(data.get("fps", 25.0) or 25.0)
 
     if not subtitles:
         raise HTTPException(400, "No subtitles provided for quality check")
 
     subtitles = prepare_for_platform(subtitles, platform_key, filename)
-    result = check_quality(subtitles, platform_key, filename)
+    result = check_quality(subtitles, platform_key, filename, fps=fps)
 
     # Log defects
     try:
@@ -1052,9 +1248,18 @@ async def clean_extracted_endpoint(data: dict):
             pass1 = []
             for sub in subs:
                 item = dict(sub)
-                item["original_text"] = sub.get("text", "")
-                cleaned_text = clean_delivery_text(sub.get("text", ""))
-                item["text"] = cleaned_text if cleaned_text.strip() else sub.get("text", "")
+                source_text = sub.get("text", "")
+                item["original_text"] = source_text
+                protected_title = _preserve_as_broadcast_title(source_text, platform_dict)
+                if protected_title is not None:
+                    # Narrative-title words are source-controlled visible text.
+                    # Preserve them before the deterministic rules run and keep
+                    # the value on the item so later passes cannot erase it.
+                    item["_protected_as_broadcast_title"] = protected_title
+                    item["text"] = protected_title
+                else:
+                    cleaned_text = clean_delivery_text(source_text)
+                    item["text"] = cleaned_text if cleaned_text.strip() else source_text
                 pass1.append(item)
 
             # ── Pass 2: Full platform rule enforcement ────────────────────────
@@ -1074,6 +1279,13 @@ async def clean_extracted_endpoint(data: dict):
 
             pass3 = apply_italics_rules(pass2, platform_key)
 
+            # Formatting utilities may legitimately remove bracketed metadata.
+            # Restore protected title text before timing work; it is never
+            # metadata and must not be reduced to a bare @m/@n tag.
+            for item in pass3:
+                if item.get("_protected_as_broadcast_title"):
+                    item["text"] = item["_protected_as_broadcast_title"]
+
             # ── Pass 4: Timing/structural rules ──────────────────────────────
             # Repairs duration (min/max), gap between subtitles, CPS, zero-subtitle
             yield f"data: {json.dumps({'status': 'processing', 'message': 'Applying timing and structural rules...', 'progress': 78})}\n\n"
@@ -1083,6 +1295,13 @@ async def clean_extracted_endpoint(data: dict):
                 pass3, platform_key, filename,
                 regenerate_timings=regenerate_timings,
             )
+
+            # prepare_for_platform can make a fresh dict while repairing
+            # timings.  Enforce source-title fidelity once more at the final
+            # boundary used by the editor/export response.
+            for item in cleaned:
+                if item.get("_protected_as_broadcast_title"):
+                    item["text"] = item["_protected_as_broadcast_title"]
 
             # ── Pass 5: Targeted flag — unfixable errors only ─────────────────
             # Only flag what genuinely could NOT be auto-fixed:
@@ -1266,6 +1485,42 @@ def _extract_text_from_upload(file_bytes: bytes, filename: str, sheet_name: str 
     return read_file(file_bytes, filename, force_ocr=True)["raw_text"].strip()
 
 
+def _fallback_pasted_rules(raw_guidelines: str) -> tuple[list[str], list[str], dict]:
+    """Persist usable pasted rules even when the AI extractor is unavailable.
+
+    Pasting a short, already-written rule list must not produce an empty OTT
+    simply because the extraction model is rate-limited or returns malformed
+    JSON.  This fallback deliberately retains the user's wording verbatim and
+    only classifies it into the existing text/timing/delivery buckets.
+    """
+    candidates = []
+    for line in raw_guidelines.splitlines():
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        if len(line) >= 8:
+            candidates.append(line)
+    # A single pasted paragraph is also a valid rule source.  Split only at a
+    # sentence boundary, never at commas or semicolons inside a requirement.
+    if len(candidates) <= 1 and raw_guidelines.strip():
+        candidates = [
+            part.strip() for part in re.split(r"(?<=[.!?])\s+(?=[A-Z@])", raw_guidelines.strip())
+            if len(part.strip()) >= 8
+        ]
+
+    deduped = []
+    seen = set()
+    for rule in candidates:
+        key = rule.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(rule)
+
+    from rule_segregation import segregate_rules, derive_timing_fields
+    buckets = segregate_rules(deduped, [])
+    operational = buckets["timing"] + buckets["positioning"] + buckets["file"]
+    timing_fields, _ = derive_timing_fields(buckets["timing"])
+    return buckets["text"], operational, timing_fields
+
+
 def _save_one_platform(platform_name: str, version_label: str, raw_guidelines: str,
                        source_files: list = None) -> dict:
     """Extract rules from raw guideline text and persist one platform. Returns a result dict."""
@@ -1284,6 +1539,18 @@ def _save_one_platform(platform_name: str, version_label: str, raw_guidelines: s
 
     print(f"[PLATFORMS] Extracting rules for '{platform_name}' v'{version_label}' from {len(raw_guidelines)} chars")
     platform_data = extract_platform_rules_with_ai(raw_guidelines, platform_name)
+
+    # The AI is helpful for long documents, but a direct paste must still save
+    # its rules when the model is unavailable or cannot return JSON.
+    if not platform_data.get("rules") and not platform_data.get("subtitler_rules"):
+        pasted_rules, operational_rules, timing_fields = _fallback_pasted_rules(raw_guidelines)
+        platform_data["rules"] = pasted_rules
+        platform_data["subtitler_rules"] = operational_rules
+        platform_data.update(timing_fields)
+        platform_data["summary"] = (
+            f"Rules pasted directly for {platform_name}; retained verbatim because AI extraction returned no rules."
+        )
+        print(f"[PLATFORMS] AI returned no rules; saved {len(pasted_rules) + len(operational_rules)} pasted rules directly")
 
     platform_data["platform_family"] = platform_family
     platform_data["version_label"]   = version_label
@@ -1330,6 +1597,8 @@ async def add_platform_stream(
     p_name = platform_name.strip()
     v_label = version_label.strip() or "Current"
     s_name = sheet_name.strip()
+    if pasted and not file_snapshots and not p_name:
+        raise HTTPException(400, "Platform name is required when pasting guidelines text")
     # Parse the list of sheets the user explicitly checked in the UI
     import json as _json_
     try:
@@ -2005,6 +2274,9 @@ async def transcribe_audio(file: UploadFile = File(...)):
                         "start_time": _from_seconds(seg["start"]),
                         "end_time": _from_seconds(seg["end"]),
                         "text": seg["text"],
+                        "words": seg.get("words", []),
+                        "confidence": seg.get("confidence"),
+                        "language": seg.get("language"),
                         "flagged": False,
                         "flag_reason": ""
                     })
@@ -2141,7 +2413,10 @@ async def transcribe_and_align_endpoint(
                         "end_time": _from_seconds(seg["end"]),
                         "text": seg["text"],
                         "flagged": False,
-                        "flag_reason": ""
+                        "flag_reason": "",
+                        "words": seg.get("words", []),
+                        "confidence": seg.get("confidence"),
+                        "language": seg.get("language"),
                     })
 
                 if script_subs:
@@ -2150,7 +2425,8 @@ async def transcribe_and_align_endpoint(
                 else:
                     final_subs = whisper_subs
 
-                q.put({"type": "done", "subtitles": final_subs, "engine": engine})
+                q.put({"type": "done", "subtitles": final_subs,
+                       "reference_subtitles": whisper_subs, "engine": engine})
 
             except Exception as e:
                 print(f"[ForcedAlign Error] {e}")
@@ -2179,7 +2455,7 @@ async def transcribe_and_align_endpoint(
                 )
                 result = {
                     "subtitles": _aligned,
-                    "reference_subtitles": whisper_subs,
+                    "reference_subtitles": msg.get("reference_subtitles", []),
                     "stats": {
                         "total_lines": len(_aligned),
                         "flagged_lines": sum(1 for s in _aligned if s.get("flagged")),
@@ -2254,6 +2530,12 @@ async def align_scripts_endpoint(
     if not ts_subs:
         raise HTTPException(400, "Could not extract timecodes from the timestamps file.")
 
+    from semantic_matcher import model_status, prepare_model
+    if not model_status().get("cached"):
+        raise HTTPException(503, "Multilingual matching model is not prepared. Use the one-time setup action first.")
+    if not model_status().get("loaded"):
+        await asyncio.to_thread(prepare_model)
+
     final_subs = align_transcription_to_script(ts_subs, script_subs, mode=mode)
 
     _matched = sum(
@@ -2276,6 +2558,137 @@ async def align_scripts_endpoint(
             },
         }
     }
+
+@app.post("/align-scripts-stream")
+async def align_scripts_stream_endpoint(
+    script_file: UploadFile = File(...), timestamps_file: UploadFile = File(...), mode: str = Form("full")
+):
+    """Streaming equivalent used by the UI; alignment logic is unchanged."""
+    import queue, threading, time
+    q: queue.Queue = queue.Queue()
+    script_bytes = await script_file.read(); ts_bytes = await timestamps_file.read()
+    script_name = script_file.filename or "script.txt"; ts_name = timestamps_file.filename or "timestamps.srt"
+
+    def worker():
+        try:
+            from file_reader import read_file
+            from extractor import pre_extract_dialogue
+            from timecoded_subtitles import parse_timecoded_subtitles
+            from transcript_aligner import align_transcription_to_script
+
+            q.put({"status": "processing", "progress": 10, "message": "Reading client subtitle text…"})
+            sd = read_file(script_bytes, script_name)
+            raw = sd["raw_text"]; structure = sd["structure"]
+            parsed = (
+                parse_timecoded_subtitles(raw)
+                if structure in ("srt", "vtt", "ttml")
+                   or script_name.lower().endswith((".srt", ".vtt"))
+                else []
+            )
+            if parsed:
+                script_subs = [dict(x, id=i, flagged=False) for i, x in enumerate(parsed, 1)]
+            else:
+                lines = pre_extract_dialogue(raw, structure, script_bytes, script_name, {}) or raw.splitlines()
+                script_subs = [{"id": i, "text": x.strip(), "flagged": False}
+                               for i, x in enumerate(lines, 1) if x.strip()]
+
+            q.put({"status": "processing", "progress": 28, "message": f"Loaded {len(script_subs)} script lines."})
+            q.put({"status": "processing", "progress": 38, "message": "Reading Whisper / Stable-ts timestamps…"})
+            td = read_file(ts_bytes, ts_name)
+            ts_subs = parse_timecoded_subtitles(td["raw_text"])
+            if not ts_subs:
+                raise ValueError("Could not extract timecodes from the timestamps file.")
+            q.put({"status": "processing", "progress": 52, "message": f"Loaded {len(ts_subs)} reference cues."})
+            q.put({"status": "processing", "progress": 58, "message": "Building word-level timeline..."})
+            from semantic_matcher import model_status, prepare_model
+            semantic_status = model_status()
+            if not semantic_status.get("cached"):
+                raise RuntimeError(
+                    "Multilingual matching model is not prepared. Click Prepare once, "
+                    "wait for Model ready, then start alignment."
+                )
+            if not semantic_status.get("loaded"):
+                q.put({"status": "processing", "progress": 60, "message": "Loading cached multilingual model (no download)..."})
+                prepare_model()
+            q.put({"status": "processing", "progress": 62, "message": "Model ready; starting global alignment..."})
+
+            # --- progress callback so the DP can report its own steps ----------
+            total_lines = max(1, len(script_subs))
+
+            def _progress(step: str, done: int = 0, total: int = 0):
+                """Called by align_transcription_to_script at key phases."""
+                if step == "bridge":
+                    pct = 62 + int((done / max(1, total)) * 8)
+                    q.put({"status": "processing", "progress": pct,
+                           "message": f"Preparing local language bridge: {done}/{total} cues..."})
+                elif step == "lexical":
+                    pct = 70 + int((done / max(1, total)) * 10)  # 70-80
+                    q.put({"status": "processing", "progress": pct,
+                           "message": f"Lexical pass: {done}/{total} lines…"})
+                elif step == "semantic":
+                    pct = 80 + int((done / max(1, total)) * 10)  # 80-90
+                    q.put({"status": "processing", "progress": pct,
+                           "message": f"Semantic pass: {done}/{total} cues…"})
+                elif step == "dp":
+                    q.put({"status": "processing", "progress": 90,
+                           "message": "Running sequence DP optimisation…"})
+                elif step == "gap_fill":
+                    q.put({"status": "processing", "progress": 95,
+                           "message": "Gap-filling unmatched lines…"})
+
+            final = align_transcription_to_script(
+                ts_subs, script_subs, mode=mode, progress_callback=_progress
+            )
+            matched = sum(1 for x in final if x.get("start_time") and x.get("status") != "UNMATCHED")
+            result = {
+                "subtitles": final,
+                "reference_subtitles": ts_subs,
+                "stats": {
+                    "total_lines": len(final),
+                    "flagged_lines": sum(1 for x in final if x.get("flagged")),
+                    "platform": "generic",
+                    "detected_structure": "aligned_scripts",
+                    "original_format": script_name,
+                    "bridge_used": any(x.get("bridge_used") for x in final),
+                    "bridge_source_language": next((x.get("bridge_source_language") for x in final if x.get("bridge_source_language")), ""),
+                    "bridge_target_language": next((x.get("bridge_target_language") for x in final if x.get("bridge_target_language")), ""),
+                    "alignStats": {"mode": "aligned", "matched": matched, "total": len(final)},
+                },
+            }
+            q.put({"status": "completed", "progress": 100, "message": "Alignment complete.", "result": result})
+        except Exception as exc:
+            q.put({"status": "error", "progress": 0, "error": str(exc)})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def events():
+        last_heartbeat = time.monotonic()
+        last_known_pct = 58  # starts at the "building timeline" step
+        while True:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                # Report liveness without claiming work has completed.
+                if time.monotonic() - last_heartbeat >= 3:
+                    last_heartbeat = time.monotonic()
+                    # Keep the last real stage percentage while the worker is busy.
+                    hb_payload = {"status": "processing", "progress": last_known_pct, "message": "Mapping dialogue to timestamps… (" + str(last_known_pct) + "%)"}
+                    hb_payload["message"] = "Backend is still working on alignment..."
+                    yield "data: " + json.dumps(hb_payload) + "\n\n"
+                await asyncio.sleep(0.1)
+                continue
+            last_heartbeat = time.monotonic()
+            if msg.get("status") == "processing":
+                last_known_pct = msg.get("progress", last_known_pct)
+            yield f"data: {json.dumps(msg)}\n\n"
+            if msg["status"] in ("completed", "error"):
+                break
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/refine-alignment")

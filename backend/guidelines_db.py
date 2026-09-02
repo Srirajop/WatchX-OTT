@@ -466,11 +466,10 @@ GUIDELINES DOCUMENT TEXT:
             for attempt in range(3):
                 try:
                     response = client_api.chat.completions.create(
-                        model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+                        model=os.getenv("GROQ_EXTRACTION_MODEL", os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")),
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.1,
-                        reasoning_effort=os.getenv("GROQ_REASONING_EFFORT", "low"),
-                        max_completion_tokens=int(os.getenv("GROQ_GUIDELINES_MAX_OUTPUT", "2000")),
+                        max_tokens=int(os.getenv("GROQ_GUIDELINES_MAX_OUTPUT", "2000")),
                     )
                     break
                 except Exception as exc:

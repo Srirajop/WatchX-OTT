@@ -16,6 +16,98 @@ _LEADING_TIMECODE = re.compile(r"^(?P<start>\d{1,2}[:.]\d{2}[:.]\d{2}[,.:;]?\d{0
 _FPS = 25
 
 
+def _as_broadcast_dialogue_section(text: str) -> str:
+    """Return only the dialogue cue table from an As-Broadcast Dialogue List.
+
+    These client documents contain a table of contents, cast/word-count report,
+    narrative titles, and a long creative overview after the actual cues.  All
+    of those sections can look like valid pipe-delimited dialogue to a generic
+    parser.  The real cue table is reliably delimited by its table header and
+    the ``Last Frame of Picture`` marker.
+    """
+    header = re.search(
+        r"(?im)^\s*DIALOGUE\s+LIST\s*\n\s*TIME\s*CODE\s*\|\s*CHARACTER\s*\|\s*DIALOGUE\s*$",
+        text,
+    )
+    if not header:
+        return text
+
+    section = text[header.end():]
+    end_marker = re.search(
+        r"(?im)^\s*\d{1,2}:\d{2}:\d{2}[:;]\d{2}\s*\|\s*Last\s+Frame\s+of\s+Picture\b.*$",
+        section,
+    )
+    if end_marker:
+        section = section[:end_marker.start()]
+    return section
+
+
+def _parse_as_broadcast_dialogue_list(text: str) -> list[dict] | None:
+    """Parse dialogue *and* narrative-title cues from a legacy AB dialogue list.
+
+    Narrative titles are forced/narrative subtitle content.  They must not be
+    discarded with cast reports and creative notes merely because they occur
+    before the dialogue table.  Labels are deliberately carried into the LLM
+    input (for example ``[ON-SCREEN TEXT]``) so platform rules such as Disney
+    FNG's @n/@m tags can be applied with the required context.
+    """
+    dialogue_header = re.search(
+        r"(?im)^\s*DIALOGUE\s+LIST\s*\n\s*TIME\s*CODE\s*\|\s*CHARACTER\s*\|\s*DIALOGUE\s*$",
+        text,
+    )
+    if not dialogue_header:
+        return None
+
+    rows = []
+    # Find the real NARRATIVE TITLES heading (not the table-of-contents entry).
+    narrative_header = None
+    for match in re.finditer(r"(?im)^\s*NARRATIVE\s+TITLES\s*$", text[:dialogue_header.start()]):
+        if re.match(r"\s*\n\s*\d{1,2}:\d{2}:\d{2}[:;]\d{2}\s*\|", text[match.end():]):
+            narrative_header = match
+
+    if narrative_header:
+        narrative_block = text[narrative_header.end():dialogue_header.start()]
+        # The next AB section is VOCALS.  This prevents any later notes from
+        # being interpreted as forced text in files with unusual layouts.
+        narrative_block = re.split(r"(?im)^\s*VOCALS\s*$", narrative_block, maxsplit=1)[0]
+        for line in narrative_block.splitlines():
+            match = re.match(
+                r"^\s*(\d{1,2}:\d{2}:\d{2}[:;]\d{2})\s*\|\s*([^|]+?)\s*\|\s*(.+?)\s*$",
+                line,
+            )
+            if not match:
+                continue
+            start, kind, content = match.groups()
+            content = content.strip()
+            if content:
+                rows.append({
+                    "start_time": normalize_timecode(start),
+                    "text": f"[{kind.strip().upper()}] {content}",
+                    "_ab_order": len(rows),
+                })
+
+    dialogue_block = _as_broadcast_dialogue_section(text)
+    for line in dialogue_block.splitlines():
+        match = re.match(
+            r"^\s*(\d{1,2}:\d{2}:\d{2}[:;]\d{2})\s*\|\s*([^|]*?)\s*\|\s*(.*?)\s*$",
+            line,
+        )
+        if not match:
+            continue
+        start, _speaker, content = match.groups()
+        if content.strip():
+            rows.append({
+                "start_time": normalize_timecode(start),
+                "text": content.strip(),
+                "_ab_order": len(rows),
+            })
+
+    if not rows:
+        return None
+    rows.sort(key=lambda row: (_to_seconds(row["start_time"]) or 0, row["_ab_order"]))
+    return _entries_from_start_times(rows)
+
+
 def _format_hms_ms(h: int, m: int, s: int, ms: int) -> str:
     if ms >= 1000:
         extra_s, ms = divmod(ms, 1000)
@@ -81,6 +173,10 @@ def parse_timecoded_subtitles(text: str) -> list[dict]:
     Extract real timecoded subtitle entries from SRT/VTT/TTML-style text.
     This never invents timings; entries without a detectable range are skipped.
     """
+    as_broadcast_entries = _parse_as_broadcast_dialogue_list(text)
+    if as_broadcast_entries is not None:
+        return as_broadcast_entries
+
     # Fix broken PyPDF2 timecodes with spurious spaces: "01:01:23:1 1" -> "01:01:23:11"
     text = re.sub(r'(\d{1,2}[:.]\d{2}[:.]\d{2}[:.,;]\d)\s+(\d)\b', r'\1\2', text)
     
@@ -892,32 +988,102 @@ def _repair_timing_windows(subtitles: list[dict], min_duration: float, max_durat
 
 
 def _split_long_subtitles(subtitles: list[dict], max_chars: int, max_lines: int) -> list[dict]:
-    """Keep exactly ONE output cue per input subtitle.
+    """Split oversized subtitle cues into multiple proportionally-timed entries.
 
-    Professional tools such as Subtitle Edit preserve the cue count on format
-    conversion (e.g. a 509-cue PAC file yields 509 SRT cues).  Only the *text*
-    is wrapped onto multiple lines *within the same cue* — a source cue is
-    never exploded into several cues.  Splitting one cue into many silently
-    changes the programme's spotting and the exported cue count, which is why a
-    509-line PAC was previously becoming 565 lines in the SRT.
+    When a single source cue contains more text than fits in max_lines lines
+    (e.g. 5 lines of dialogue squeezed under one timestamp), this function:
+      1. Word-wraps the text to max_chars per line.
+      2. Groups wrapped lines into max_lines-line chunks (= one output cue each).
+      3. Divides the original cue's duration proportionally across the chunks
+         (each chunk gets time ∝ its char count, with a 2-frame min gap between).
+      4. Returns the new cues in place of the single original cue.
+
+    If the cue fits within max_lines already it is passed through unchanged —
+    same behaviour as before for well-spotted files.
+    If the cue has no valid timecode (script-only files), it falls back to
+    wrap-only so downstream timing generation still works.
     """
+    FPS = 25
+    MIN_GAP = 2 / FPS  # 2-frame gap between split fragments
+
     def mark_line_limit(item: dict):
         hints = list(item.get("rule_hints", []))
         if "line_limit" not in hints:
             hints.append("line_limit")
         item["rule_hints"] = hints
 
-    split = []
+    result = []
     for sub in subtitles:
-        text = sub.get("text", "")
-        item = dict(sub)
+        text = sub.get("text", "").strip()
+        if not text:
+            result.append(sub)
+            continue
+
+        # Word-wrap to max_chars per line
         wrapped = _wrap_chunk(text, max_chars)
-        if wrapped != text:
+        all_lines = [l for l in wrapped.splitlines() if l.strip()]
+
+        # Fits in max_lines — pass through unchanged
+        if len(all_lines) <= max_lines:
+            item = dict(sub)
+            if wrapped != text:
+                item["text"] = wrapped
+                mark_line_limit(item)
+            result.append(item)
+            continue
+
+        # --- Needs splitting ---
+        # Build chunks of max_lines lines each
+        chunks = []
+        for i in range(0, len(all_lines), max_lines):
+            chunk_text = "\n".join(all_lines[i : i + max_lines])
+            chunks.append(chunk_text)
+
+        # Try to get start/end seconds for proportional timing
+        start_sec = _to_seconds(sub.get("start_time", ""))
+        end_sec = _to_seconds(sub.get("end_time", ""))
+
+        if start_sec is None or end_sec is None or end_sec <= start_sec:
+            # No valid timecode — just wrap, don't split
+            item = dict(sub)
             item["text"] = wrapped
             mark_line_limit(item)
-        split.append(item)
+            result.append(item)
+            continue
 
-    return split
+        total_duration = end_sec - start_sec
+        n = len(chunks)
+
+        # Reserve gaps between chunks so they don't overlap
+        reserved_gaps = MIN_GAP * (n - 1)
+        available = max(total_duration - reserved_gaps, MIN_GAP * n)
+
+        # Each chunk gets time proportional to its character count
+        char_counts = [len(re.sub(r"<[^>]+>", "", c)) for c in chunks]
+        total_chars = sum(char_counts) or 1
+
+        current_start = start_sec
+        for j, chunk_text in enumerate(chunks):
+            fraction = char_counts[j] / total_chars
+            chunk_dur = available * fraction
+            chunk_dur = max(chunk_dur, MIN_GAP)  # at least 2 frames
+
+            chunk_end = current_start + chunk_dur
+            if j == n - 1:
+                # Last chunk: snap to original end_time
+                chunk_end = end_sec
+
+            new_item = dict(sub)
+            new_item["text"] = chunk_text
+            new_item["start_time"] = _from_seconds(round(current_start * FPS) / FPS)
+            new_item["end_time"] = _from_seconds(round(chunk_end * FPS) / FPS)
+            mark_line_limit(new_item)
+            result.append(new_item)
+
+            current_start = chunk_end + MIN_GAP
+
+    return result
+
 
 
 def _text_fits(text: str, max_chars: int, max_lines: int) -> bool:

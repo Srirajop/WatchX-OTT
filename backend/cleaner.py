@@ -141,6 +141,91 @@ def _rules_to_instructions(platform: dict) -> list[str]:
         
     return instructions
 
+
+_AS_BROADCAST_MARKER = re.compile(r"^\s*\[([^\]]+)\]\s*(.+?)\s*$")
+
+
+def _preserve_as_broadcast_title(source: str, platform: dict) -> str | None:
+    """Make forced/title source content non-destructive.
+
+    An As-Broadcast marker supplies context for the LLM, but the words after
+    it are the actual visible title.  They must never be replaced by only a
+    Disney control tag (the failure that turned ``[MAIN TITLE] CASTLE`` into
+    just ``@m``).  These entries are source text, not translations, so keeping
+    their exact wording is safer than asking a generative model to recreate it.
+    """
+    match = _AS_BROADCAST_MARKER.match(source or "")
+    if not match:
+        return None
+
+    marker, visible_text = match.groups()
+    marker = marker.upper()
+    rule_text = " ".join(str(rule).lower() for rule in platform.get("rules", []) or [])
+    if "main title" not in rule_text or "narrative on-screen text" not in rule_text:
+        # Still remove internal extraction metadata for non-FNG deliveries,
+        # while preserving the client-supplied visible text exactly.
+        return visible_text
+    if "MAIN TITLE" in marker:
+        return f"@m {visible_text}"
+    if "ON-SCREEN TEXT" in marker:
+        return f"{'@*' if 'BURN-IN' in marker else '@n'} {visible_text}"
+    return visible_text
+
+
+def _post_process_line(text: str) -> str:
+    """
+    Deterministic post-processing applied to every cleaned subtitle line.
+    Catches HOH/italic mistakes the LLM makes despite explicit instructions.
+    """
+    # 1. Remove angle-bracket HOH/sound-effect tags the LLM missed.
+    #    Preserve <i> and </i> italic tags by matching only non-italic angle tags.
+    #    Matches <laughs>, <cHuckling exhale>, <exclaims> etc. (up to 60 chars inside)
+    text = re.sub(
+        r'<(?!/?(i|b)>)([a-zA-Z][^>]{0,60})>',
+        '',
+        text
+    )
+
+    # 2. Fix broken italic tag that cuts mid-word: <i>Non</i>e. -> <i>None</i>.
+    text = re.sub(
+        r'<i>(\w+)</i>(\w+)',
+        lambda m: '<i>' + m.group(1) + m.group(2) + '</i>',
+        text
+    )
+
+    # 3. Fix opening italic tag splitting mid-word: word<i>suffix -> <i>wordsuffix</i>
+    text = re.sub(
+        r'(\w+)<i>(\w+)',
+        lambda m: '<i>' + m.group(1) + m.group(2) + '</i>',
+        text
+    )
+
+    # 4. Remove empty italic tags: <i></i>  or  <i>  </i>
+    text = re.sub(r'<i>\s*</i>', '', text)
+
+    # 5. Strip stray bold tags (never allowed in OTT subtitles)
+    text = re.sub(r'</?b>', '', text)
+
+    # 6. Clean up empty parentheses/brackets left after HOH removal
+    text = re.sub(r'\(\s*\)', '', text)
+    text = re.sub(r'\[\s*\]', '', text)
+
+    # 6b. Belt-and-suspenders: remove known round-bracket sound effects the LLM missed.
+    #     Only remove (word) patterns where the inner word is a known HOH sound verb.
+    _HOH_WORDS = (
+        r'laughs?|chuckles?|sighs?|gasps?|groans?|moans?|cries|crying|sniffles?|'
+        r'exhales?|inhales?|grunts?|screams?|whispers?|sobs?|yells?|shouts?|'
+        r'exclaims?|narrat(?:es?|ing|or)|singing|humming|clears? (?:his |her |their )?throat'
+    )
+    text = re.sub(r'\((' + _HOH_WORDS + r')\)', '', text, flags=re.IGNORECASE)
+
+    # 7. Collapse multiple spaces into one
+    text = re.sub(r'  +', ' ', text)
+
+    return text.strip()
+
+
+
 def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) -> tuple[str, str]:
     """
     Build a very explicit, actionable prompt so the LLM actually applies
@@ -149,6 +234,7 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
     """
     platform_name = platform.get("name", "Unknown")
     remove = platform.get("remove_elements", [])
+    rules = platform.get("rules", []) or []
     
     subtitler_ops = platform.get("subtitler_rules", []) or []
     do_not_list = ""
@@ -173,7 +259,7 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
         "(4) NEVER invent words, remove dialogue, or rewrite sentences. DO NOT \"fix\" grammar if it changes spoken words. "
         "(5) Only apply italics (<i>...</i>) when a specific rule explicitly requires it. "
         "(6) If no italic rule applies, output plain text with NO tags whatsoever. "
-        "(7) The number of subtitles in your output MUST MATCH the number of input subtitles (unless you completely delete an HOH-only line). "
+        "(7) The number of output bullets MUST MATCH the number of input subtitles. "
         "Return ONLY a bulleted list. Never skip any rule. Never add commentary."
     )
 
@@ -184,20 +270,38 @@ def build_prompt(raw_text: str, structure: str, platform: dict, max_chars: int) 
         f"at a natural phrase boundary to split it into 2 lines."
     )
     
-    if "HOH" in remove or "EMT" in remove:
+    if {str(item).strip().lower() for item in remove} & {"hoh", "emt"}:
         instructions.append(
-            "DELETE COMPLETELY (Hard-of-Hearing/EMT elements - these must be removed, NOT kept): "
-            "[MUSIC], [MUSIC PLAYING], [APPLAUSE], [LAUGHTER], [CHEERING], [GUNSHOT], [EXPLOSION], "
-            "[SINGING], (music), (singing), (narrator), (narrating), (chuckles), (laughs), "
-            "(sighs), (gasps), (crying), and ANY text inside square brackets [...] or "
-            "parentheses (...) that describes a sound, action, or stage direction. "
-            "If an entire subtitle is only a sound effect, return nothing for that entry - skip it."
+            "DELETE COMPLETELY (Hard-of-Hearing/EMT elements - these must be removed, NOT kept)."
+            "They appear in THREE bracket formats - remove ALL of them:\n"
+            "ANGLE BRACKETS (most common in Castle/ABC episodes): <laughs>, <chuckles>, <exhales>, "
+            "<exclaims>, <moans>, <sighs>, <groans>, <gasps>, <cries>, <screams>, <cHuckling exhale>, "
+            "<grunts>, <sniffles>, <whispers>, and ANY text inside <angle brackets> describing "
+            "a sound or action (note: <i> and </i> italic tags are NOT sound effects).\n"
+            "SQUARE BRACKETS: [MUSIC], [MUSIC PLAYING], [APPLAUSE], [LAUGHTER], [CHEERING], "
+            "[GUNSHOT], [EXPLOSION], [SINGING], and ANY [...] sound/action descriptor.\n"
+            "ROUND BRACKETS: (music), (singing), (narrator), (chuckles), (laughs), "
+            "(sighs), (gasps), (crying), and ANY (...) sound/action descriptor.\n"
+            "RULE: If entire subtitle is ONLY sound effect(s), output [DELETE] for that entry. "
+            "If sound is mixed with dialogue (e.g. '<laughs> No.'), remove ONLY the sound tag: 'No.'"
         )
 
     # Dynamic rules mapping
     dynamic_instructions = _rules_to_instructions(platform)
     for dyn in dynamic_instructions:
         instructions.append(dyn)
+
+    all_rule_text = " ".join(str(rule).lower() for rule in rules)
+    if "main title" in all_rule_text and "narrative on-screen text" in all_rule_text:
+        instructions.append(
+            "AS-BROADCAST SOURCE MARKERS: Square-bracket prefixes such as "
+            "[MAIN TITLE] and [ON-SCREEN TEXT (...)] identify the type of the "
+            "following source cue; they are not dialogue and must not appear in "
+            "the delivered subtitle. Apply @m to a [MAIN TITLE] cue. Apply @n to "
+            "an [ON-SCREEN TEXT ...] cue. Apply @* instead only when its source "
+            "marker explicitly says BURN-IN. Keep every word after the source "
+            "marker exactly: [MAIN TITLE] CASTLE MUST output @m CASTLE, never @m alone."
+        )
         
     instructions.insert(0,
         "PLAIN TEXT DEFAULT ΓÇö CRITICAL: The dialogue text must remain PLAIN unless a specific rule "
@@ -220,10 +324,10 @@ MANDATORY FORMATTING RULES ΓÇö APPLY ALL OF THEM:
 OUTPUT INSTRUCTIONS:
 - Return ONLY a bulleted list, one hyphen (-) per subtitle line.
 - DO NOT combine multiple subtitle lines into one.
-- DO NOT add extra lines. Output exactly one bullet per input line.
+- DO NOT add extra lines. Output exactly one bullet per input line, including HOH-only lines.
 - Apply EVERY rule above to each line.
 - If a line must be split due to length, use \\n between the two parts in the same bullet.
-- If an entire entry is ONLY a sound effect or HOH element to delete, skip it entirely.
+- If an entire entry is ONLY a sound effect or HOH element to delete, output `- [DELETE]` for that same entry. Never skip it.
 - Do NOT add any commentary, headers, notes, or explanation.
 - ACTUALLY write <i>text</i> tags in your output ONLY when a rule above says to use italics.
 - NEVER write <b>text</b> bold tags ΓÇö these are NEVER allowed in OTT subtitles.
@@ -239,7 +343,7 @@ INPUT DIALOGUE TO FORMAT:
     return system, user
 
 def clean_subtitle_chunk(
-    raw_text: str,
+    raw_text: str | list[str],
     structure: str,
     platform_key: str = "generic",
     filename: str = ""
@@ -251,7 +355,14 @@ def clean_subtitle_chunk(
     platform = get_platform(platform_key)
     max_chars = platform.get("max_chars_per_line", 42)
 
-    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    # The endpoint batches extracted cues as a list.  Accept that native form
+    # rather than stringifying it (or failing on ``splitlines``), keeping one
+    # source item per LLM bullet for timing restoration.
+    if isinstance(raw_text, (list, tuple)):
+        lines = [str(line).strip() for line in raw_text if str(line).strip()]
+        raw_text = "\n".join(lines)
+    else:
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     if not lines:
         return []
 
@@ -271,8 +382,11 @@ def clean_subtitle_chunk(
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.1,
-                reasoning_effort=os.getenv("GROQ_REASONING_EFFORT", "low"),
-                max_completion_tokens=max_output_tokens,
+                # ``max_tokens`` is supported by both the installed Groq
+                # client and Groq's OpenAI-compatible chat endpoint.  The
+                # newer ``max_completion_tokens`` name caused every real
+                # cleaning request to fail before the model received a cue.
+                max_tokens=max_output_tokens,
             )
             choice = response.choices[0]
             result_text = (choice.message.content or "").strip()
@@ -341,8 +455,15 @@ def clean_subtitle_chunk(
 
                 # Convert escaped newlines to real newlines
                 cleaned_line = cleaned_line.replace('\\n', '\n')
-                # Auto-enforce line length
+                # Deterministic post-processing: fix angle-bracket HOH, broken italics
+                cleaned_line = _post_process_line(cleaned_line)
+                # Auto-enforce line length (char width)
                 cleaned_line = _auto_break_line(cleaned_line, max_chars)
+                # Enforce max_lines: cap subtitle to platform max (default 2)
+                _max_lines = platform.get('max_lines', 2)
+                _line_parts = cleaned_line.split('\n')
+                if len(_line_parts) > _max_lines:
+                    cleaned_line = '\n'.join(_line_parts[:_max_lines])
                 if cleaned_line.strip():
                     extracted_lines.append(cleaned_line)
 
@@ -351,10 +472,29 @@ def clean_subtitle_chunk(
                 time.sleep(retry_delay)
                 continue
 
+            # Timed source files must remain one-to-one with the model output.
+            # A missing bullet would otherwise attach every subsequent cleaned
+            # cue to the wrong source timecode.  Retry instead of exporting a
+            # silently misaligned Disney delivery.
+            if len(extracted_lines) != len(lines):
+                last_error = Exception(
+                    f"LLM returned {len(extracted_lines)} bullets for {len(lines)} input cues"
+                )
+                print(f"[CLEANER] {last_error}; retrying.")
+                time.sleep(retry_delay)
+                continue
+
             subtitles = []
             for i, line in enumerate(extracted_lines):
                 if not line.strip():
                     continue
+                source_line = lines[i] if i < len(lines) else line
+                preserved_title = _preserve_as_broadcast_title(source_line, platform)
+                if preserved_title is not None:
+                    # Do not allow the model to remove or paraphrase client
+                    # supplied visible title text; only the FNG delivery tag
+                    # is added deterministically.
+                    line = _auto_break_line(preserved_title, max_chars)
                 flagged = False
                 flag_reason = ""
                 for ln in line.split("\n"):
@@ -367,8 +507,11 @@ def clean_subtitle_chunk(
                     "id": i + 1,
                     "start_time": "",
                     "end_time": "",
-                    "original_text": lines[i] if i < len(lines) else line,
+                    "original_text": source_line,
                     "text": line,
+                    # Preserve the cue through timing restoration, then let
+                    # the endpoint remove it without shifting later timings.
+                    "deleted": line.strip().upper() == "[DELETE]",
                     "flagged": flagged,
                     "flag_reason": flag_reason
                 })
@@ -537,6 +680,74 @@ def _repair_truncated_json(text: str) -> str:
     return text + suffix
 
 
+def _clean_ocr_text(text: str) -> str:
+    """Pre-clean garbled OCR before LLM. Drops duplicate pages, noise lines, garbage pages."""
+    import re as _re
+
+    # 1. Deduplicate: keep only OCR pages block when both exist
+    if "=== OCR PAGE" in text and "=== PAGE" in text:
+        ocr_start = text.find("=== OCR PAGE")
+        if ocr_start > 0:
+            text = text[ocr_start:]
+
+    lines = text.splitlines()
+    clean = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if clean and clean[-1] != "":
+                clean.append("")
+            continue
+        # Drop known single-word OCR artefact rows
+        if stripped in ("Be", "ee", "re", "Tn", "ne", "oe", "TT", "Oo", "SO", "es"):
+            continue
+        # Strip "Be | " prefix before real content
+        m = _re.match(r"^(Be|ee|re|es)\s*\|\s*(.+)", stripped)
+        if m:
+            remainder = m.group(2).strip()
+            if len(remainder) >= 4:
+                line = remainder
+                stripped = remainder
+            else:
+                continue
+        clean.append(line)
+
+    # 2. Drop pages where lines avg >3 pipes AND <50% have English words
+    #    (catches fully garbled scanned-table pages like Page 4)
+    page_sections = []
+    current_header = None
+    current_page_lines = []
+    for line in clean:
+        if _re.match(r"^=== (?:OCR )?PAGE \d+", line.strip()):
+            if current_header is not None:
+                page_sections.append((current_header, current_page_lines))
+            current_header = line
+            current_page_lines = []
+        else:
+            current_page_lines.append(line)
+    if current_header is not None:
+        page_sections.append((current_header, current_page_lines))
+
+    filtered = []
+    for header, plines in page_sections:
+        clines = [l for l in plines if l.strip()]
+        if not clines:
+            continue
+        avg_pipes = sum(l.count("|") for l in clines) / len(clines)
+        english_lines = sum(1 for l in clines if _re.search(r"[a-zA-Z]{3,}", l))
+        english_ratio = english_lines / len(clines)
+        if avg_pipes > 3 and english_ratio < 0.5:
+            print(f"[OCR CLEAN] Dropping noisy page avg={avg_pipes:.1f}pipes eng={english_ratio:.0%}: {header.strip()}")
+            continue
+        filtered.append(header)
+        filtered.extend(plines)
+
+    result = "\n".join(filtered).strip()
+    if len(result) > 3000:
+        result = result[:3000]
+    return result
+
+
 def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str) -> dict:
     """
     Call LLM for a single chunk of guidelines text.
@@ -545,6 +756,12 @@ def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str)
     """
     import re as _re
     import time as _time
+
+    # Pre-clean the OCR chunk BEFORE building the prompt
+    chunk = _clean_ocr_text(chunk)
+    if not chunk.strip():
+        print("[RULES] Chunk was empty after OCR cleaning — skipping")
+        return {"script_rules": [], "subtitler_rules": []}
 
     prompt = (
         f'Read this section of subtitle guidelines for "{platform_name}".\n\n'
@@ -595,6 +812,7 @@ def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str)
         '---'
     )
 
+
     MAX_RETRIES = 4
     BASE_DELAY = 20   # seconds
 
@@ -602,11 +820,43 @@ def _call_llm_for_rules(client, model_name: str, platform_name: str, chunk: str)
         try:
             response = client.chat.completions.create(
                 model=model_name,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a subtitle guideline parser. "
+                            "You MUST output ONLY a valid JSON object immediately. "
+                            "Do NOT explain, do NOT think out loud. "
+                            "Start your response with '{' and end with '}'. "
+                            "If the text is too garbled to extract any rule, return: "
+                            "{\"script_rules\": [], \"subtitler_rules\": []}"
+                        )
+                    },
+                    {"role": "user", "content": prompt},
+                ],
                 temperature=0.0,
                 max_tokens=3500,
             )
-            result_text = (response.choices[0].message.content or "").strip()
+            msg = response.choices[0].message
+            result_text = (msg.content or "").strip()
+
+            # gpt-oss-20b is a reasoning model — it puts its thinking in `reasoning`
+            # and only puts the final answer in `content`. When content is empty,
+            # try to find a JSON object embedded inside the reasoning text.
+            if not result_text:
+                reasoning_text = (getattr(msg, 'reasoning', None) or "").strip()
+                if reasoning_text:
+                    print("[RULES] content empty, searching reasoning field for JSON...")
+                    # Look for the last JSON object in the reasoning text
+                    json_matches = list(_re.finditer(r'\{[\s\S]*?"script_rules"[\s\S]*?\}', reasoning_text))
+                    if json_matches:
+                        result_text = json_matches[-1].group(0)
+                        print(f"[RULES] Extracted JSON from reasoning ({len(result_text)} chars)")
+                    else:
+                        # No JSON found — retry with a simpler prompt won't help,
+                        # log and fall through to empty return
+                        print(f"[RULES] No JSON found in reasoning. First 300: {reasoning_text[:300]}")
+
             print(f"[RULES DEBUG] Raw LLM Output (first 500 chars): {result_text[:500]}")
             
             # Remove <think> tags for reasoning models
@@ -734,11 +984,14 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
     Extract ALL rules from a custom platform guidelines document.
     Uses free-tier-safe chunks and pacing for Groq GPT-OSS 20B.
     """
-    import os
+    import time
+
     CHUNK_SIZE = int(os.getenv("GROQ_RULES_CHUNK_SIZE", "2500"))
     from groq import Groq
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    # Use a dedicated extraction model (standard instruction-following, not reasoning-only)
+    # so it reliably outputs JSON even from garbled OCR text
+    model_name = os.getenv("GROQ_EXTRACTION_MODEL", os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"))
     
     import time
 
@@ -748,7 +1001,8 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
         "min_interval_seconds": 0.02, "reading_speed_target_cps": 17,
         "reading_speed_max_cps": 21, "file_format": "PAC",
         "two_speaker_format": "hyphen_no_space", "zero_subtitle_required": True,
-        "rules": ["Maximum 42 characters per line", "Maximum 2 lines", "Standard guidelines"],
+        "rules": [],  # No hardcoded fallback — empty = extraction genuinely found nothing
+        "subtitler_rules": [],
         "summary": f"Custom platform: {platform_name}"
     }
 
@@ -772,7 +1026,7 @@ def extract_platform_rules_with_ai(guidelines_text: str, platform_name: str) -> 
 
     # Step 2: extract rules with pacing to avoid RPM limit
     import time as _chunk_time
-    inter_chunk_delay = float(os.getenv("GROQ_RULES_CHUNK_DELAY", "20"))
+    inter_chunk_delay = float(os.getenv("GROQ_RULES_CHUNK_DELAY", "5"))  # gpt-oss-20b handles faster rate
 
     all_script_rules = []
     all_subtitler_rules = []

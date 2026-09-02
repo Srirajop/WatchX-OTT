@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
+from pathlib import Path
 from typing import Callable
 
 
@@ -25,6 +28,38 @@ def transcribe_with_stable_timestamps(
     on a machine with sufficient memory.
     """
     model_size = model_size or os.getenv("STABLE_TS_MODEL", "base")
+    cache_dir = Path(os.getenv("WATCHX_CACHE_DIR", Path(__file__).with_name(".cache")))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        stat = os.stat(audio_path)
+        key = hashlib.sha256(f"{audio_path}:{stat.st_size}:{stat.st_mtime_ns}:{model_size}".encode()).hexdigest()
+        cache_file = cache_dir / f"transcription-{key}.json"
+        if cache_file.exists():
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            return payload["segments"], payload["engine"] + " (cache)"
+    except OSError:
+        cache_file = None
+
+    def serialize_segments(segments, engine, language=None):
+        output = []
+        for segment in segments:
+            words = []
+            for word in (getattr(segment, "words", None) or []):
+                start = getattr(word, "start", None)
+                end = getattr(word, "end", None)
+                if start is None or end is None:
+                    continue
+                words.append({"word": getattr(word, "word", "").strip(), "start": float(start),
+                              "end": float(end), "confidence": getattr(word, "probability", None)})
+            item = {"start": float(segment.start), "end": float(segment.end),
+                    "text": segment.text.strip(), "words": words,
+                    "confidence": getattr(segment, "avg_logprob", None),
+                    "language": language}
+            if item["text"]:
+                output.append(item)
+        if cache_file:
+            cache_file.write_text(json.dumps({"segments": output, "engine": engine}), encoding="utf-8")
+        return output, engine
     try:
         os.environ["OMP_NUM_THREADS"] = "2"
         os.environ["MKL_NUM_THREADS"] = "2"
@@ -46,12 +81,7 @@ def transcribe_with_stable_timestamps(
             verbose=None,
             progress_callback=progress_callback,
         )
-        segments = [
-            {"start": float(segment.start), "end": float(segment.end), "text": segment.text.strip()}
-            for segment in result.segments
-            if segment.text and segment.text.strip()
-        ]
-        return segments, "stable-ts"
+        return serialize_segments(result.segments, "stable-ts", getattr(result, "language", None))
     except Exception as stable_error:
         # Keep transcription available on systems where stable-ts cannot load
         # its model/runtime.  The status returned to the caller makes this
@@ -65,9 +95,4 @@ def transcribe_with_stable_timestamps(
             word_timestamps=True,
             vad_filter=True,
         )
-        segments = [
-            {"start": float(segment.start), "end": float(segment.end), "text": segment.text.strip()}
-            for segment in segments_gen
-            if segment.text and segment.text.strip()
-        ]
-        return segments, f"Faster-Whisper fallback (stable-ts unavailable: {stable_error})"
+        return serialize_segments(segments_gen, f"Faster-Whisper fallback (stable-ts unavailable: {stable_error})", getattr(_info, "language", None))

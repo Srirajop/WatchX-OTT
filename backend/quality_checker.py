@@ -571,7 +571,7 @@ def auto_fix_subtitles(subtitles: list, platform_key: str) -> list:
 
 # ─── QUALITY CHECK ───────────────────────────────────────────────────────────
 
-def check_quality(subtitles: list, platform_key: str, filename: str) -> dict:
+def check_quality(subtitles: list, platform_key: str, filename: str, fps: float = 25.0) -> dict:
     """
     Run all quality checks on a subtitle list.
     AUTO-FIXES everything fixable first, then reports only what remains.
@@ -590,7 +590,7 @@ def check_quality(subtitles: list, platform_key: str, filename: str) -> dict:
     defects += check_profanity(fixed_subtitles, platform_key)
     defects += check_spacing_punctuation(fixed_subtitles)
     defects += check_hoh_emt(fixed_subtitles, platform)
-    defects += check_universal_guidelines(fixed_subtitles)
+    defects += check_universal_guidelines(fixed_subtitles, fps=fps)
     defects += has_italics_errors(fixed_subtitles, platform_key)
     defects += check_platform_specific_rules(fixed_subtitles, platform)
 
@@ -879,7 +879,7 @@ def check_hoh_emt(subtitles: list, platform: dict) -> list:
     return defects
 
 
-def check_universal_guidelines(subtitles: list) -> list:
+def check_universal_guidelines(subtitles: list, fps: float = 25.0) -> list:
     """
     Check SDI House Protocol universal guidelines.
     These are TIMING rules — only applicable when timecodes are present.
@@ -889,7 +889,7 @@ def check_universal_guidelines(subtitles: list) -> list:
     # These can only be checked when timecodes are available
     # For now we report if we detect timing that looks wrong
     prev_end = None
-    fps = 25  # PAL standard
+    fps = float(fps or 25.0)
 
     for sub in subtitles:
         start = sub.get("start_time", "")

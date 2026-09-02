@@ -137,7 +137,7 @@ def _get_client_and_model():
     else:
         from groq import Groq
         client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
         return client, model, False
 
 def _rules_to_instructions(platform: dict) -> list[str]:

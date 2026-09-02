@@ -157,7 +157,7 @@ _GAP_SEC_RE = re.compile(
 _ZERO_SUB_RE = re.compile(r"zero[- ]?subtitle|story:\s*\w|lang:\s*\w", re.IGNORECASE)
 
 
-def derive_timing_fields(rules: list[str], base: dict | None = None) -> dict:
+def derive_timing_fields(rules: list[str], base: dict | None = None, fps: float = 25.0) -> dict:
     """
     Given the list of TIMING-bucket rules, derive the numeric operational fields
     the code engine needs. Returns a dict of platform field overrides. Values not
@@ -193,7 +193,7 @@ def derive_timing_fields(rules: list[str], base: dict | None = None) -> dict:
         if m:
             frames = float(m.group(1))
             if frames > 0:
-                secs = round(frames / 25.0, 4)
+                secs = round(frames / float(fps or 25.0), 4)
                 fields["min_interval_seconds"] = secs
                 changed["min_interval_seconds"] = secs
         # Minimum gap in seconds

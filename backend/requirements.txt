@@ -18,6 +18,9 @@ PyJWT>=2.8.0
 
 stable-ts>=2.0.0
 faster-whisper>=1.0.0
+sentence-transformers>=3.0.0
+argostranslate>=1.9.0
+langdetect>=1.0.9
 
 # OCR Dependencies (from Claude update)
 pytesseract>=0.3.10

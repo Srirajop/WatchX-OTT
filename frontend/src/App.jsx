@@ -567,6 +567,10 @@ export default function App() {
   const [transcribeProgress, setTranscribeProgress] = useState({ pct: 0, msg: '' })
   const [transcribeError, setTranscribeError] = useState('')
   const [alignStats, setAlignStats] = useState(null)
+  const [semanticModel, setSemanticModel] = useState(null)
+  const [bridgeStatus, setBridgeStatus] = useState(null)
+  const [preparingBridge, setPreparingBridge] = useState(false)
+  const [preparingSemanticModel, setPreparingSemanticModel] = useState(false)
   const [aiReviewing, setAiReviewing] = useState(false)
   const scriptFileRef = useRef()
   const tsFileRef = useRef()
@@ -633,7 +637,16 @@ export default function App() {
     }
   }
 
-  useEffect(() => { loadPlatforms(); loadMovies(); }, [])
+  useEffect(() => { loadPlatforms(); loadMovies(); loadBridgeStatus(); }, [])
+
+  async function loadBridgeStatus() {
+    try {
+      const r = await axios.get(`${API}/bridge/status`)
+      setBridgeStatus(r.data || null)
+    } catch (e) {
+      setBridgeStatus({ available: false, message: 'Local language bridge status unavailable.' })
+    }
+  }
 
   async function loadPlatforms() {
     try {
@@ -1049,6 +1062,18 @@ export default function App() {
   async function handleUnifiedProcess() {
     setUniErr(''); setUniMsg('')
 
+    // A pasted rule set has no filename from which the backend can infer an
+    // OTT name.  Stop here with a useful message instead of silently saving
+    // it as the repeatedly-overwritten "Custom Platform".
+    if (uniText.trim() && uniFiles.length === 0 && !uniPlatform.trim()) {
+      setUniErr('Enter the OTT Platform Name before saving pasted guidelines.')
+      return
+    }
+    if (!uniText.trim() && uniFiles.length === 0) {
+      setUniErr('Paste guidelines text or upload at least one guideline file.')
+      return
+    }
+
     // Build the multipart body exactly like before (single document OR bulk Excel).
     const fd = new FormData()
     // In bulk Excel mode (multiple sheets detected), NEVER send platform_name — each sheet
@@ -1287,9 +1312,17 @@ export default function App() {
   async function handleAlignScripts() {
     if (!scriptFile) { setTranscribeError('Please upload an original cleaned script'); return }
     if (!timestampsFile) { setTranscribeError('Please upload a timestamps file'); return }
+    try {
+      const statusResponse = await fetch(`${API}/semantic-model/status`)
+      const status = await statusResponse.json()
+      setSemanticModel(status)
+    } catch (e) {
+      setTranscribeError('Could not verify multilingual model setup.')
+      return
+    }
     setTranscribing(true); setTranscribeError(''); setSubtitles([]); setCleanStats(null);
     setAlignStats(null); setWhisperSubs([]);
-    setTranscribeProgress({ pct: 50, msg: 'Aligning dialogues to timestamps...' })
+    setTranscribeProgress({ pct: 5, msg: 'Starting alignment...' })
 
     const fd = new FormData()
     fd.append('script_file', scriptFile)
@@ -1297,16 +1330,24 @@ export default function App() {
     fd.append('mode', alignMode)
 
     try {
-      const response = await fetch(`${API}/align-scripts`, { method: 'POST', body: fd })
+      const response = await fetch(`${API}/align-scripts-stream`, { method: 'POST', body: fd })
       if (!response.ok) throw new Error(`Server error: ${response.status}`)
-      
-      const data = await response.json()
-      const finalSubs = data.subtitles || []
-      const finalStats = data.stats || null
-      setSubtitles(finalSubs)
-      setWhisperSubs(data.reference_subtitles || finalSubs)
-      setCleanStats(finalStats)
-      setAlignStats(finalStats)
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read(); if (done) break
+        buffer += decoder.decode(value, { stream: true }); const lines = buffer.split('\n'); buffer = lines.pop() || ''
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const event = JSON.parse(line.slice(6))
+          if (event.status === 'processing') setTranscribeProgress(prev => ({ pct: Math.max(prev.pct || 0, event.progress || 0), msg: event.message || 'Aligning...' }))
+          else if (event.status === 'error') throw new Error(event.error || 'Alignment failed')
+          else if (event.status === 'completed') {
+            const data = event.result || {}; const finalSubs = data.subtitles || []; const finalStats = data.stats || null
+            setTranscribeProgress({ pct: 100, msg: event.message || 'Alignment complete.' })
+            setSubtitles(finalSubs); setWhisperSubs(data.reference_subtitles || finalSubs); setCleanStats(finalStats); setAlignStats(finalStats)
+          }
+        }
+      }
       // Stay on the Transcribe tab so the user can download / send to Clean
       // directly from the result panel instead of a bare redirect.
     } catch (e) {
@@ -1314,6 +1355,59 @@ export default function App() {
     } finally {
       setTranscribing(false)
       setTranscribeProgress({ pct: 0, msg: '' })
+    }
+  }
+
+  async function prepareSemanticModel() {
+    setPreparingSemanticModel(true); setTranscribeError('')
+    setTranscribeProgress({ pct: 5, msg: 'Connecting to model repository…' })
+    try {
+      const response = await fetch(`${API}/semantic-model/prepare-stream`, { method: 'POST' })
+      if (!response.ok) { const d = await response.json(); throw new Error(d.detail || 'Model setup failed') }
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read(); if (done) break
+        buffer += decoder.decode(value, { stream: true }); const lines = buffer.split('\n'); buffer = lines.pop() || ''
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          let evt; try { evt = JSON.parse(line.slice(6)) } catch(e) { continue }
+          if (evt.status === 'processing') setTranscribeProgress({ pct: evt.progress || 0, msg: evt.message || 'Loading model…' })
+          else if (evt.status === 'completed') { setSemanticModel(evt.result || null); setTranscribeProgress({ pct: 100, msg: 'Model ready!' }) }
+          else if (evt.status === 'error') throw new Error(evt.error || 'Model setup failed')
+        }
+      }
+    } catch (e) { setTranscribeError(e.message || 'Multilingual model setup failed') }
+    finally { setPreparingSemanticModel(false); setTimeout(() => setTranscribeProgress({ pct: 0, msg: '' }), 2000) }
+  }
+
+  async function prepareLanguageBridge() {
+    if (!scriptFile || !timestampsFile) return
+    setPreparingBridge(true); setTranscribeError('')
+    setTranscribeProgress({ pct: 10, msg: 'Detecting the two subtitle languages…' })
+    try {
+      const fd = new FormData()
+      fd.append('script_file', scriptFile); fd.append('timestamps_file', timestampsFile)
+      const response = await fetch(`${API}/bridge/prepare-from-files-stream`, { method: 'POST', body: fd })
+      if (!response.ok) throw new Error(`Server error: ${response.status}`)
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read(); if (done) break
+        buffer += decoder.decode(value, { stream: true }); const lines = buffer.split('\n'); buffer = lines.pop() || ''
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const evt = JSON.parse(line.slice(6))
+          if (evt.status === 'processing') setTranscribeProgress({ pct: evt.progress || 0, msg: evt.message || 'Preparing bridge…' })
+          else if (evt.status === 'completed') {
+            setBridgeStatus({ ...(evt.result || {}), available: true, ready: true })
+            setTranscribeProgress({ pct: 100, msg: evt.message || 'Language bridge ready!' })
+          } else if (evt.status === 'error') throw new Error(evt.error || 'Language bridge setup failed')
+        }
+      }
+    } catch (e) {
+      setTranscribeError(e.message || 'Language bridge setup failed')
+    } finally {
+      setPreparingBridge(false)
+      setTimeout(() => setTranscribeProgress({ pct: 0, msg: '' }), 2500)
     }
   }
 
@@ -1651,7 +1745,7 @@ export default function App() {
                 </div>
                 <div style={{background:'#ffffff', border:'1px solid #e11d4840', borderRadius:8, padding:'10px 12px', fontSize:11}}>
                   <div style={{color:'#e11d48', fontWeight:700, marginBottom:4}}>🔄 Case 3 — Text-to-Text</div>
-                  <div style={{color:'#64748b'}}>Upload Clean Script + Timestamps file. AI maps dialogues automatically.</div>
+                  <div style={{color:'#64748b'}}>Upload the original client script + a Whisper/Stable-ts timestamps file. WatchX aligns them automatically.</div>
                 </div>
               </div>
 
@@ -1732,6 +1826,20 @@ export default function App() {
 
               {scriptFile ? (
                   <div style={{marginBottom:14}}>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'8px 10px',marginBottom:10,border:'1px solid #c7d2fe',borderRadius:8,background:'#eef2ff',fontSize:11,color:'#3730a3'}}>
+                      <span>🌐 Multilingual matching model {semanticModel?.cached ? 'ready for alignment' : 'needs one-time setup'}</span>
+                      <button type="button" onClick={prepareSemanticModel} disabled={preparingSemanticModel} style={{...S.smallBtn,background:'#4f46e5',color:'#fff',borderColor:'#4f46e5'}}>
+                        {preparingSemanticModel ? 'Loading…' : semanticModel?.cached ? 'Prepare / verify' : 'Prepare once'}
+                      </button>
+                    </div>
+                    <div style={{background:'#f8fafc',border:'1px solid #cbd5e1',borderRadius:8,padding:'9px 11px',marginBottom:10,fontSize:10,color:'#475569',lineHeight:1.5}}>
+                      <div style={{fontWeight:700,color:'#334155',marginBottom:3}}>How WatchX chooses the timing</div>
+                      <div>1. Whisper/Stable-ts listens to the video and keeps real word timings.</div>
+                      <div>2. Same-language scripts use direct word alignment. Different languages use a temporary local bridge.</div>
+                      <div>3. Your original client text is copied back unchanged; only its timing is replaced.</div>
+                      <div style={{marginTop:4,color:bridgeStatus?.available ? '#047857' : '#b45309'}}>Local language bridge: {bridgeStatus?.available ? 'installed; selected pair checked during setup' : 'setup required'}.</div>
+                      <button type="button" onClick={prepareLanguageBridge} disabled={preparingBridge || !timestampsFile} style={{...S.smallBtn,marginTop:6,background:'#0f766e',color:'#fff',borderColor:'#0f766e'}}>{preparingBridge ? 'Preparing bridge…' : 'Prepare/check selected language pair'}</button>
+                    </div>
                     <div style={{fontSize:11, fontWeight:700, color:'#475569', marginBottom:6}}>🎚️ Mapping mode</div>
                     <div style={{display:'flex', gap:8}}>
                       <button
@@ -1741,7 +1849,7 @@ export default function App() {
                           background: alignMode==='full' ? '#e11d48' : '#f8fafc',
                           color: alignMode==='full' ? '#fff' : '#64748b',
                           border: `1px solid ${alignMode==='full' ? '#e11d48' : '#e2e8f0'}`}}>
-                        🔄 Full Map<br/><span style={{fontWeight:400,fontSize:10}}>Adopt both in &amp; out cues from Whisper</span>
+                        🔄 Full Map<br/><span style={{fontWeight:400,fontSize:10}}>Best when client times are wrong</span>
                       </button>
                       <button
                         type="button"
@@ -1750,7 +1858,7 @@ export default function App() {
                           background: alignMode==='preserve_duration' ? '#d97706' : '#f8fafc',
                           color: alignMode==='preserve_duration' ? '#fff' : '#64748b',
                           border: `1px solid ${alignMode==='preserve_duration' ? '#d97706' : '#e2e8f0'}`}}>
-                        🔒 Preserve Duration<br/><span style={{fontWeight:400,fontSize:10}}>Keep original dialogue duration</span>
+                        🔒 Preserve Duration<br/><span style={{fontWeight:400,fontSize:10}}>Keep trusted client durations</span>
                       </button>
                       <button
                         type="button"
@@ -1763,7 +1871,7 @@ export default function App() {
                       </button>
                     </div>
                     <div style={{marginTop:7,fontSize:10,color:'#4f46e5',fontWeight:600}}>
-                      AI refinement is applied automatically to weak matches in both modes.
+                      Use Full Map for a fresh, audio-timed subtitle file. AI review is optional for genuinely uncertain lines.
                     </div>
                   </div>
                 ) : null}
@@ -1778,7 +1886,7 @@ export default function App() {
                   </button>
               )}
 
-              {(transcribing || aiReviewing) && (
+              {(transcribing || aiReviewing || preparingSemanticModel) && (
                 <div style={S.progressContainer}>
                   <div style={S.progressBarOuter}><div style={{...S.progressBarInner, width: `${transcribeProgress.pct}%`}} /></div>
                   <div style={S.progressMeta}>
@@ -1791,7 +1899,7 @@ export default function App() {
               {alignStats && alignStats.mode === 'aligned' && (
                 <div style={{marginTop:12, background:'#ecfdf5', border:'1px solid #05966930', borderRadius:8, padding:'10px 14px', fontSize:11, color:'#059669'}}>
                   ✅ Alignment complete — {alignStats.matched} / {alignStats.total} lines matched to script.
-                  {alignStats.total - alignStats.matched > 0 && <span style={{color:'#d97706'}}> {alignStats.total - alignStats.matched} lines interpolated (flagged for review).</span>}
+                  {alignStats.total - alignStats.matched > 0 && <span style={{color:'#d97706'}}> {alignStats.total - alignStats.matched} lines remain ambiguous or unmatched (no fabricated timing).</span>}
                 </div>
               )}
 
@@ -1827,18 +1935,18 @@ export default function App() {
                     <div style={{marginTop:10, background:'#fff7ed', border:'1px solid #fdba74', borderRadius:10, padding:'12px 14px'}}>
                       <div style={{fontSize:12, fontWeight:700, color:'#c2410c', marginBottom:5}}>Manual timestamp placement required</div>
                       <div style={{fontSize:11, color:'#9a3412', marginBottom:8}}>
-                        These original script dialogues need a subtitle editor's timing pass. Safe gaps are used where possible; anything without a safe gap remains in TXT/DOCX exports and Cleaning, because SRT cannot include a cue without timestamps.
+                        These original script dialogues have no verified reference timing. They remain untimed until AI or a subtitle editor confirms a real reference cue; no placeholder timing is used.
                       </div>
                       <button style={{...S.btnSm, marginBottom:8, background:'#c2410c', borderColor:'#c2410c', color:'#fff'}}
                               onClick={handleAiReviewAlignment} disabled={aiReviewing}>
                         {aiReviewing ? 'AI is mapping the remaining lines...' : 'AI Map Remaining Lines'}
                       </button>
                       <div style={{fontSize:10, color:'#9a3412', marginBottom:6}}>
-                        AI uses the supplied timed cues to place the lines below. Any line it cannot match confidently stays flagged for manual timing.
+                        AI may choose only from supplied timed reference cues. Any line it cannot match confidently remains untimed.
                       </div>
                       {subtitles.filter(sub => (sub.manual_placement || !sub.start_time) && sub.text?.trim()).map((sub, index) => (
                         <div key={`${sub.id || index}-${index}`} style={{fontSize:11, color:'#7c2d12', padding:'6px 0', borderTop:index ? '1px solid #fed7aa' : 'none'}}>
-                          <strong>#{sub.id || index + 1}</strong>{sub.start_time ? ` (${sub.start_time} → ${sub.end_time})` : ' (no safe gap)'} — {sub.text}
+                          <strong>#{sub.id || index + 1}</strong>{sub.start_time ? ` (${sub.start_time} → ${sub.end_time})` : ' (unresolved)'} — {sub.text}
                         </div>
                       ))}
                     </div>
